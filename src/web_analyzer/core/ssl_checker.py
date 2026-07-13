@@ -8,9 +8,7 @@ class SslChecker:
 
     def __init__(self, timeout: float = 10.0) -> None:
         self.timeout = timeout
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) python-web-analyzer"
-        }
+        self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) python-web-analyzer"}
 
     def _normalize_url(self, url_or_domain: str) -> str:
         """入力された文字列からドメインを抽出し、検証用のhttp:// URLを生成する。"""
@@ -38,9 +36,7 @@ class SslChecker:
 
         try:
             # クライアントセッションを作成して通信（リダイレクトを追跡）
-            with httpx.Client(
-                headers=self.headers, timeout=self.timeout, follow_redirects=True
-            ) as client:
+            with httpx.Client(headers=self.headers, timeout=self.timeout, follow_redirects=True) as client:
                 response = client.get(test_url)
 
                 final_url = str(response.url)
@@ -51,9 +47,7 @@ class SslChecker:
                 return is_https and has_redirects
 
         except httpx.ConnectError:
-            print(
-                f"[Error] 接続できませんでした。ドメインが存在しないか、サーバーがダウンしています: {target}"
-            )
+            print(f"[Error] 接続できませんでした。ドメインが存在しないか、サーバーがダウンしています: {target}")
             return False
         except httpx.TimeoutException:
             print(f"[Error] タイムアウトしました。応答がありません: {target}")
