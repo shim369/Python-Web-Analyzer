@@ -6,7 +6,7 @@ import streamlit as st
 
 from web_analyzer.core.excel_service import ExcelService
 from web_analyzer.core.scraper_service import SiteScraperService
-from web_analyzer.models import ScrapingJob
+from web_analyzer.models import ScrapingJob, SiteAssessment
 
 # ページの設定
 st.set_page_config(
@@ -15,11 +15,15 @@ st.set_page_config(
     layout="centered",
 )
 
-# サービスの初期化（セッションを跨いで保持）
+# セッション管理の初期化
 if "scraper_service" not in st.session_state:
     st.session_state.scraper_service = SiteScraperService()
 if "current_job_id" not in st.session_state:
     st.session_state.current_job_id = None
+if "completed_assessments" not in st.session_state:
+    st.session_state.completed_assessments = None
+if "operator_name" not in st.session_state:
+    st.session_state.operator_name = "山田 太郎"
 
 scraper_service: SiteScraperService = st.session_state.scraper_service
 
@@ -38,12 +42,13 @@ st.header("⚙️ ツール設定")
 col1, col2 = st.columns([1, 1])
 
 with col1:
-    operator_name = st.text_input(
+    operator_input = st.text_input(
         "担当者名",
-        value="山田 太郎",
+        value=st.session_state.operator_name,
         placeholder="担当者の名前を入力してください",
         help="出力Excelの「担当」列に書き込まれます。",
     )
+    st.session_state.operator_name = operator_input
 
 with col2:
     st.markdown("**判定ページ数基準（しきい値）**")
@@ -81,66 +86,64 @@ uploaded_file = st.file_uploader(
 
 st.write("---")
 
-# 3. アクション＆進捗エリア
+# 3. アクション＆進捗・完了エリア
 if uploaded_file is not None:
     st.success(f"ファイル「{uploaded_file.name}」を正常に受け付けました！")
 
-    # 調査開始ボタン（実行中は非活性に）
     is_processing = st.session_state.current_job_id is not None
 
-    if st.button("⚡ 調査を開始する", use_container_width=True, type="primary", disabled=is_processing):
-        # 1. 一時ファイルとして保存してインポート
-        temp_path = Path(f"temp_{uploaded_file.name}")
-        with open(temp_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+    col_btn1, col_btn2 = st.columns([1, 1])
 
-        try:
-            # 【修正①】operator_name を第2引数として正しく渡す
-            _, assessments = ExcelService.import_excel(temp_path, operator_name)
+    with col_btn1:
+        if st.button("⚡ 調査を開始する", use_container_width=True, type="primary", disabled=is_processing):
+            # 新規調査開始時、古い完了キャッシュをクリア
+            st.session_state.completed_assessments = None
 
-            if not assessments:
-                st.error("Excelファイルから有効なドメイン（B列）を検出できませんでした。")
-            else:
-                # 2. 新しいジョブの作成
-                job_id = f"job_{int(time.time())}"
-                job = ScrapingJob(
-                    id=job_id,
-                    operator_name=operator_name,
-                    threshold_1=int(threshold_1),
-                    threshold_2=int(threshold_2),
-                    threshold_3=int(threshold_3),
-                    status="pending",
-                    created_at=datetime.now(),
-                )
+            temp_path = Path(f"temp_{uploaded_file.name}")
+            with open(temp_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
 
-                # 3. バックグラウンドスレッドでスクレイピング開始
-                scraper_service.start_background_job(job, assessments)
-                st.session_state.current_job_id = job_id
-                st.rerun()
+            try:
+                # ExcelServiceからデータをインポート
+                _, assessments = ExcelService.import_excel(temp_path, st.session_state.operator_name)
 
-        except Exception as e:
-            st.error(f"Excelファイルの読み込み中にエラーが発生しました: {e}")
-        finally:
-            if temp_path.exists():
-                temp_path.unlink()
+                if not assessments:
+                    st.error("Excelファイルから有効なドメイン（B列）を検出できませんでした。")
+                else:
+                    job_id = f"job_{int(time.time())}"
+                    job = ScrapingJob(
+                        id=job_id,
+                        operator_name=st.session_state.operator_name,
+                        threshold_1=int(threshold_1),
+                        threshold_2=int(threshold_2),
+                        threshold_3=int(threshold_3),
+                        status="pending",
+                        created_at=datetime.now(),
+                    )
+
+                    # バックグラウンド処理スタート
+                    scraper_service.start_background_job(job, assessments)
+                    st.session_state.current_job_id = job_id
+                    st.rerun()
+
+            except Exception as e:
+                st.error(f"Excelファイルの読み込み中にエラーが発生しました: {e}")
+            finally:
+                if temp_path.exists():
+                    temp_path.unlink()
 
     # 4. プログレス監視（ポーリング）ループ
     if st.session_state.current_job_id:
         job_id = st.session_state.current_job_id
-
-        # 進捗プレースホルダーの作成
         progress_bar = st.progress(0)
         status_text = st.empty()
 
-        # 状態が完了または失敗になるまでループ監視
         while True:
-            # 【修正②】戻り値の4つの要素を正しくアンパックして受け取る
             job_info, assessments_list, total, completed = scraper_service.get_job_progress(job_id)
 
             if not job_info:
                 break
 
-            # 進捗率の計算
             progress_ratio = completed / total if total > 0 else 0.0
             progress_bar.progress(progress_ratio)
             status_text.markdown(f"**ステータス: {job_info.status.upper()}** ({completed} / {total} 件完了)")
@@ -148,18 +151,57 @@ if uploaded_file is not None:
             if job_info.status in ("completed", "failed"):
                 if job_info.status == "completed":
                     st.success("🎉 全てのサイト調査が完了しました！")
-                    # セッションに結果を一時保存（エクスポート機能用）
                     st.session_state.completed_assessments = assessments_list
                 else:
                     st.error("❌ 調査中に致命的なエラーが発生し、停止しました。")
 
-                # ジョブIDをリセットして再活性化
                 st.session_state.current_job_id = None
+                st.rerun()
                 break
 
-            # 0.5秒待機して再取得（簡易ポーリング）
             time.sleep(0.5)
             st.rerun()
+
+    # 5. 解析完了画面＆エクスポート処理
+    if st.session_state.completed_assessments is not None:
+        st.write("---")
+        st.header("📊 解析結果のダウンロード")
+
+        # 簡易的なサマリー表示
+        results: list[SiteAssessment] = st.session_state.completed_assessments
+        total_sites = len(results)
+        ok_count = sum(1 for r in results if r.evaluation_result in ("◎", "◯", "△"))
+        ng_count = total_sites - ok_count
+
+        col_res1, col_res2, col_res3 = st.columns(3)
+        col_res1.metric("総調査サイト数", f"{total_sites} 件")
+        col_res2.metric("リニューアル推奨 (◎/◯/△)", f"{ok_count} 件")
+        col_res3.metric("対象外 (×)", f"{ng_count} 件")
+
+        # openpyxlで生成したExcelをメモリ上のバイナリに変換
+        try:
+            # Excel用の一時ファイルを作成
+            temp_out_path = Path("temp_output.xlsx")
+            ExcelService.export_excel(results, temp_out_path)
+
+            # バイナリとして読み込み
+            with open(temp_out_path, "rb") as f:
+                excel_data = f.read()
+
+            # 一時ファイルの削除
+            if temp_out_path.exists():
+                temp_out_path.unlink()
+
+            # ダウンロードボタンの設置
+            st.download_button(
+                label="📥 調査結果Excelをダウンロードする",
+                data=excel_data,
+                file_name=f"site_assessment_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.error(f"ダウンロードファイルの生成中にエラーが発生しました: {e}")
 
 else:
     st.warning("ファイルをドロップすると、ここに「調査開始」ボタンが表示されます。")
