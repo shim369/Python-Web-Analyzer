@@ -1,6 +1,9 @@
+import logging
 from urllib.parse import urlparse
 
-import httpx
+import requests
+
+logger = logging.getLogger(__name__)
 
 
 class SslChecker:
@@ -8,7 +11,10 @@ class SslChecker:
 
     def __init__(self, timeout: float = 10.0) -> None:
         self.timeout = timeout
-        self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) python-web-analyzer"}
+        # Google等にブロックされにくいよう、一般的なブラウザのUser-Agentを設定
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
 
     def _normalize_url(self, url_or_domain: str) -> str:
         """入力された文字列からドメインを抽出し、検証用の http:// URLを生成する。"""
@@ -17,38 +23,51 @@ class SslChecker:
 
         parsed = urlparse(url_or_domain)
         domain = parsed.netloc if parsed.netloc else parsed.path
+        # ポート番号やスラッシュ以降を削る
         domain = domain.split(":")[0].split("/")[0]
 
         return f"http://{domain}"
 
-    def check_ssl_status(self, target: str) -> tuple[bool, bool]:
-        """対象サイトの『SSLあり』と『常時SSL』を判定する。
+    def check_ssl_status(self, domain: str) -> tuple[bool | None, bool | None]:
+        """ドメインのSSL対応状況をチェックする。
 
-        Args:
-            target: 検証対象のURLまたはドメイン名
-
-        Returns:
-            tuple[bool, bool]: (has_ssl, is_always_ssl) の真偽値ペア
+        戻り値:
+            (True, True)   -> SSL対応、常時SSL対応
+            (False, False) -> SSL非対応（通信はできたがHTTPのみなど）
+            (None, None)   -> 接続エラー、ボットブロック、タイムアウトなど（判定不能）
         """
-        test_url = self._normalize_url(target)
+        start_url = self._normalize_url(domain)
 
         try:
-            # http:// から始めてリダイレクトを追跡
-            with httpx.Client(headers=self.headers, timeout=self.timeout, follow_redirects=True) as client:
-                response = client.get(test_url)
+            # 1. http:// でアクセスし、リダイレクトを追跡する
+            # (User-Agentヘッダーを付与してセキュリティブロックを緩和)
+            response = requests.get(start_url, headers=self.headers, timeout=self.timeout, allow_redirects=True)
 
-                final_url = str(response.url)
-                is_https = final_url.startswith("https://")
-                has_redirects = len(response.history) > 0
+            final_url = response.url
+            parsed_final = urlparse(final_url)
 
-                # 最終URLがhttpsであればSSLに対応しているとみなす
-                has_ssl = is_https
-                # 途中にリダイレクト履歴があり、最終的にhttpsになっていれば常時SSLと判定
-                is_always_ssl = is_https and has_redirects
+            # 最終的なURLが https:// であれば「常時SSL対応」
+            if parsed_final.scheme == "https":
+                return True, True
 
-                return has_ssl, is_always_ssl
+            # httpsにリダイレクトされなかったが、個別で https:// 接続を試みる
+            try:
+                https_url = start_url.replace("http://", "https://")
+                https_response = requests.get(https_url, headers=self.headers, timeout=self.timeout, allow_redirects=False)
+                if https_response.status_code < 400:
+                    # HTTPSでの接続はできるが、常時リダイレクトはされていない場合
+                    return True, False
+            except Exception:
+                # HTTPSでの接続に失敗した場合
+                pass
 
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError):
+            # 通信はできたがHTTPS化されていない場合
             return False, False
-        except httpx.RequestError:
-            return False, False
+
+        except requests.exceptions.RequestException as e:
+            # タイムアウト、DNSエラー、Google等の403/401ブロックなどの接続エラー時
+            logger.warning(f"[{domain}] 接続エラーまたはボット拒否のため判定不能: {e}")
+            return None, None
+        except Exception as e:
+            logger.exception(f"[{domain}] SSLチェック中に予期せぬエラー: {e}")
+            return None, None

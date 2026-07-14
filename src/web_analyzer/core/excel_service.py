@@ -3,6 +3,7 @@ from datetime import datetime
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment
 from openpyxl.worksheet.worksheet import Worksheet
 
 from web_analyzer.models import ScrapingJob, SiteAssessment
@@ -114,5 +115,14 @@ class ExcelService:
                 item.operator_name,  # O
             ]
             ws.append(row_data)
+
+            # 【追加】直前に追加したデータ行を取得し、全セルを上揃えにする
+            current_row = ws.max_row
+            for col_idx in range(1, len(row_data) + 1):
+                cell = ws.cell(row=current_row, column=col_idx)
+                cell.alignment = Alignment(
+                    vertical="top",  # 縦位置を上揃えに設定
+                    wrap_text=True,  # セル内での折り返し（自動改行）を有効化
+                )
 
         wb.save(str(output_path))

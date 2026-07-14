@@ -34,7 +34,7 @@ packages = ["src/web_analyzer"]
 
 [tool.ruff]
 target-version = "py312"
-line-length = 130
+line-length = 150
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

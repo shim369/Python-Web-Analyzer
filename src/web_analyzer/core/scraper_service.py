@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class SiteScraperService:
-    """バックグラウンドでサイト調査を実行し、進捗率やステータスを管理するサービス。"""
+    """バックグラウンドでサイト調査を実行し、進捗率やステータスを管理する服务。"""
 
     def __init__(self) -> None:
         self.ssl_checker = SslChecker()
@@ -71,15 +71,22 @@ class SiteScraperService:
             for item in assessments:
                 logger.info(f"[{job_id}] 解析開始: {item.domain_name}")
 
-                # 初期値として失敗時用のフォールバックを設定
-                has_ssl, is_always_ssl = False, False
+                # 初期値を空文字 "" に設定して、エラー時や取得失敗時に「空欄」になるようにする
+                has_ssl_val: str = ""
+                is_always_ssl_val: str = ""
                 total_pages, max_depth, contact_fields, site_structure = (0, 0, "", "取得失敗（接続エラーまたはタイムアウト）")
 
                 try:
-                    # 1. SSL判定（タイムアウトやエラーハンドリングは各モジュール内、またはここで安全に包む）
+                    # 1. SSL判定の実行
                     has_ssl, is_always_ssl = self.ssl_checker.check_ssl_status(item.domain_name)
+                    # 正常に通信できた場合のみ、◯ や × を代入する
+                    has_ssl_val = "◯" if has_ssl else "×"
+                    is_always_ssl_val = "◯" if is_always_ssl else "×"
                 except Exception as e:
-                    logger.warning(f"[{item.domain_name}] SSLチェック中にエラーが発生しました: {e}")
+                    # セキュリティブロックやDNSエラーの時はログを残して空欄のままにする
+                    logger.warning(f"[{item.domain_name}] SSLチェック中にエラーが発生しました。判定を空欄にします: {e}")
+                    has_ssl_val = ""
+                    is_always_ssl_val = ""
 
                 try:
                     # 2. クローラー巡回（10秒制限付き）
@@ -96,8 +103,8 @@ class SiteScraperService:
 
                 # スレッドセーフに結果を書き込み
                 with self._lock:
-                    item.has_ssl = "◯" if has_ssl else "×"
-                    item.is_always_ssl = "◯" if is_always_ssl else "×"
+                    item.has_ssl = has_ssl_val
+                    item.is_always_ssl = is_always_ssl_val
                     item.total_pages = total_pages
                     item.max_depth = max_depth
                     item.contact_fields = contact_fields

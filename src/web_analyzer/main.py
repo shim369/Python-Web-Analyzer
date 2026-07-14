@@ -29,10 +29,7 @@ scraper_service: SiteScraperService = st.session_state.scraper_service
 
 # ヘッダー
 st.title("⚡ サイトリニューアル可否自動判定ツール")
-st.markdown(
-    "インポートされたExcelファイルのドメインリストから、"
-    "SSL状態・ページ数・CMS・問い合わせ項目などを自動巡回解析し、判定結果を出力します。"
-)
+st.markdown("インポートされたExcelファイルのドメインリストから、SSL状態・ページ数・CMS・問い合わせ項目などを自動巡回解析し、判定結果を出力します。")
 
 st.write("---")
 
