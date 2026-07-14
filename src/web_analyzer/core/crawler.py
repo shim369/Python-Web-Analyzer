@@ -10,9 +10,7 @@ class WebCrawler:
 
     def __init__(self, timeout: float = 10.0) -> None:
         self.timeout = timeout
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) python-web-analyzer"
-        }
+        self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) python-web-analyzer"}
 
     def _get_domain(self, url: str) -> str:
         """URLからドメイン（netloc）を抽出する。"""
@@ -31,8 +29,19 @@ class WebCrawler:
         # 静的ファイルや非Webページ（画像、PDF、zip、tel、mailtoなど）を除外
         path = parsed.path.lower()
         invalid_extensions = (
-            ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".zip", ".tar",
-            ".gz", ".mp3", ".mp4", ".css", ".js", ".xml"
+            ".pdf",
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".gif",
+            ".zip",
+            ".tar",
+            ".gz",
+            ".mp3",
+            ".mp4",
+            ".css",
+            ".js",
+            ".xml",
         )
         if any(path.endswith(ext) for ext in invalid_extensions):
             return False
@@ -139,9 +148,7 @@ class WebCrawler:
 
                         # 2. 問い合わせページの探索
                         # URLに "contact"、"inquiry"、"otoiawase"、または日本語の「問い合わせ」等を含む場合
-                        is_contact_url = any(
-                            k in current_url.lower() for k in ["contact", "inquiry", "otoiawase"]
-                        )
+                        is_contact_url = any(k in current_url.lower() for k in ["contact", "inquiry", "otoiawase"])
                         if is_contact_url and not contact_fields:
                             contact_fields = self._extract_form_fields(response.text)
 
