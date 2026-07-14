@@ -4,7 +4,7 @@ import httpx
 
 
 class SslChecker:
-    """Webサイトの常時SSL（HTTPS化）状態を判定するクラス。"""
+    """WebサイトのSSL状態（SSLあり・常時SSL）を判定するクラス。"""
 
     def __init__(self, timeout: float = 10.0) -> None:
         self.timeout = timeout
@@ -12,30 +12,27 @@ class SslChecker:
 
     def _normalize_url(self, url_or_domain: str) -> str:
         """入力された文字列からドメインを抽出し、検証用のhttp:// URLを生成する。"""
-        # スキーマがない場合にurlparseが正しく挙動するよう暫定処理
         if not url_or_domain.startswith(("http://", "https://")):
             url_or_domain = f"http://{url_or_domain}"
 
         parsed = urlparse(url_or_domain)
         domain = parsed.netloc if parsed.netloc else parsed.path
-        # ポート番号やパスが含まれる場合はドメイン名のみを抽出
         domain = domain.split(":")[0].split("/")[0]
 
         return f"http://{domain}"
 
-    def is_always_ssl(self, target: str) -> bool:
-        """対象サイトが常時SSLに対応しているか判定する。
+    def check_ssl_status(self, target: str) -> tuple[bool, bool]:
+        """対象サイトの『SSLあり』と『常時SSL』を判定する。
 
         Args:
-            target: 検証対象のURLまたはドメイン名
+            target: 検検証対象のURLまたはドメイン名
 
         Returns:
-            常時SSLに対応している場合はTrue、そうでない場合はFalse
+            tuple[bool, bool]: (has_ssl, is_always_ssl) の真偽値ペア
         """
         test_url = self._normalize_url(target)
 
         try:
-            # クライアントセッションを作成して通信（リダイレクトを追跡）
             with httpx.Client(headers=self.headers, timeout=self.timeout, follow_redirects=True) as client:
                 response = client.get(test_url)
 
@@ -43,18 +40,16 @@ class SslChecker:
                 is_https = final_url.startswith("https://")
                 has_redirects = len(response.history) > 0
 
-                # 最終URLがhttpsであり、かつhttpからリダイレクトされた履歴がある場合のみTrue
-                return is_https and has_redirects
+                # C列用：最終的にHTTPSに繋がれば、有効なSSL証明書があるとみなす
+                has_ssl = is_https
 
-        except httpx.ConnectError:
-            print(f"[Error] 接続できませんでした。ドメインが存在しないか、サーバーがダウンしています: {target}")
-            return False
-        except httpx.TimeoutException:
-            print(f"[Error] タイムアウトしました。応答がありません: {target}")
-            return False
-        except httpx.HTTPStatusError as e:
-            print(f"[Error] HTTPエラーが発生しました ({e.response.status_code}): {target}")
-            return False
-        except httpx.RequestError as e:
-            print(f"[Error] 通信中に予期せぬエラーが発生しました: {e}")
-            return False
+                # D列用：最終URLがhttpsであり、かつhttpからリダイレクトされた履歴がある場合
+                is_always_ssl = is_https and has_redirects
+
+                return has_ssl, is_always_ssl
+
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError):
+            # 既存のエラーハンドリングを活かしつつ、失敗時は両方Falseを返す
+            return False, False
+        except httpx.RequestError:
+            return False, False
