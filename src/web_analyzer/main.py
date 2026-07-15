@@ -19,10 +19,7 @@ st.set_page_config(
 # Google アナリティクス (GA4) トラッキングコードの埋め込み
 # -----------------------------------------------------------------------------
 # Ruffの行長150文字制限に引っかからないよう、URL文字列を分割して結合しています
-ga_url = (
-    "https://www.googletagmanager.com/gtag/js"
-    "?id=G-2WN3P34LZQ"
-)
+ga_url = "https://www.googletagmanager.com/gtag/js?id=G-2WN3P34LZQ"
 
 ga_code = f"""
 <script async src="{ga_url}"></script>
