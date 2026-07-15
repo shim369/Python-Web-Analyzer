@@ -15,3 +15,5 @@ wheels/
 .ruff_cache/
 
 logs/
+
+temp/

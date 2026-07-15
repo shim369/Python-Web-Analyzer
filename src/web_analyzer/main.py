@@ -6,199 +6,207 @@ import streamlit as st
 
 from web_analyzer.core.excel_service import ExcelService
 from web_analyzer.core.scraper_service import SiteScraperService
-from web_analyzer.models import ScrapingJob, SiteAssessment
 
-# ページの設定
+# -----------------------------------------------------------------------------
+# 1. ページ設定とカスタムCSS（プロフェッショナル・フラットデザイン）
+# -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="サイトリニューアル可否自動判定ツール",
-    page_icon="⚡",
-    layout="centered",
+    page_title="Web Site Analyzer",
+    layout="wide",  # ワイドレイアウトで一覧性を確保
+    initial_sidebar_state="expanded",
 )
 
-# セッション管理の初期化
+# チープな要素を排除し、信頼感のあるコーポレートブルーを基調としたフラットUI
+st.markdown(
+    """
+    <style>
+        /* 全体フォントの統一 */
+        html, body, [class*="css"] {
+            font-family: 'Yu Gothic', 'Hiragino Kaku Gothic ProN', sans-serif;
+        }
+        /* メインタイトルの装飾（落ち着いたネイビーのアンダーライン） */
+        .main-title {
+            color: #1F4E78;
+            font-size: 2.0rem;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+            border-bottom: 2px solid #1F4E78;
+            padding-bottom: 0.5rem;
+        }
+        /* サブタイトルの装飾 */
+        .sub-title {
+            color: #666666;
+            font-size: 0.95rem;
+            margin-bottom: 2rem;
+        }
+        /* 起動ボタンのスタイリング */
+        .stButton > button {
+            background-color: #1F4E78 !important;
+            color: white !important;
+            border-radius: 4px !important;
+            border: none !important;
+            padding: 0.6rem 2rem !important;
+            font-weight: bold !important;
+            transition: all 0.2s ease;
+        }
+        .stButton > button:hover {
+            background-color: #2c6aa3 !important;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        /* シンプルなカード風コンテナ */
+        .metric-card {
+            background-color: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            padding: 1.2rem;
+            text-align: center;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# -----------------------------------------------------------------------------
+# 2. 初期化とサービス生成
+# -----------------------------------------------------------------------------
 if "scraper_service" not in st.session_state:
     st.session_state.scraper_service = SiteScraperService()
 if "current_job_id" not in st.session_state:
     st.session_state.current_job_id = None
-if "completed_assessments" not in st.session_state:
-    st.session_state.completed_assessments = None
-if "operator_name" not in st.session_state:
-    st.session_state.operator_name = "山田 太郎"
 
 scraper_service: SiteScraperService = st.session_state.scraper_service
 
-# ヘッダー
-st.title("⚡ サイトリニューアル可否自動判定ツール")
-st.markdown("インポートされたExcelファイルのドメインリストから、SSL状態・ページ数・CMS・問い合わせ項目などを自動巡回解析し、判定結果を出力します。")
+# -----------------------------------------------------------------------------
+# 3. サイドバーの設定（ビジネスライクな設定パネル）
+# -----------------------------------------------------------------------------
+with st.sidebar:
+    st.markdown("### 解析設定")
+    st.write("調査パラメータおよび担当者名を設定してください。")
 
-st.write("---")
+    operator_name = st.text_input("担当者名", value="担当者名", placeholder="氏名を入力")
 
-# 1. ツール設定エリア
-st.header("⚙️ ツール設定")
+    st.markdown("---")
+    st.markdown("#### 判定しきい値（ページ数）")
+    st.caption("各評価（◎, ◯, △）を分ける最大ページ数です。")
 
-col1, col2 = st.columns([1, 1])
+    threshold_1 = st.number_input("評価 ◎ の最大ページ数", min_value=1, value=10)
+    threshold_2 = st.number_input("評価 ◯ の最大ページ数", min_value=1, value=15)
+    threshold_3 = st.number_input("評価 △ の最大ページ数", min_value=1, value=20)
 
-with col1:
-    operator_input = st.text_input(
-        "担当者名",
-        value=st.session_state.operator_name,
-        placeholder="担当者の名前を入力してください",
-        help="出力Excelの「担当」列に書き込まれます。",
-    )
-    st.session_state.operator_name = operator_input
-
-with col2:
-    st.markdown("**判定ページ数基準（しきい値）**")
-    threshold_1 = st.number_input(
-        "◎ 判定の基準 (ページ以下)",
-        min_value=1,
-        value=10,
-        step=1,
-        help="CMSなし、かつこのページ数以下の場合に「◎」判定となります。",
-    )
-    threshold_2 = st.number_input(
-        "◯ 判定の基準 (ページ以下)",
-        min_value=1,
-        value=15,
-        step=1,
-    )
-    threshold_3 = st.number_input(
-        "△ 判定の基準 (ページ以下)",
-        min_value=1,
-        value=20,
-        step=1,
-        help="これを超えると自動的に「×：ページ数が多いため」になります。",
-    )
-
-st.write("---")
-
-# 2. ファイルアップロードエリア
-st.header("📂 ファイル読み込み")
-
-uploaded_file = st.file_uploader(
-    "解析対象のExcelファイル（.xlsx）をドラッグ＆ドロップしてください",
-    type=["xlsx"],
-    help="B列にドメイン名（サイト名）が記載されている必要があります。",
+# -----------------------------------------------------------------------------
+# 4. メインコンテンツエリア
+# -----------------------------------------------------------------------------
+st.markdown('<div class="main-title">Web Site Analyzer</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="sub-title">指定されたExcelリストから、複数ドメインのSSL対応状況、サイト構成、総ページ数を自動調査・評価します。</div>',
+    unsafe_allow_html=True,
 )
 
-st.write("---")
+# ファイルアップローダー（行が長くならないよう、文字列を改行して接続）
+uploaded_file = st.file_uploader(
+    "インポート用Excelファイル（B列にドメイン名が配置されたシート）を選択、またはドラッグ＆ドロップしてください",
+    type=["xlsx"],
+)
 
-# 3. アクション＆進捗・完了エリア
-if uploaded_file is not None:
-    st.success(f"ファイル「{uploaded_file.name}」を正常に受け付けました！")
+if uploaded_file and operator_name:
+    temp_dir = Path("temp")
+    temp_dir.mkdir(exist_ok=True)
+    input_path = temp_dir / uploaded_file.name
 
-    is_processing = st.session_state.current_job_id is not None
+    with open(input_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
 
-    col_btn1, col_btn2 = st.columns([1, 1])
+    try:
+        job, assessments = ExcelService.import_excel(
+            file_path=input_path,
+            operator_name=operator_name,
+            threshold_1=threshold_1,
+            threshold_2=threshold_2,
+            threshold_3=threshold_3,
+        )
 
-    with col_btn1:
-        if st.button("⚡ 調査を開始する", use_container_width=True, type="primary", disabled=is_processing):
-            # 新規調査開始時、古い完了キャッシュをクリア
-            st.session_state.completed_assessments = None
+        st.success(f"ファイルを正常に読み込みました。 (対象ドメイン数: {len(assessments)}件)")
 
-            temp_path = Path(f"temp_{uploaded_file.name}")
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
+        if st.button("調査を開始する", use_container_width=True):
+            scraper_service.start_background_job(job, assessments)
+            st.session_state.current_job_id = job.id
 
-            try:
-                # ExcelServiceからデータをインポート
-                _, assessments = ExcelService.import_excel(temp_path, st.session_state.operator_name)
+    except Exception as e:
+        st.error(f"ファイルのインポート処理中にエラーが発生しました: {e}")
 
-                if not assessments:
-                    st.error("Excelファイルから有効なドメイン（B列）を検出できませんでした。")
-                else:
-                    job_id = f"job_{int(time.time())}"
-                    job = ScrapingJob(
-                        id=job_id,
-                        operator_name=st.session_state.operator_name,
-                        threshold_1=int(threshold_1),
-                        threshold_2=int(threshold_2),
-                        threshold_3=int(threshold_3),
-                        status="pending",
-                        created_at=datetime.now(),
-                    )
+# -----------------------------------------------------------------------------
+# 5. リアルタイム進行状況モニタリング
+# -----------------------------------------------------------------------------
+job_id = st.session_state.current_job_id
 
-                    # バックグラウンド処理スタート
-                    scraper_service.start_background_job(job, assessments)
-                    st.session_state.current_job_id = job_id
-                    st.rerun()
+if job_id:
+    st.markdown("---")
+    st.markdown("### リアルタイム実行状況")
 
-            except Exception as e:
-                st.error(f"Excelファイルの読み込み中にエラーが発生しました: {e}")
-            finally:
-                if temp_path.exists():
-                    temp_path.unlink()
+    metrics_placeholder = st.empty()
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    download_placeholder = st.empty()
 
-    # 4. プログレス監視（ポーリング）ループ
-    if st.session_state.current_job_id:
-        job_id = st.session_state.current_job_id
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+    while True:
+        job, assessments, total, completed = scraper_service.get_job_progress(job_id)
 
-        while True:
-            job_info, assessments_list, total, completed = scraper_service.get_job_progress(job_id)
+        if not job:
+            break
 
-            if not job_info:
-                break
+        percent = int((completed / total) * 100) if total > 0 else 0
+        progress_bar.progress(percent)
 
-            progress_ratio = completed / total if total > 0 else 0.0
-            progress_bar.progress(progress_ratio)
-            status_text.markdown(f"**ステータス: {job_info.status.upper()}** ({completed} / {total} 件完了)")
+        with metrics_placeholder.container():
+            col1, col2, col3 = st.columns(3)
+            # 各メトリクスカード内の長いHTML1行を複数行に綺麗に分割
+            with col1:
+                st.markdown(
+                    '<div class="metric-card">'
+                    '<p style="margin:0;color:#666;font-size:0.9rem;">総ドメイン数</p>'
+                    f'<h2 style="margin:5px 0;color:#1F4E78;font-weight:700;">{total} 件</h2>'
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+            with col2:
+                st.markdown(
+                    '<div class="metric-card">'
+                    '<p style="margin:0;color:#666;font-size:0.9rem;">解析完了</p>'
+                    f'<h2 style="margin:5px 0;color:#2e7d32;font-weight:700;">{completed} 件</h2>'
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+            with col3:
+                st.markdown(
+                    '<div class="metric-card">'
+                    '<p style="margin:0;color:#666;font-size:0.9rem;">現在の進捗率</p>'
+                    f'<h2 style="margin:5px 0;color:#333;font-weight:700;">{percent} %</h2>'
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
 
-            if job_info.status in ("completed", "failed"):
-                if job_info.status == "completed":
-                    st.success("🎉 全てのサイト調査が完了しました！")
-                    st.session_state.completed_assessments = assessments_list
-                else:
-                    st.error("❌ 調査中に致命的なエラーが発生し、停止しました。")
+        status_text.write(f"処理実行中... ({completed}/{total} 件完了)")
 
-                st.session_state.current_job_id = None
-                st.rerun()
-                break
+        if job.status == "completed":
+            status_text.success("すべてのドメインの解析が完了しました。")
 
-            time.sleep(0.5)
-            st.rerun()
+            output_filename = f"result_{datetime.now().strftime('%Y%m%d%H%M%S')}.xlsx"
+            output_path = Path("temp") / output_filename
+            ExcelService.export_excel(assessments, output_path)
 
-    # 5. 解析完了画面＆エクスポート処理
-    if st.session_state.completed_assessments is not None:
-        st.write("---")
-        st.header("📊 解析結果のダウンロード")
+            with open(output_path, "rb") as file:
+                download_placeholder.download_button(
+                    label="調査結果Excelをダウンロード",
+                    data=file,
+                    file_name=output_filename,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            break
 
-        # 簡易的なサマリー表示
-        results: list[SiteAssessment] = st.session_state.completed_assessments
-        total_sites = len(results)
-        ok_count = sum(1 for r in results if r.evaluation_result in ("◎", "◯", "△"))
-        ng_count = total_sites - ok_count
+        elif job.status == "failed":
+            status_text.error("予期せぬエラーが発生したため、処理が中断されました。")
+            break
 
-        col_res1, col_res2, col_res3 = st.columns(3)
-        col_res1.metric("総調査サイト数", f"{total_sites} 件")
-        col_res2.metric("リニューアル推奨 (◎/◯/△)", f"{ok_count} 件")
-        col_res3.metric("対象外 (×)", f"{ng_count} 件")
-
-        # openpyxlで生成したExcelをメモリ上のバイナリに変換
-        try:
-            # Excel用の一時ファイルを作成
-            temp_out_path = Path("temp_output.xlsx")
-            ExcelService.export_excel(results, temp_out_path)
-
-            # バイナリとして読み込み
-            with open(temp_out_path, "rb") as f:
-                excel_data = f.read()
-
-            # 一時ファイルの削除
-            if temp_out_path.exists():
-                temp_out_path.unlink()
-
-            # ダウンロードボタンの設置
-            st.download_button(
-                label="📥 調査結果Excelをダウンロードする",
-                data=excel_data,
-                file_name=f"site_assessment_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        except Exception as e:
-            st.error(f"ダウンロードファイルの生成中にエラーが発生しました: {e}")
-
-else:
-    st.warning("ファイルをドロップすると、ここに「調査開始」ボタンが表示されます。")
+        time.sleep(1)
