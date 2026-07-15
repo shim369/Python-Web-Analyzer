@@ -8,14 +8,35 @@ from web_analyzer.core.excel_service import ExcelService
 from web_analyzer.core.scraper_service import SiteScraperService
 from web_analyzer.models import ScrapingJob
 
-# -----------------------------------------------------------------------------
-# 1. ページ設定とカスタムCSS（プロフェッショナル・フラットデザイン）
-# -----------------------------------------------------------------------------
+# 1. ページ設定（必ず最初に実行）
 st.set_page_config(
     page_title="Web Site Analyzer",
-    layout="wide",  # ワイドレイアウトで一覧性を確保
+    layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# -----------------------------------------------------------------------------
+# Google アナリティクス (GA4) トラッキングコードの埋め込み
+# -----------------------------------------------------------------------------
+# Ruffの行長150文字制限に引っかからないよう、URL文字列を分割して結合しています
+ga_url = (
+    "https://www.googletagmanager.com/gtag/js"
+    "?id=G-2WN3P34LZQ"
+)
+
+ga_code = f"""
+<script async src="{ga_url}"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){{dataLayer.push(arguments);}}
+  gtag('js', new Date());
+
+  gtag('config', 'G-2WN3P34LZQ');
+</script>
+"""
+
+# HTMLをバックグラウンドに埋め込み（画面上には何も表示されません）
+st.html(ga_code)
 
 # チープな要素を排除し、信頼感のあるコーポレートブルーを基調としたフラットUI
 st.markdown(
