@@ -89,18 +89,25 @@ class ExcelService:
 
         # 罫線設定（極細のライトグレー）
         thin_border_side = Side(style="thin", color="D9D9D9")
-        thin_border = Border(
-            left=thin_border_side,
-            right=thin_border_side,
-            top=thin_border_side,
-            bottom=thin_border_side
-        )
+        thin_border = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thin_border_side)
 
         # 新仕様に基づいたヘッダー（A〜O列）
         headers = [
-            "日付", "サイト名", "調査結果", "SSLあり", "SSL常時",
-            "階層数", "svcmd", "構成", "ページ数", "使用CMS",
-            "用途", "問合せ項目", "不可の理由", "備考", "担当"
+            "日付",
+            "サイト名",
+            "調査結果",
+            "SSLあり",
+            "SSL常時",
+            "階層数",
+            "svcmd",
+            "構成",
+            "ページ数",
+            "使用CMS",
+            "用途",
+            "問合せ項目",
+            "不可の理由",
+            "備考",
+            "担当",
         ]
         ws.append(headers)
 
