@@ -6,6 +6,7 @@ import streamlit as st
 
 from web_analyzer.core.excel_service import ExcelService
 from web_analyzer.core.scraper_service import SiteScraperService
+from web_analyzer.models import ScrapingJob
 
 # -----------------------------------------------------------------------------
 # 1. ページ設定とカスタムCSS（プロフェッショナル・フラットデザイン）
@@ -103,7 +104,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ファイルアップローダー（行が長くならないよう、文字列を改行して接続）
+# ファイルアップローダー（150文字制限を確実にクリアできるよう、改行で接続）
 uploaded_file = st.file_uploader(
     "インポート用Excelファイル（B列にドメイン名が配置されたシート）を選択、またはドラッグ＆ドロップしてください",
     type=["xlsx"],
@@ -118,6 +119,8 @@ if uploaded_file and operator_name:
         f.write(uploaded_file.getbuffer())
 
     try:
+        # mypy の代入における型不整合を防ぐため、受ける変数の型を明示
+        job: ScrapingJob
         job, assessments = ExcelService.import_excel(
             file_path=input_path,
             operator_name=operator_name,
@@ -150,9 +153,14 @@ if job_id:
     download_placeholder = st.empty()
 
     while True:
-        job, assessments, total, completed = scraper_service.get_job_progress(job_id)
+        # mypy での型割り当て不整合を避けるため、受け取る job_progress の型を考慮
+        job_progress_info = scraper_service.get_job_progress(job_id)
+        current_job_opt = job_progress_info[0]
+        assessments = job_progress_info[1]
+        total = job_progress_info[2]
+        completed = job_progress_info[3]
 
-        if not job:
+        if not current_job_opt:
             break
 
         percent = int((completed / total) * 100) if total > 0 else 0
@@ -164,31 +172,43 @@ if job_id:
             with col1:
                 st.markdown(
                     '<div class="metric-card">'
-                    '<p style="margin:0;color:#666;font-size:0.9rem;">総ドメイン数</p>'
-                    f'<h2 style="margin:5px 0;color:#1F4E78;font-weight:700;">{total} 件</h2>'
+                    '<p style="margin:0;color:#666;font-size:0.9rem;">'
+                    "総ドメイン数"
+                    "</p>"
+                    f'<h2 style="margin:5px 0;color:#1F4E78;font-weight:700;">'
+                    f"{total} 件"
+                    "</h2>"
                     "</div>",
                     unsafe_allow_html=True,
                 )
             with col2:
                 st.markdown(
                     '<div class="metric-card">'
-                    '<p style="margin:0;color:#666;font-size:0.9rem;">解析完了</p>'
-                    f'<h2 style="margin:5px 0;color:#2e7d32;font-weight:700;">{completed} 件</h2>'
+                    '<p style="margin:0;color:#666;font-size:0.9rem;">'
+                    "解析完了"
+                    "</p>"
+                    f'<h2 style="margin:5px 0;color:#2e7d32;font-weight:700;">'
+                    f"{completed} 件"
+                    "</h2>"
                     "</div>",
                     unsafe_allow_html=True,
                 )
             with col3:
                 st.markdown(
                     '<div class="metric-card">'
-                    '<p style="margin:0;color:#666;font-size:0.9rem;">現在の進捗率</p>'
-                    f'<h2 style="margin:5px 0;color:#333;font-weight:700;">{percent} %</h2>'
+                    '<p style="margin:0;color:#666;font-size:0.9rem;">'
+                    "現在の進捗率"
+                    "</p>"
+                    f'<h2 style="margin:5px 0;color:#333;font-weight:700;">'
+                    f"{percent} %"
+                    "</h2>"
                     "</div>",
                     unsafe_allow_html=True,
                 )
 
         status_text.write(f"処理実行中... ({completed}/{total} 件完了)")
 
-        if job.status == "completed":
+        if current_job_opt.status == "completed":
             status_text.success("すべてのドメインの解析が完了しました。")
 
             output_filename = f"result_{datetime.now().strftime('%Y%m%d%H%M%S')}.xlsx"
@@ -200,12 +220,12 @@ if job_id:
                     label="調査結果Excelをダウンロード",
                     data=file,
                     file_name=output_filename,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    mime=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
                     use_container_width=True,
                 )
             break
 
-        elif job.status == "failed":
+        elif current_job_opt.status == "failed":
             status_text.error("予期せぬエラーが発生したため、処理が中断されました。")
             break
 

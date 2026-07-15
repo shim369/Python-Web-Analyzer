@@ -160,9 +160,15 @@ class ExcelService:
                     cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
 
         # --- 【自動調整】各列の幅をコンテンツの最大長に合わせて調整する ---
+        # --- 【自動調整】各列の幅をコンテンツの最大長に合わせて調整する ---
         for col in ws.columns:
             max_len = 0
-            col_letter = get_column_letter(col[0].column)
+            # col[0].column が None の場合は処理をスキップ（型安全性の確保）
+            col_num = col[0].column
+            if col_num is None:
+                continue
+
+            col_letter = get_column_letter(col_num)
 
             for cell in col:
                 # セル値の文字数を簡易カウント（Noneはスキップ、改行がある場合は一番長い行を基準に）
