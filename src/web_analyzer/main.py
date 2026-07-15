@@ -1,3 +1,4 @@
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -8,47 +9,23 @@ from web_analyzer.core.excel_service import ExcelService
 from web_analyzer.core.scraper_service import SiteScraperService
 from web_analyzer.models import ScrapingJob
 
-# 1. ページ設定（必ず最初に実行）
+# RuffのE402（インポート位置ルール）を回避するために、ここだけ一時的に無視設定を入れます
+
+# プロジェクトルートディレクトリを sys.path に追加
+root_path = Path(__file__).resolve().parents[2]
+if str(root_path) not in sys.path:
+    sys.path.append(str(root_path))
+
+# Ruffに「このインポート順で正しい」と伝えるために # noqa: E402 を付与
+from inject_ga import inject_ga  # noqa: E402
+
+inject_ga()
+
 st.set_page_config(
     page_title="Web Site Analyzer",
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
-# -----------------------------------------------------------------------------
-# Google アナリティクス (GA4) トラッキングコードの親ウィンドウ注入
-# -----------------------------------------------------------------------------
-# st.html の iframe から抜け出し、親ウィンドウの <head> に直接タグを注入します
-ga_injection_code = """
-<script>
-    // 1. 親ウィンドウ (parent.document) の head を取得
-    const parentDoc = window.parent.document;
-    const parentHead = parentDoc.getElementsByTagName('head')[0];
-
-    // 2. 既にタグが挿入されているかチェック (重複防止)
-    if (!parentDoc.getElementById('ga-gtag')) {
-        // Gtag のライブラリ読み込み用 script タグを作成
-        const scriptLib = parentDoc.createElement('script');
-        scriptLib.id = 'ga-gtag';
-        scriptLib.async = true;
-        scriptLib.src = 'https://www.googletagmanager.com/gtag/js?id=G-2WN3P34LZQ';
-        parentHead.appendChild(scriptLib);
-
-        // トラッキング初期化用の script タグを作成
-        const scriptInit = parentDoc.createElement('script');
-        scriptInit.innerHTML = `
-            window.dataLayer = window.dataLayer || [];
-            function gtag(){dataLayer.push(arguments);}
-            gtag('js', new Date());
-            gtag('config', 'G-2WN3P34LZQ');
-        `;
-        parentHead.appendChild(scriptInit);
-    }
-</script>
-"""
-
-# HTMLコンポーネントとして実行 (画面上には表示されません)
-st.html(ga_injection_code)
 
 # チープな要素を排除し、信頼感のあるコーポレートブルーを基調としたフラットUI
 st.markdown(
