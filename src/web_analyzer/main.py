@@ -3,7 +3,6 @@ from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 from web_analyzer.core.excel_service import ExcelService
 from web_analyzer.core.scraper_service import SiteScraperService
@@ -13,26 +12,6 @@ st.set_page_config(
     page_title="Web Site Analyzer",
     layout="wide",
     initial_sidebar_state="expanded",
-)
-
-# -----------------------------------------------------------------------------
-# Google アナリティクス (GA4) の埋め込み（iframe内独立ロード型）
-# -----------------------------------------------------------------------------
-# 高さを0にして、画面上は完全に見えない状態（非表示の裏プロセス）でGA4を動かします
-components.html(
-    """
-    <script async src="https://www.googletagmanager.com/gtag/js?id=G-2WN3P34LZQ"></script>
-    <script>
-      window.dataLayer = window.dataLayer || [];
-      function gtag(){dataLayer.push(arguments);}
-      gtag('js', new Date());
-      gtag('config', 'G-2WN3P34LZQ', {
-        'send_page_view': true
-      });
-    </script>
-    """,
-    height=0,
-    width=0,
 )
 
 # チープな要素を排除し、信頼感のあるコーポレートブルーを基調としたフラットUI
