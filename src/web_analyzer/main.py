@@ -16,24 +16,39 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# Google アナリティクス (GA4) トラッキングコードの埋め込み
+# Google アナリティクス (GA4) トラッキングコードの親ウィンドウ注入
 # -----------------------------------------------------------------------------
-# Ruffの行長150文字制限に引っかからないよう、URL文字列を分割して結合しています
-ga_url = "https://www.googletagmanager.com/gtag/js?id=G-2WN3P34LZQ"
-
-ga_code = f"""
-<script async src="{ga_url}"></script>
+# st.html の iframe から抜け出し、親ウィンドウの <head> に直接タグを注入します
+ga_injection_code = """
 <script>
-  window.dataLayer = window.dataLayer || [];
-  function gtag(){{dataLayer.push(arguments);}}
-  gtag('js', new Date());
+    // 1. 親ウィンドウ (parent.document) の head を取得
+    const parentDoc = window.parent.document;
+    const parentHead = parentDoc.getElementsByTagName('head')[0];
 
-  gtag('config', 'G-2WN3P34LZQ');
+    // 2. 既にタグが挿入されているかチェック (重複防止)
+    if (!parentDoc.getElementById('ga-gtag')) {
+        // Gtag のライブラリ読み込み用 script タグを作成
+        const scriptLib = parentDoc.createElement('script');
+        scriptLib.id = 'ga-gtag';
+        scriptLib.async = true;
+        scriptLib.src = 'https://www.googletagmanager.com/gtag/js?id=G-2WN3P34LZQ';
+        parentHead.appendChild(scriptLib);
+
+        // トラッキング初期化用の script タグを作成
+        const scriptInit = parentDoc.createElement('script');
+        scriptInit.innerHTML = `
+            window.dataLayer = window.dataLayer || [];
+            function gtag(){dataLayer.push(arguments);}
+            gtag('js', new Date());
+            gtag('config', 'G-2WN3P34LZQ');
+        `;
+        parentHead.appendChild(scriptInit);
+    }
 </script>
 """
 
-# HTMLをバックグラウンドに埋め込み（画面上には何も表示されません）
-st.html(ga_code)
+# HTMLコンポーネントとして実行 (画面上には表示されません)
+st.html(ga_injection_code)
 
 # チープな要素を排除し、信頼感のあるコーポレートブルーを基調としたフラットUI
 st.markdown(
