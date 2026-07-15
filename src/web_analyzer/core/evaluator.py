@@ -1,42 +1,40 @@
 class RenewalEvaluator:
-    """しきい値とサイトの特徴から、リニューアル移行の容易さを判定するクラス。"""
+    """Webサイトのリニューアル（移行）可否を、ページ数などの条件から判定・評価するクラス。"""
 
     def __init__(self, threshold_1: int = 10, threshold_2: int = 15, threshold_3: int = 20) -> None:
-        self.t1 = threshold_1
-        self.t2 = threshold_2
-        self.t3 = threshold_3
+        self.threshold_1 = threshold_1
+        self.threshold_2 = threshold_2
+        self.threshold_3 = threshold_3
 
-    def evaluate_rank(self, cms_name: str, total_pages: int | None) -> str:
-        """しきい値とCMS有無に基づき、調査結果のランク (◎, ◯, △, ×) を動的に判定する。"""
-        # ページ数計測がタイムアウトなどにより空欄（None）の場合は判定不可として "×" とする
-        if total_pages is None:
-            return "×"
+    def evaluate_rank(self, cms_name: str, total_pages: int) -> str:
+        """ページ数のみに基づいてリニューアルの推奨度（◎, ◯, △, ×）を評価する。
 
-        has_cms = bool(cms_name.strip())
-
-        # (1) 使用CMSが空欄、かつ ページ数 ≦ 【閾値1】 ➔ ◎
-        if not has_cms and total_pages <= self.t1:
+        ※以前にあった「CMSが導入されていたらランクダウン」という要件は、
+          簡素なサイトにおける移行メリットを考慮して撤廃されました。
+        """
+        # 1. ページ数がしきい値1（デフォルト10）以下
+        if total_pages <= self.threshold_1:
             return "◎"
-        # (2) 上記以外、かつ ページ数 ≦ 【閾値2】 ➔ ◯
-        elif total_pages <= self.t2:
+
+        # 2. ページ数がしきい値2（デフォルト15）以下
+        if total_pages <= self.threshold_2:
             return "◯"
-        # (3) 上記以外、かつ ページ数 ≦ 【閾値3】 ➔ △
-        elif total_pages <= self.t3:
+
+        # 3. ページ数がしきい値3（デフォルト20）以下
+        if total_pages <= self.threshold_3:
             return "△"
-        # (4) いずれにも該当しない（【閾値3】を超える）場合 ➔ ×
-        else:
-            return "×"
 
-    def compile_rejection_reason(self, total_pages: int | None, has_login: bool) -> str:
-        """リニューアル移行不可となる理由テキストを自動生成する（複数合致時は改行区切りで併記）。"""
-        reasons: list[str] = []
+        # 4. それ以上は移行非推奨
+        return "×"
 
-        # (1) ページ数が 【閾値3】 以上の場合
-        if total_pages is not None and total_pages >= self.t3:
-            reasons.append("ページ数が多いため")
-
-        # (2) 会員ログイン機能がある場合
+    def compile_rejection_reason(self, total_pages: int, has_login: bool) -> str:
+        """判定が「×」となった場合の具体的な理由を出力する。"""
+        # ログイン機能がある場合は、最優先でその理由を返却
         if has_login:
-            reasons.append("会員ログイン機能があるため")
+            return "外部非公開のログイン機能（会員限定ページなど）が存在するため"
 
-        return "\n".join(reasons)
+        # ページ数がしきい値3を超えている場合
+        if total_pages > self.threshold_3:
+            return "ページ数が多いため"
+
+        return ""
