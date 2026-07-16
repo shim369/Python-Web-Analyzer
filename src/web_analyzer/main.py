@@ -24,7 +24,7 @@ st.markdown(
         }
         /* メインタイトルの装飾（落ち着いたネイビーのアンダーライン） */
         .main-title {
-            color: #1F4E78;
+            color: #1d78c9;
             font-size: 2.0rem;
             font-weight: 700;
             margin-bottom: 0.5rem;
@@ -33,7 +33,7 @@ st.markdown(
         }
         /* サブタイトルの装飾 */
         .sub-title {
-            color: #666666;
+            color: #ffffff;
             font-size: 0.95rem;
             margin-bottom: 2rem;
         }
