@@ -1,3 +1,4 @@
+import re
 import time
 from urllib.parse import urljoin, urlparse
 
@@ -10,7 +11,7 @@ class WebCrawler:
 
     def __init__(self, timeout: float = 10.0) -> None:
         self.timeout = timeout
-        self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) python-web-analyzer"}
+        self.headers = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) python-web-analyzer")}
 
     def _get_domain(self, url: str) -> str:
         """URLからドメイン（netloc）を抽出する。"""
@@ -22,11 +23,9 @@ class WebCrawler:
         absolute_url = urljoin(current_url, link_url)
         parsed = urlparse(absolute_url)
 
-        # ドメインが一致し、かつHTTP(S)プロトコルであること
         if parsed.netloc != base_domain or parsed.scheme not in ("http", "https"):
             return False
 
-        # 静的ファイルや非Webページ（画像、PDF、zip、tel、mailtoなど）を除外
         path = parsed.path.lower()
         invalid_extensions = (
             ".pdf",
@@ -48,13 +47,84 @@ class WebCrawler:
 
         return True
 
-    def _extract_form_fields(self, html: str) -> str:
-        """HTML内のフォーム要素から、お問合せ項目名（labelやplaceholderなど）を改行区切りで抽出する。"""
+    def _extract_purpose_and_features(self, html: str, url: str) -> tuple[str, str]:
+        """トップページのHTMLから用途をフォールバック抽出（Description -> Title -> H1）し、
+
+        特徴（備考）を自動合成する。
+        """
         soup = BeautifulSoup(html, "html.parser")
-        # 主要なフォームコンテナまたは直接input要素を探索
+
+        # ---------------------------------------------------------------------
+        # 用途（Description -> Title -> H1）
+        # ---------------------------------------------------------------------
+        purpose = ""
+        # 優先①: meta description (OGP含む)
+        desc_tag = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
+        if desc_tag and isinstance(desc_tag, Tag):
+            val = desc_tag.get("content")
+            if isinstance(val, str) and val.strip():
+                purpose = val.strip()
+
+        # 優先②: Title
+        if not purpose and soup.title:
+            purpose = soup.title.text.strip()
+
+        # 優先③: H1
+        if not purpose:
+            h1_tag = soup.find("h1")
+            if h1_tag:
+                purpose = h1_tag.text.strip()
+
+        if not purpose:
+            purpose = "コーポレートサイト（推測）"
+
+        if len(purpose) > 100:
+            purpose = purpose[:100] + "..."
+
+        # ---------------------------------------------------------------------
+        # 備考・特徴（キーワード判定）
+        # ---------------------------------------------------------------------
+        features: list[str] = []
+        text_content = soup.get_text().lower()
+
+        if "採用" in text_content or "recruit" in url.lower():
+            features.append("採用活動に注力している")
+        if any(
+            k in text_content
+            for k in [
+                "カート",
+                "買い物かご",
+                "商品一覧",
+                "特定商取引",
+                "cart",
+                "shop",
+            ]
+        ):
+            features.append("EC/オンラインショップ機能を有している")
+        if "wp-content" in html or "wp-includes" in html:
+            features.append("WordPressによるWeb運用を行っている")
+        if "instagram.com" in html:
+            features.append("InstagramなどのSNSを活用したWebマーケティングを実施している")
+
+        features_summary = (
+            "、".join(features) + "特徴が見受けられます。" if features else "シンプルな構成のコーポレート・Web紹介サイトの特徴を持っています。"
+        )
+
+        return purpose, features_summary
+
+    def _extract_form_fields(self, html: str) -> str:
+        """HTML内のフォーム要素や埋め込み外部サービスからお問合せ項目名を抽出する。"""
+        # 外部フォーム埋め込みサービスの検出
+        if "formrun.jp" in html:
+            return "お名前\nメールアドレス\nお問い合わせ内容 (Formrun埋め込み)"
+        if "tayori.com" in html:
+            return "お名前\nメールアドレス\nお問い合わせ内容 (Tayori埋め込み)"
+        if "forms.gle" in html:
+            return "お名前\nメールアドレス\nお問い合わせ内容 (Googleフォーム埋め込み)"
+
+        soup = BeautifulSoup(html, "html.parser")
         form = soup.find("form")
         if not form or not isinstance(form, Tag):
-            # フォームタグがない場合はページ全体のインプット要素から推測
             form = soup
 
         fields: list[str] = []
@@ -65,9 +135,8 @@ class WebCrawler:
             if text and text not in fields:
                 fields.append(text)
 
-        # labelが見つからない場合、input/textarea/select の placeholder や name から補完
+        # placeholder や name から補完
         for elem in form.find_all(["input", "textarea", "select"]):
-            # 送信ボタンや非表示フィールド、チェックボックス等はスキップ
             elem_type = elem.get("type", "")
             if elem_type in ("submit", "hidden", "button", "image", "radio"):
                 continue
@@ -78,7 +147,6 @@ class WebCrawler:
                 continue
 
             name = elem.get("name", "")
-            # よくある項目名（かつlabel等にまだ追加されていないもの）をマッピング
             name_mapping = {
                 "name": "お名前",
                 "email": "メールアドレス",
@@ -89,40 +157,51 @@ class WebCrawler:
             if name in name_mapping and name_mapping[name] not in fields:
                 fields.append(name_mapping[name])
 
-        # 改行区切りの縦並びで表示
-        return "\n".join(fields[:15])  # 項目が多すぎる場合は上限15個に制限
+        # 抽出項目が極めて少ない場合、問い合わせ項目を確実にするための正規表現マッチング
+        if len(fields) < 2:
+            form_text = form.get_text().lower()
+            field_patterns = {
+                "お名前": r"name|氏名|名前|お名前|担当者",
+                "メールアドレス": r"mail|email|アドレス|連絡先",
+                "電話番号": r"tel|phone|電話|番号",
+                "会社名": r"company|corp|会社|組織|法人",
+                "お問い合わせ内容": r"content|message|body|内容|問合せ|質問|自由記述",
+            }
+            for field_name, pattern in field_patterns.items():
+                if re.search(pattern, form_text) and field_name not in fields:
+                    fields.append(field_name)
 
-    def crawl_and_analyze(self, start_url: str) -> tuple[int, int, str, str]:
-        """10秒のタイムアウト制約のなかで、同一ドメイン内を巡回し各種解析を行う。
+        return "\n".join(fields[:15])
+
+    def crawl_and_analyze(self, start_url: str) -> tuple[int, int, str, str, str, str]:
+        """10秒のタイムアウト制約の中で巡回し、用途・特徴（備考）を優先判定しつつ解析を行う。
 
         Returns:
-            tuple[int, int, str, str]: (総ページ数, 最大階層数, 問い合わせ項目, サイト構成)
+            tuple[int, int, str, str, str, str]:
+            (総ページ数, 最大階層数, 問い合わせ項目, サイト構成, 用途, 備考)
         """
-        # プロトコルの自動補完
         if not start_url.startswith(("http://", "https://")):
             start_url = f"https://{start_url}"
 
         base_domain = self._get_domain(start_url)
         start_time = time.time()
 
-        # クロール管理用セット
         visited: set[str] = set()
-        queue: list[tuple[str, int]] = [(start_url, 0)]  # (URL, 現在の階層深さ)
+        queue: list[tuple[str, int]] = [(start_url, 0)]
 
         max_depth = 0
         contact_fields = ""
         global_nav_menus: list[str] = []
+        site_purpose = ""
+        site_remarks = ""
 
         try:
             with httpx.Client(headers=self.headers, timeout=3.0, follow_redirects=True) as client:
                 while queue:
-                    # 全体の処理時間が制限時間（10秒）を超えた場合は即座に打ち切り
                     if time.time() - start_time > self.timeout:
                         break
 
                     current_url, depth = queue.pop(0)
-
-                    # 正規化して重複判定
                     normalized_url = current_url.split("#")[0].rstrip("/")
                     if normalized_url in visited:
                         continue
@@ -132,49 +211,49 @@ class WebCrawler:
                         visited.add(normalized_url)
                         max_depth = max(max_depth, depth)
 
-                        # HTML解析
                         soup = BeautifulSoup(response.text, "html.parser")
 
-                        # 1. トップページ解析（初回巡回時）からグローバルナビを抽出
+                        # 初回巡回（トップページ）のタイミングで用途、特徴、ナビを抽出
                         if len(visited) == 1:
-                            # 一般的なナビゲーションタグやクラスからメニューを抽出
+                            site_purpose, site_remarks = self._extract_purpose_and_features(response.text, start_url)
+
                             nav = soup.find(["nav", "header"]) or soup.find(class_=lambda x: x and "menu" in x or "nav" in x)
                             if nav and isinstance(nav, Tag):
                                 for item in nav.find_all(["li", "a"]):
                                     menu_text = item.get_text(strip=True)
-                                    # 冗長な空白文字や、空のメニュー、長すぎる文字列を除外
                                     if menu_text and len(menu_text) < 15 and menu_text not in global_nav_menus:
                                         global_nav_menus.append(menu_text)
 
-                        # 2. 問い合わせページの探索
-                        # URLに "contact"、"inquiry"、"otoiawase"、または日本語の「問い合わせ」等を含む場合
+                        # 問い合わせページの探索
                         is_contact_url = any(k in current_url.lower() for k in ["contact", "inquiry", "otoiawase"])
                         if is_contact_url and not contact_fields:
                             contact_fields = self._extract_form_fields(response.text)
 
-                        # 3. 同一ドメイン内リンクの探索
+                        # 同一ドメイン内リンクの探索
                         for link in soup.find_all("a", href=True):
                             href = link["href"]
                             if self._is_valid_internal_link(current_url, href, base_domain):
                                 abs_href = urljoin(current_url, href)
                                 abs_normalized = abs_href.split("#")[0].rstrip("/")
                                 if abs_normalized not in visited:
-                                    # 階層深さのカウント: パスのスラッシュの数で簡易計算
                                     path_depth = len([p for p in urlparse(abs_href).path.split("/") if p])
                                     queue.append((abs_href, path_depth))
 
-                        # サーバー不可を考慮し、微小なディレイを挟む
                         time.sleep(0.1)
 
                     except httpx.RequestError:
-                        # 個別ページの取得エラーはログを残して次のページへ
                         continue
 
         except Exception as e:
-            # 予期せぬ重大なエラーは安全にいなして終了
             print(f"[Warning] クローラー内で予期せぬエラーが発生しました: {e}")
 
-        # 構成（改行区切り）の作成
         site_structure = "\n".join(global_nav_menus[:10])
 
-        return len(visited), max_depth, contact_fields, site_structure
+        return (
+            len(visited),
+            max_depth,
+            contact_fields,
+            site_structure,
+            site_purpose,
+            site_remarks,
+        )

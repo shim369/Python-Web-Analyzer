@@ -80,7 +80,7 @@ class SiteScraperService:
             for item in assessments:
                 logger.info(f"[{job_id}] 解析開始: {item.domain_name}")
 
-                # 初期値を空文字 "" に設定して、エラー時や取得失敗時に「空欄」になるようにする
+                # 初期値を空文字 "" に設定
                 has_ssl_val: str = ""
                 is_always_ssl_val: str = ""
                 total_pages, max_depth, contact_fields, site_structure = (
@@ -89,12 +89,13 @@ class SiteScraperService:
                     "",
                     "取得失敗（接続エラーまたはタイムアウト）",
                 )
+                site_purpose = ""
+                site_remarks = ""
 
+                # 1. SSL判定の実行
                 try:
-                    # 1. SSL判定の実行
                     has_ssl, is_always_ssl = self.ssl_checker.check_ssl_status(item.domain_name)
 
-                    # check_ssl_status は判定不能時に (None, None) を返す
                     if has_ssl is None or is_always_ssl is None:
                         has_ssl_val = ""
                         is_always_ssl_val = ""
@@ -103,28 +104,49 @@ class SiteScraperService:
                         is_always_ssl_val = "◯" if is_always_ssl else "×"
 
                 except Exception as e:
-                    # セキュリティブロックやDNSエラーの時はログを残して空欄のままにする
-                    logger.warning(f"[{item.domain_name}] SSLチェック中にエラーが発生しました。判定を空欄にします: {e}")
+                    logger.warning(f"[{item.domain_name}] SSLチェック中にエラーが発生しました: {e}")
                     has_ssl_val = ""
                     is_always_ssl_val = ""
 
+                # 2. クローラー巡回（新仕様: 戻り値が6つに変更）
                 try:
-                    # 2. クローラー巡回（10秒制限付き）
                     (
                         total_pages,
                         max_depth,
                         contact_fields,
                         site_structure,
+                        site_purpose,
+                        site_remarks,
                     ) = self.crawler.crawl_and_analyze(item.domain_name)
                 except Exception as e:
                     logger.warning(f"[{item.domain_name}] クロール中にエラーまたはタイムアウトが発生しました: {e}")
 
-                # 3. リニューアル可否の動的評価
-                has_login = "login" in site_structure.lower() or "signin" in site_structure.lower()
-                cms_name = "WordPress" if "wp-content" in site_structure else ""
+                # 3. CMSの検出（WordPressを含むその他の簡易検出）
+                # 大文字小文字の揺れを考慮。WordPress以外のCMS拡張にも対応しやすいように小文字変換で判定
+                cms_name = ""
+                site_structure_lower = site_structure.lower()
+                if "wp-content" in site_structure_lower or "wp-includes" in site_structure_lower:
+                    cms_name = "WordPress"
+                elif "shopify" in site_structure_lower:
+                    cms_name = "Shopify"
+                elif "microcms" in site_structure_lower:
+                    cms_name = "microCMS"
 
-                eval_result = evaluator.evaluate_rank(cms_name, total_pages)
-                rejection_reason = evaluator.compile_rejection_reason(total_pages, has_login)
+                # 4. リニューアル評価判定 & 不可判定（新ロジック導入）
+                has_login = "login" in site_structure_lower or "signin" in site_structure_lower
+
+                # 判定保留判定（ページ数が中途半端に少ない場合のケア）
+                if total_pages <= 2:
+                    eval_result = "要確認"
+                    rejection_reason = f"クロールできたページ数が極端に少ないため判定を保留しました (取得数: {total_pages}ページ)。"
+                else:
+                    # 通常の評価
+                    eval_result = evaluator.evaluate_rank(cms_name, total_pages)
+                    # 問い合わせ項目が「なし（空）」の場合はリニューアル適合とは言えないため不可理由を差し込む
+                    if not contact_fields or contact_fields == "なし":
+                        rejection_reason = "問い合わせ入力項目が検出できませんでした（導線またはフォームの不足）。"
+                    else:
+                        rejection_reason = evaluator.compile_rejection_reason(total_pages, has_login)
 
                 # スレッドセーフに結果を書き込み
                 with self._lock:
@@ -132,11 +154,13 @@ class SiteScraperService:
                     item.is_always_ssl = is_always_ssl_val
                     item.total_pages = total_pages
                     item.max_depth = max_depth
-                    item.contact_fields = contact_fields
+                    item.contact_fields = contact_fields or "なし"
                     item.site_structure = site_structure
-                    item.cms_name = cms_name
-                    item.evaluation_result = eval_result
-                    item.rejection_reason = rejection_reason
+                    item.cms_name = cms_name or "なし"
+                    item.description = site_purpose  # K列：用途
+                    item.remarks = site_remarks  # N列：備考
+                    item.evaluation_result = eval_result  # C列：調査結果
+                    item.rejection_reason = rejection_reason  # M列：不可の理由
 
                 logger.info(f"[{job_id}] 解析完了: {item.domain_name} -> 判定: {eval_result}")
 
