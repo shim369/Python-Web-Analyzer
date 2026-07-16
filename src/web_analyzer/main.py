@@ -82,7 +82,7 @@ with st.sidebar:
     st.markdown("### 解析設定")
     st.write("調査パラメータおよび担当者名を設定してください。")
 
-    operator_name = st.text_input("担当者名", value="担当者名", placeholder="氏名を入力")
+    operator_name = st.text_input("担当者名", value="", placeholder="氏名を入力")
 
     st.markdown("---")
     st.markdown("#### 判定しきい値（ページ数）")

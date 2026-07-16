@@ -117,6 +117,7 @@ class SiteScraperService:
                         site_structure,
                         site_purpose,
                         site_remarks,
+                        is_wp_detected,
                     ) = self.crawler.crawl_and_analyze(item.domain_name)
                 except Exception as e:
                     logger.warning(f"[{item.domain_name}] クロール中にエラーまたはタイムアウトが発生しました: {e}")
@@ -124,25 +125,27 @@ class SiteScraperService:
                 # 3. CMSの検出（WordPressを含むその他の簡易検出）
                 # 大文字小文字の揺れを考慮。WordPress以外のCMS拡張にも対応しやすいように小文字変換で判定
                 cms_name = ""
-                site_structure_lower = site_structure.lower()
-                if "wp-content" in site_structure_lower or "wp-includes" in site_structure_lower:
+                # クロール中に wp-content 等が1回でも検出されていれば無条件で「WordPress」に確定
+                if is_wp_detected:
                     cms_name = "WordPress"
-                elif "shopify" in site_structure_lower:
-                    cms_name = "Shopify"
-                elif "microcms" in site_structure_lower:
-                    cms_name = "microCMS"
+                else:
+                    # その他の補助的な判定ロジック
+                    site_structure_lower = site_structure.lower()
+                    if "shopify" in site_structure_lower:
+                        cms_name = "Shopify"
+                    elif "microcms" in site_structure_lower:
+                        cms_name = "microCMS"
 
-                # 4. リニューアル評価判定 & 不可判定（新ロジック導入）
+                # 4. リニューアル評価判定 & 不可判定
+                site_structure_lower = site_structure.lower()
                 has_login = "login" in site_structure_lower or "signin" in site_structure_lower
 
-                # 判定保留判定（ページ数が中途半端に少ない場合のケア）
+                # 判定保留判定（ページ数が少なすぎる場合）
                 if total_pages <= 2:
                     eval_result = "要確認"
                     rejection_reason = f"クロールできたページ数が極端に少ないため判定を保留しました (取得数: {total_pages}ページ)。"
                 else:
-                    # 通常の評価
                     eval_result = evaluator.evaluate_rank(cms_name, total_pages)
-                    # 問い合わせ項目が「なし（空）」の場合はリニューアル適合とは言えないため不可理由を差し込む
                     if not contact_fields or contact_fields == "なし":
                         rejection_reason = "問い合わせ入力項目が検出できませんでした（導線またはフォームの不足）。"
                     else:
