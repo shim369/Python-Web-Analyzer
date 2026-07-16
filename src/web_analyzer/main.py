@@ -101,13 +101,14 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ファイルアップローダー（150文字制限を確実にクリアできるよう、改行で接続）
+# ファイルアップローダー
 uploaded_file = st.file_uploader(
     "インポート用Excelファイル（B列にドメイン名が配置されたシート）を選択、またはドラッグ＆ドロップしてください",
     type=["xlsx"],
 )
 
-if uploaded_file and operator_name:
+# operator_nameの有無にかかわらず、ファイルがアップされたら即時解析してボタンを表示する
+if uploaded_file:
     temp_dir = Path("temp")
     temp_dir.mkdir(exist_ok=True)
     input_path = temp_dir / uploaded_file.name
@@ -116,11 +117,10 @@ if uploaded_file and operator_name:
         f.write(uploaded_file.getbuffer())
 
     try:
-        # mypy の代入における型不整合を防ぐため、受ける変数の型を明示
-        job: ScrapingJob
+        # Excelの仮インポート処理
         job, assessments = ExcelService.import_excel(
             file_path=input_path,
-            operator_name=operator_name,
+            operator_name=operator_name if operator_name.strip() else "未指定",
             threshold_1=threshold_1,
             threshold_2=threshold_2,
             threshold_3=threshold_3,
@@ -128,9 +128,28 @@ if uploaded_file and operator_name:
 
         st.success(f"ファイルを正常に読み込みました。 (対象ドメイン数: {len(assessments)}件)")
 
+        # 2. 「調査を開始する」ボタン押下時のロジック
+
         if st.button("調査を開始する", use_container_width=True):
-            scraper_service.start_background_job(job, assessments)
-            st.session_state.current_job_id = job.id
+            # ボタンが押されたタイミングで、担当者名が空なら警告を出す（バリデーション）
+            if not operator_name.strip():
+                st.error("調査を開始するには、サイドバーから「担当者名」を入力してください。")
+            else:
+                # 読み取り専用プロパティの代入を避け、新しいインスタンスを再生成する
+                updated_job = ScrapingJob(
+                    id=job.id,
+                    operator_name=operator_name.strip(),  # 新しい担当者名を指定
+                    threshold_1=job.threshold_1,
+                    threshold_2=job.threshold_2,
+                    threshold_3=job.threshold_3,
+                    status=job.status,
+                    created_at=job.created_at,
+                )
+
+                # 新しく作ったオブジェクトを渡してジョブを開始
+                scraper_service.start_background_job(updated_job, assessments)
+                st.session_state.current_job_id = updated_job.id
+                st.rerun()
 
     except Exception as e:
         st.error(f"ファイルのインポート処理中にエラーが発生しました: {e}")
@@ -144,86 +163,66 @@ if job_id:
     st.markdown("---")
     st.markdown("### リアルタイム実行状況")
 
-    metrics_placeholder = st.empty()
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    download_placeholder = st.empty()
+    # 進捗データの取得
+    job_progress_info = scraper_service.get_job_progress(job_id)
+    current_job_opt = job_progress_info[0]
+    assessments = job_progress_info[1]
+    total = job_progress_info[2]
+    completed = job_progress_info[3]
 
-    while True:
-        # mypy での型割り当て不整合を避けるため、受け取る job_progress の型を考慮
-        job_progress_info = scraper_service.get_job_progress(job_id)
-        current_job_opt = job_progress_info[0]
-        assessments = job_progress_info[1]
-        total = job_progress_info[2]
-        completed = job_progress_info[3]
-
-        if not current_job_opt:
-            break
-
+    if current_job_opt:
         percent = int((completed / total) * 100) if total > 0 else 0
-        progress_bar.progress(percent)
 
-        with metrics_placeholder.container():
-            col1, col2, col3 = st.columns(3)
-            # 各メトリクスカード内の長いHTML1行を複数行に綺麗に分割
-            with col1:
-                st.markdown(
-                    '<div class="metric-card">'
-                    '<p style="margin:0;color:#666;font-size:0.9rem;">'
-                    "総ドメイン数"
-                    "</p>"
-                    f'<h2 style="margin:5px 0;color:#1F4E78;font-weight:700;">'
-                    f"{total} 件"
-                    "</h2>"
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
-            with col2:
-                st.markdown(
-                    '<div class="metric-card">'
-                    '<p style="margin:0;color:#666;font-size:0.9rem;">'
-                    "解析完了"
-                    "</p>"
-                    f'<h2 style="margin:5px 0;color:#2e7d32;font-weight:700;">'
-                    f"{completed} 件"
-                    "</h2>"
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
-            with col3:
-                st.markdown(
-                    '<div class="metric-card">'
-                    '<p style="margin:0;color:#666;font-size:0.9rem;">'
-                    "現在の進捗率"
-                    "</p>"
-                    f'<h2 style="margin:5px 0;color:#333;font-weight:700;">'
-                    f"{percent} %"
-                    "</h2>"
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
+        # 進捗バーとメトリクスの表示
+        st.progress(percent)
 
-        status_text.write(f"処理実行中... ({completed}/{total} 件完了)")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown(
+                '<div class="metric-card">'
+                '<p style="margin:0;color:#666;font-size:0.9rem;">総ドメイン数</p>'
+                f'<h2 style="margin:5px 0;color:#1F4E78;font-weight:700;">{total} 件</h2>'
+                "</div>",
+                unsafe_allow_html=True,
+            )
+        with col2:
+            st.markdown(
+                '<div class="metric-card">'
+                '<p style="margin:0;color:#666;font-size:0.9rem;">解析完了</p>'
+                f'<h2 style="margin:5px 0;color:#2e7d32;font-weight:700;">{completed} 件</h2>'
+                "</div>",
+                unsafe_allow_html=True,
+            )
+        with col3:
+            st.markdown(
+                '<div class="metric-card">'
+                '<p style="margin:0;color:#666;font-size:0.9rem;">現在の進捗率</p>'
+                f'<h2 style="margin:5px 0;color:#333;font-weight:700;">{percent} %</h2>'
+                "</div>",
+                unsafe_allow_html=True,
+            )
 
-        if current_job_opt.status == "completed":
-            status_text.success("すべてのドメインの解析が完了しました。")
+        # ステータスごとの処理
+        if current_job_opt.status == "processing":
+            st.info(f"処理実行中... ({completed}/{total} 件完了)")
+            time.sleep(1.5)  # サーバー負荷防止のため少し休止
+            st.rerun()  # 画面をリロードして進捗を最新にする
+
+        elif current_job_opt.status == "completed":
+            st.success("すべてのドメインの解析が完了しました。")
 
             output_filename = f"result_{datetime.now().strftime('%Y%m%d%H%M%S')}.xlsx"
             output_path = Path("temp") / output_filename
             ExcelService.export_excel(assessments, output_path)
 
             with open(output_path, "rb") as file:
-                download_placeholder.download_button(
+                st.download_button(
                     label="調査結果Excelをダウンロード",
                     data=file,
                     file_name=output_filename,
-                    mime=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
-            break
 
         elif current_job_opt.status == "failed":
-            status_text.error("予期せぬエラーが発生したため、処理が中断されました。")
-            break
-
-        time.sleep(1)
+            st.error("予期せぬエラーが発生したため、処理が中断されました。")

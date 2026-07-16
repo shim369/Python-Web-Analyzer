@@ -41,7 +41,7 @@
 | **I** | ページ数 | 整数 | 同一ドメイン内のすべての内部リンクを巡回し、総ページ数を集計。<br>
 
 <br>**(新仕様: 接続時にタイムアウト(1ページあたり2.5秒、ジョブ全体で最大12秒)が発生した場合は空欄とせず「0」やフォールバック接続結果を出力)** |
-| **J** | 使用CMS | 文字列 | **(新仕様: HTMLソース内に `wp-content` または `wp-includes` を1回でも検出した場合は、100%確実に『WordPress』と出力)**。その他、ShopifyやmicroCMSなども並行検出。 |
+| **J** | 使用CMS | 文字列 | **(最新仕様: HTMLソース内のシグネチャから国内主要CMSを多角的に判定)**<br>以下の優先判定ルールに基づいてCMS名を自動特定し、非CMSサイトは「なし」と出力する。<br>・`wp-content` / `wp-includes` ➔ **WordPress**<br>・`mt-static` / `/.shared/mt-static/` ➔ **Movable Type / MovableType.net**<br>・`eccube` ➔ **EC-CUBE**<br>・`concrete` / `/ccm/` ➔ **Concrete CMS**<br>・`ablogcms` ➔ **a-blog cms**<br>・`basercms` ➔ **baserCMS**<br>・`shopify` ➔ **Shopify** |
 | **K** | 用途 | 文字列 | トップページのメタ情報より優先度順に抽出。(1) `<meta name="description">` ➔ (2) `<title>` ➔ (3) `<h1>`。最大100文字。 |
 | **L** | 問合せ項目 | 文字列 | **(新仕様: 問い合わせテキストリンク(日本語)や '/mail/'、外部フォーム埋め込み（Formrun, Tayori, Google Forms）を自動判別し、項目名を改行区切りで出力)**。 |
 | **M** | 不可の理由 | 文字列 | (1) ページ数が2ページ以下 ➔ 「**クロールできたページ数が極端に少ないため判定を保留しました...**」<br>

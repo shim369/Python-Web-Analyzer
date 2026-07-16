@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup, Tag
 
 
 class WebCrawler:
-    """同一ドメイン内の巡回、ページ数カウント、および問い合わせページの解析を行うクローラー。"""
+    """同一ドメイン内の巡回、ページ数カウント、国内主要CMSの特定、および問い合わせページの解析を行うクローラー。"""
 
     def __init__(self, timeout: float = 12.0) -> None:
         # クロール全体の最大処理時間（秒）
@@ -55,7 +55,47 @@ class WebCrawler:
 
         return True
 
-    def _extract_purpose_and_features(self, html: str, url: str, is_wp: bool) -> tuple[str, str]:
+    def _detect_cms(self, html_src: str) -> str:
+        """HTMLソース内から、国内で利用される主要なCMSのシグネチャを検知し、CMS名を返す。"""
+        html_lower = html_src.lower()
+
+        # 1. WordPress (最優先検出)
+        if "wp-content" in html_lower or "wp-includes" in html_lower or 'content="wordpress' in html_lower:
+            return "WordPress"
+
+        # 2. Movable Type (SaaS版とインストールパッケージ版)
+        if "/.shared/mt-static/" in html_lower:
+            return "MovableType.net"
+        if "mt-static" in html_lower or 'content="movable type' in html_lower:
+            return "Movable Type"
+
+        # 3. EC-Cube (ECサイトに特化)
+        if "eccube" in html_lower or "user_data/packages/default" in html_lower:
+            return "EC-CUBE"
+
+        # 4. Concrete CMS (旧concrete5)
+        if "concrete5" in html_lower or "/ccm/" in html_lower or "/updates/concrete" in html_lower:
+            return "Concrete CMS"
+
+        # 5. a-blog cms (国産)
+        if "ablogcms" in html_lower or "/themes/system/images/" in html_lower:
+            return "a-blog cms"
+
+        # 6. baserCMS (国産)
+        if "basercms" in html_lower or "baser_helper" in html_lower:
+            return "baserCMS"
+
+        # 7. Shopify
+        if "shopify" in html_lower or "cdn.shopify.com" in html_lower:
+            return "Shopify"
+
+        # 8. microCMS
+        if "microcms" in html_lower or "images.microcms-assets.io" in html_lower:
+            return "microCMS"
+
+        return "なし"
+
+    def _extract_purpose_and_features(self, html: str, url: str, cms_name: str) -> tuple[str, str]:
         """トップページのHTMLから用途を判定し、特徴（備考）を生成する。"""
         soup = BeautifulSoup(html, "html.parser")
 
@@ -82,16 +122,20 @@ class WebCrawler:
         if len(purpose) > 100:
             purpose = purpose[:100] + "..."
 
-        # 2. 特徴・備考の自動生成
+        # 2. 特徴・備考の自動生成（検出CMSに応じた動的な記述への対応）
         features: list[str] = []
         text_content = soup.get_text().lower()
 
         if "採用" in text_content or "recruit" in url.lower():
             features.append("採用活動に注力している")
+
         if any(k in text_content for k in ["カート", "買い物かご", "商品一覧", "特定商取引", "cart", "shop"]):
             features.append("EC/オンラインショップ機能を有している")
-        if is_wp:
-            features.append("WordPressによるWeb運用を行っている")
+
+        # 検出されたCMS別の備考テキスト合成
+        if cms_name != "なし":
+            features.append(f"{cms_name}によるWebシステム運用を行っている")
+
         if "instagram.com" in html:
             features.append("InstagramなどのSNSを活用したWebマーケティングを実施している")
 
@@ -157,7 +201,7 @@ class WebCrawler:
 
         return "\n".join(fields[:15])
 
-    def crawl_and_analyze(self, start_url: str) -> tuple[int, int, str, str, str, str, bool]:
+    def crawl_and_analyze(self, start_url: str) -> tuple[int, int, str, str, str, str, str]:
         """巡回を行い、用途・特徴（備考）を優先判定しつつ解析を行う。"""
         # プロトコルの初期補正（デフォルトはHTTPS。のちのフォールバックでHTTPも試す）
         if not start_url.startswith(("http://", "https://")):
@@ -179,7 +223,10 @@ class WebCrawler:
         global_nav_menus: list[str] = []
         site_purpose = ""
         site_remarks = ""
-        is_wp_detected = False
+        cms_name = "なし"
+
+        # 💡 [修正] UnboundLocalError 回避のための初期定義
+        html_src = ""
 
         # 各接続のタイムアウト。全体のタイムアウトが12秒なので、1ページあたりは短めの2.5秒に抑えて高速処理する
         page_timeout = 2.5
@@ -195,34 +242,32 @@ class WebCrawler:
                 # 2. 最初のトップページ接続（HTTPS -> 失敗時HTTPへの切り替え）
                 try:
                     response = client.get(primary_url)
-                    # response.url を str() で囲んで文字列化する
                     queue.append((str(response.url), 0))
                 except Exception:
                     if fallback_url:
                         try:
                             response = client.get(fallback_url)
-                            # response.url を str() で囲んで文字列化する
                             queue.append((str(response.url), 0))
                         except Exception:
-                            # 両方失敗した場合は、接続エラー扱いで返す
+                            # 💡 [修正] 接続エラー時もサービス側初期値と整合性を取ってタプル返却
                             return (
                                 0,
                                 0,
                                 "",
-                                "取得失敗（接続不可）",
-                                "接続エラーにより取得不可",
+                                "取得失敗（接続エラーまたはタイムアウト）",
+                                "コーポレートサイト",
                                 "サイトに接続できませんでした。サーバーが停止しているか、アクセスが拒否されています。",
-                                False,
+                                "なし",
                             )
                     else:
                         return (
                             0,
                             0,
                             "",
-                            "取得失敗（接続不可）",
-                            "接続エラーにより取得不可",
+                            "取得失敗（接続エラーまたはタイムアウト）",
+                            "コーポレートサイト",
                             "サイトに接続できませんでした。サーバーが停止しているか、アクセスが拒否されています。",
-                            False,
+                            "なし",
                         )
 
                 # 3. クロールループ
@@ -242,14 +287,18 @@ class WebCrawler:
                         max_depth = max(max_depth, depth)
 
                         html_src = response.text
-                        if "wp-content" in html_src or "wp-includes" in html_src:
-                            is_wp_detected = True
+
+                        # CMSの判定（WordPressをはじめ、MTや国産CMSシグネチャを多角的に検出。見つかった段階で更新）
+                        detected = self._detect_cms(html_src)
+                        if detected != "なし" and cms_name == "なし":
+                            cms_name = detected
 
                         soup = BeautifulSoup(html_src, "html.parser")
 
                         # トップページの解析（一番初めに訪問したページ）
                         if len(visited) == 1:
-                            site_purpose, site_remarks = self._extract_purpose_and_features(html_src, current_url, is_wp_detected)
+                            # 備考(features)に正しく検出中のCMS名を反映
+                            site_purpose, site_remarks = self._extract_purpose_and_features(html_src, current_url, cms_name)
 
                             # グローバルナビゲーションの抽出
                             nav = soup.find(["nav", "header"]) or soup.find(class_=lambda x: x and ("menu" in x or "nav" in x))
@@ -290,9 +339,9 @@ class WebCrawler:
         except Exception as e:
             print(f"[Warning] クローラー内で予期せぬエラーが発生しました: {e}")
 
-        # WordPress判定を最終調整（備考と連動）
-        if is_wp_detected and "WordPress" not in site_remarks:
-            _, site_remarks = self._extract_purpose_and_features("", start_url, True)
+        # クロール後半でCMSが発見された場合、備考の最終調整（未反映であれば備考テキストを再生成）
+        if cms_name != "なし" and cms_name not in site_remarks and html_src:
+            _, site_remarks = self._extract_purpose_and_features(html_src, start_url, cms_name)
 
         site_structure = "\n".join(global_nav_menus[:10])
 
@@ -303,5 +352,5 @@ class WebCrawler:
             site_structure,
             site_purpose,
             site_remarks,
-            is_wp_detected,
+            cms_name,
         )

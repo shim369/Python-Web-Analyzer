@@ -20,7 +20,7 @@ class SiteScraperService:
 
     def __init__(self) -> None:
         self.ssl_checker = SslChecker()
-        self.crawler = WebCrawler()
+        # 💡 [修正] crawlerの共通インスタンス保持を廃止し、スレッドごとに生成するようにします
 
         # ジョブや解析データをメモリ上で保持するキャッシュ
         self._jobs_cache: dict[str, ScrapingJob] = {}
@@ -38,7 +38,7 @@ class SiteScraperService:
             if not job or not assessments:
                 return None, [], 0, 0
 
-            # 処理完了件数をカウント（判定結果が書き込まれている、または取得済みのものをカウント）
+            # 処理完了件数をカウント（判定結果が空欄以外になっているものをカウント）
             completed_count = sum(1 for item in assessments if item.evaluation_result != "")
             total_count = len(assessments)
 
@@ -80,7 +80,7 @@ class SiteScraperService:
             for item in assessments:
                 logger.info(f"[{job_id}] 解析開始: {item.domain_name}")
 
-                # 初期値を空文字 "" に設定
+                # 初期値を安全に設定
                 has_ssl_val: str = ""
                 is_always_ssl_val: str = ""
                 total_pages, max_depth, contact_fields, site_structure = (
@@ -89,8 +89,9 @@ class SiteScraperService:
                     "",
                     "取得失敗（接続エラーまたはタイムアウト）",
                 )
-                site_purpose = ""
-                site_remarks = ""
+                site_purpose = "コーポレートサイト"
+                site_remarks = "サイトに接続できませんでした。サーバーが停止しているか、アクセスが拒否されています。"
+                cms_name = "なし"
 
                 # 1. SSL判定の実行
                 try:
@@ -108,7 +109,8 @@ class SiteScraperService:
                     has_ssl_val = ""
                     is_always_ssl_val = ""
 
-                # 2. クローラー巡回（新仕様: 戻り値が6つに変更）
+                # 2. クローラー巡回（💡 スレッドセーフ化のためにスレッド毎にインスタンスを生成）
+                crawler = WebCrawler()
                 try:
                     (
                         total_pages,
@@ -117,36 +119,25 @@ class SiteScraperService:
                         site_structure,
                         site_purpose,
                         site_remarks,
-                        is_wp_detected,
-                    ) = self.crawler.crawl_and_analyze(item.domain_name)
+                        cms_name,
+                    ) = crawler.crawl_and_analyze(item.domain_name)
                 except Exception as e:
-                    logger.warning(f"[{item.domain_name}] クロール中にエラーまたはタイムアウトが発生しました: {e}")
-
-                # 3. CMSの検出（WordPressを含むその他の簡易検出）
-                # 大文字小文字の揺れを考慮。WordPress以外のCMS拡張にも対応しやすいように小文字変換で判定
-                cms_name = ""
-                # クロール中に wp-content 等が1回でも検出されていれば無条件で「WordPress」に確定
-                if is_wp_detected:
-                    cms_name = "WordPress"
-                else:
-                    # その他の補助的な判定ロジック
-                    site_structure_lower = site_structure.lower()
-                    if "shopify" in site_structure_lower:
-                        cms_name = "Shopify"
-                    elif "microcms" in site_structure_lower:
-                        cms_name = "microCMS"
+                    logger.warning(f"[{item.domain_name}] クロール中に予期せぬエラーが発生しました: {e}")
 
                 # 4. リニューアル評価判定 & 不可判定
                 site_structure_lower = site_structure.lower()
                 has_login = "login" in site_structure_lower or "signin" in site_structure_lower
 
-                # 判定保留判定（ページ数が少なすぎる場合）
-                if total_pages <= 2:
+                # 💡 [修正] 接続失敗時（total_pages == 0）と巡回低ページ（1〜2）をきれいに切り分け
+                if total_pages == 0:
+                    eval_result = "要確認"
+                    rejection_reason = "接続不可またはアクセス拒否のため、判定を保留しました。"
+                elif 1 <= total_pages <= 2:
                     eval_result = "要確認"
                     rejection_reason = f"クロールできたページ数が極端に少ないため判定を保留しました (取得数: {total_pages}ページ)。"
                 else:
                     eval_result = evaluator.evaluate_rank(cms_name, total_pages)
-                    if not contact_fields or contact_fields == "なし":
+                    if not contact_fields or contact_fields == "なし" or contact_fields.strip() == "":
                         rejection_reason = "問い合わせ入力項目が検出できませんでした（導線またはフォームの不足）。"
                     else:
                         rejection_reason = evaluator.compile_rejection_reason(total_pages, has_login)
@@ -157,9 +148,15 @@ class SiteScraperService:
                     item.is_always_ssl = is_always_ssl_val
                     item.total_pages = total_pages
                     item.max_depth = max_depth
-                    item.contact_fields = contact_fields or "なし"
+
+                    # 💡 [修正] ページ数0の場合は「取得失敗（接続エラー...）」の初期値を活かし、それ以外は代入
+                    if total_pages == 0:
+                        item.contact_fields = "なし"
+                    else:
+                        item.contact_fields = contact_fields or "なし"
+
                     item.site_structure = site_structure
-                    item.cms_name = cms_name or "なし"
+                    item.cms_name = cms_name
                     item.description = site_purpose  # K列：用途
                     item.remarks = site_remarks  # N列：備考
                     item.evaluation_result = eval_result  # C列：調査結果
