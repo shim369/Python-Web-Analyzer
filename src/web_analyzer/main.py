@@ -33,7 +33,6 @@ st.markdown(
         }
         /* サブタイトルの装飾 */
         .sub-title {
-            color: #ffffff;
             font-size: 0.95rem;
             margin-bottom: 2rem;
         }

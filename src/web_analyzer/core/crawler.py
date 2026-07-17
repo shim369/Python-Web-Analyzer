@@ -93,7 +93,19 @@ class WebCrawler:
         if "microcms" in html_lower or "images.microcms-assets.io" in html_lower:
             return "microCMS"
 
-        return "なし"
+        # 9. Wix
+        if "wixstatic.com" in html_lower or 'content="wix.com' in html_lower:
+            return "Wix"
+
+        # 10. MakeShop (国内メジャーEC)
+        if "makeshop.jp" in html_lower or "/shopimages/" in html_lower:
+            return "MakeShop"
+
+        # 11. DNN (DotNetNuke)
+        if "dotnetnuke" in html_lower or "__dnnvariable" in html_lower or 'content="dotnetnuke' in html_lower:
+            return "DNN"
+
+        return "その他 / 不明"
 
     def _extract_purpose_and_features(self, html: str, url: str, cms_name: str) -> tuple[str, str]:
         """トップページのHTMLから用途を判定し、特徴（備考）を生成する。"""

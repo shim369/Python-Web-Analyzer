@@ -93,7 +93,7 @@ class SiteScraperService:
                 site_remarks = "サイトに接続できませんでした。サーバーが停止しているか、アクセスが拒否されています。"
                 cms_name = "なし"
 
-                # 1. SSL判定の実行
+                # 1. SSL判定の実行 (修正: ◯/× -> あり/なし)
                 try:
                     has_ssl, is_always_ssl = self.ssl_checker.check_ssl_status(item.domain_name)
 
@@ -101,15 +101,15 @@ class SiteScraperService:
                         has_ssl_val = ""
                         is_always_ssl_val = ""
                     else:
-                        has_ssl_val = "◯" if has_ssl else "×"
-                        is_always_ssl_val = "◯" if is_always_ssl else "×"
+                        has_ssl_val = "あり" if has_ssl else "なし"
+                        is_always_ssl_val = "あり" if is_always_ssl else "なし"
 
                 except Exception as e:
                     logger.warning(f"[{item.domain_name}] SSLチェック中にエラーが発生しました: {e}")
                     has_ssl_val = ""
                     is_always_ssl_val = ""
 
-                # 2. クローラー巡回（💡 スレッドセーフ化のためにスレッド毎にインスタンスを生成）
+                # 2. クローラー巡回
                 crawler = WebCrawler()
                 try:
                     (
@@ -128,7 +128,6 @@ class SiteScraperService:
                 site_structure_lower = site_structure.lower()
                 has_login = "login" in site_structure_lower or "signin" in site_structure_lower
 
-                # 💡 [修正] 接続失敗時（total_pages == 0）と巡回低ページ（1〜2）をきれいに切り分け
                 if total_pages == 0:
                     eval_result = "要確認"
                     rejection_reason = "接続不可またはアクセス拒否のため、判定を保留しました。"
@@ -149,7 +148,6 @@ class SiteScraperService:
                     item.total_pages = total_pages
                     item.max_depth = max_depth
 
-                    # 💡 [修正] ページ数0の場合は「取得失敗（接続エラー...）」の初期値を活かし、それ以外は代入
                     if total_pages == 0:
                         item.contact_fields = "なし"
                     else:
@@ -157,10 +155,10 @@ class SiteScraperService:
 
                     item.site_structure = site_structure
                     item.cms_name = cms_name
-                    item.description = site_purpose  # K列：用途
-                    item.remarks = site_remarks  # N列：備考
-                    item.evaluation_result = eval_result  # C列：調査結果
-                    item.rejection_reason = rejection_reason  # M列：不可の理由
+                    item.description = site_purpose
+                    item.remarks = site_remarks
+                    item.evaluation_result = eval_result
+                    item.rejection_reason = rejection_reason
 
                 logger.info(f"[{job_id}] 解析完了: {item.domain_name} -> 判定: {eval_result}")
 
