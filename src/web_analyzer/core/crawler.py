@@ -151,9 +151,7 @@ class WebCrawler:
         if "instagram.com" in html:
             features.append("InstagramなどのSNSを活用したWebマーケティングを実施している")
 
-        features_summary = (
-            "、".join(features) + "特徴が見受けられます。" if features else "シンプルな構成のコーポレート・Web紹介サイトの特徴を持っています。"
-        )
+        features_summary = "、".join(features) + "特徴が見受けられます。" if features else "シンプルな構成のコーポレート・Web紹介サイトの特徴を持っています。"
 
         return purpose, features_summary
 
@@ -321,9 +319,7 @@ class WebCrawler:
                                         global_nav_menus.append(menu_text)
 
                         # 問い合わせページの判定（"mail" を対象に含む）
-                        is_contact_url = any(
-                            k in current_url.lower() for k in ["contact", "inquiry", "otoiawase", "entry", "support", "form", "mail"]
-                        )
+                        is_contact_url = any(k in current_url.lower() for k in ["contact", "inquiry", "otoiawase", "entry", "support", "form", "mail"])
                         has_contact_text = False
                         contact_link_tag = soup.find("a", string=re.compile(r"問い合わせ|問合せ|相談|コンタクト|送信", re.I))
                         if contact_link_tag:

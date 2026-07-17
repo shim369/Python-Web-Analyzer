@@ -12,9 +12,7 @@ class SslChecker:
     def __init__(self, timeout: float = 10.0) -> None:
         self.timeout = timeout
         # Google等にブロックされにくいよう、一般的なブラウザのUser-Agentを設定
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
+        self.headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
 
     def _normalize_url(self, url_or_domain: str) -> str:
         """入力された文字列からドメインを抽出し、検証用の http:// URLを生成する。"""

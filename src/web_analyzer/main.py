@@ -194,10 +194,7 @@ if job_id:
             )
         with col3:
             st.markdown(
-                '<div class="metric-card">'
-                '<p style="margin:0;color:#666;font-size:0.9rem;">現在の進捗率</p>'
-                f'<h2 style="margin:5px 0;color:#333;font-weight:700;">{percent} %</h2>'
-                "</div>",
+                f'<div class="metric-card"><p style="margin:0;color:#666;font-size:0.9rem;">現在の進捗率</p><h2 style="margin:5px 0;color:#333;font-weight:700;">{percent} %</h2></div>',
                 unsafe_allow_html=True,
             )
 
