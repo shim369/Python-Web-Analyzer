@@ -31,7 +31,7 @@ class RenewalEvaluator:
         has_heavy_animation: bool = False,
         has_floating_sidebar: bool = False,
         is_multilingual: bool = False,
-        has_file_upload: bool = False
+        has_file_upload: bool = False,
     ) -> str:
         """判定が「×」や「△」となる対象外・懸念となる具体的な理由を複合的に判定して出力する。"""
 
