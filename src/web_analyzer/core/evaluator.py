@@ -31,7 +31,7 @@ class RenewalEvaluator:
         has_heavy_animation: bool = False,
         has_floating_sidebar: bool = False,
         is_multilingual: bool = False,
-        has_file_upload: bool = False,
+        has_file_upload: bool = False
     ) -> str:
         """判定が「×」や「△」となる対象外・懸念となる具体的な理由を複合的に判定して出力する。"""
 
@@ -49,7 +49,7 @@ class RenewalEvaluator:
 
         # 設定された「最大しきい値3」を超えた場合に対象外理由とする
         if total_pages > self.threshold_3:
-            reasons.append("総ページ数がリニューアル移行の対象基準を超えているため")
+            reasons.append(f"総ページ数がリニューアル移行の対象基準（{self.threshold_3}P以内）を超えているため(現在: {total_pages}P)")
 
         # --- 追加された対象外・減点条件 ---
         if has_search:
