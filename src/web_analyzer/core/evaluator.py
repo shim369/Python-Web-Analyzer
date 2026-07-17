@@ -47,9 +47,11 @@ class RenewalEvaluator:
         if has_file_upload:
             reasons.append("フォームにファイル添付機能（履歴書や図面等）があるため")
 
-        if total_pages > self.threshold_1:  # 10P超え（実務判断基準の10P以内をベースに判定）
-            reasons.append(f"総ページ数が小規模サイトの基準（10P以内）を超えているため(現在: {total_pages}P)")
+        # 設定された「最大しきい値3」を超えた場合に対象外理由とする
+        if total_pages > self.threshold_3:
+            reasons.append(f"総ページ数がリニューアル移行の対象基準（{self.threshold_3}P以内）を超えているため")
 
+        # --- 追加された対象外・減点条件 ---
         if has_search:
             reasons.append("サイト内検索機能が存在するため")
 
@@ -59,8 +61,9 @@ class RenewalEvaluator:
         if has_floating_sidebar:
             reasons.append("追従型のフローティングサイドバーを利用しているため")
 
-        # 理由を綺麗に結合して返却
+        # 理由があれば「【対象外・要確認の理由】」を付けて返し、なければ空欄にする
         if reasons:
             return "【対象外・要確認の理由】 " + " / ".join(reasons)
 
-        return "高度なCMS運用を前提としない、移行に最適なシンプル構成です。"
+        # 移行対象（問題なし）の場合は、何も出力しない
+        return ""

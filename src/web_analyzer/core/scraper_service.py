@@ -128,6 +128,10 @@ class SiteScraperService:
                 site_structure_lower = site_structure.lower()
                 has_login = "login" in site_structure_lower or "signin" in site_structure_lower
 
+                # --- [ここから修正・追加] ---
+                # クローラーから渡ってきた情報や、今後追加する変数（一時的に既存変数で代入、または拡張）
+                # ※クローラーが「対象外」と判断した理由が site_remarks に入っている場合の整合性を取ります
+
                 if total_pages == 0:
                     eval_result = "要確認"
                     rejection_reason = "接続不可またはアクセス拒否のため、判定を保留しました。"
@@ -135,11 +139,29 @@ class SiteScraperService:
                     eval_result = "要確認"
                     rejection_reason = f"クロールできたページ数が極端に少ないため判定を保留しました (取得数: {total_pages}ページ)。"
                 else:
-                    eval_result = evaluator.evaluate_rank(cms_name, total_pages)
-                    if not contact_fields or contact_fields == "なし" or contact_fields.strip() == "":
-                        rejection_reason = "問い合わせ入力項目が検出できませんでした（導線またはフォームの不足）。"
+                    # 5. まず追加条件も含めて「不可理由」を生成
+                    rejection_reason = evaluator.compile_rejection_reason(
+                        total_pages=total_pages,
+                        has_login=has_login,
+                        # 必要に応じて、クローラー側で検知したフラグをここに渡す
+                    )
+
+                    # 6. 不可理由が生成された（＝対象外の要素がある）場合は、評価を強制的に「×」にする
+                    if "【対象外・要確認の理由】" in rejection_reason:
+                        eval_result = "×"
                     else:
-                        rejection_reason = evaluator.compile_rejection_reason(total_pages, has_login)
+                        # 対象外の理由がなければ、ページ数ベースの推奨度をそのまま適用
+                        eval_result = evaluator.evaluate_rank(cms_name, total_pages)
+
+                # 7. 評価結果と備考の矛盾を防ぐための文言調整
+                if eval_result in ["◎", "◯", "△"]:
+                    # 対象（移行推奨）の場合は、備考が「対象外」から始まらないようにクリーンアップ
+                    if "対象外" in site_remarks or site_remarks.startswith("サイトに接続できませんでした"):
+                        site_remarks = "正常に巡回を完了しました。"
+                elif eval_result == "×":
+                    # 対象外の場合は、備考に不可理由を添えるか、綺麗に同期させる
+                    site_remarks = f"判定：対象外。{rejection_reason}"
+                # --- [ここまで修正・追加] ---
 
                 # スレッドセーフに結果を書き込み
                 with self._lock:
@@ -156,9 +178,9 @@ class SiteScraperService:
                     item.site_structure = site_structure
                     item.cms_name = cms_name
                     item.description = site_purpose
-                    item.remarks = site_remarks
-                    item.evaluation_result = eval_result
-                    item.rejection_reason = rejection_reason
+                    item.remarks = site_remarks  # 矛盾のない備考が格納される
+                    item.evaluation_result = eval_result  # 連動した判定結果が格納される
+                    item.rejection_reason = rejection_reason  # 不可理由
 
                 logger.info(f"[{job_id}] 解析完了: {item.domain_name} -> 判定: {eval_result}")
 
