@@ -16,7 +16,5 @@ def test_evaluate_rank_and_reason() -> None:
 
     # ケース3: 20ページ超過 -> ×
     assert evaluator.evaluate_rank(cms_name="", total_pages=25) == "×"
-    assert evaluator.compile_rejection_reason(total_pages=25, has_login=False) == "ページ数が多いため"
 
-    # 期待するテキストを新しい実装仕様（しきい値動的埋め込み）に合わせます
     assert evaluator.compile_rejection_reason(total_pages=25, has_login=False) == "【対象外・要確認の理由】 総ページ数がリニューアル移行の対象基準（20P以内）を超えているため(現在: 25P)"
