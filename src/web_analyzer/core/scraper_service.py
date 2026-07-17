@@ -102,7 +102,7 @@ class SiteScraperService:
                         is_always_ssl_val = ""
                     else:
                         has_ssl_val = "あり" if has_ssl else "なし"
-                        is_always_ssl_val = "あり" if is_always_ssl else "なし"
+                        is_always_ssl_val = "◯" if is_always_ssl else "×"
 
                 except Exception as e:
                     logger.warning(f"[{item.domain_name}] SSLチェック中にエラーが発生しました: {e}")
