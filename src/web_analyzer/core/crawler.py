@@ -170,8 +170,8 @@ class WebCrawler:
 
         return "\n".join(fields[:15])
 
-    def crawl_and_analyze(self, start_url: str) -> tuple[int, int, str, str, str, str, str]:
-        """巡回を行い、用途を優先判定しつつ解析を行う。"""
+    def crawl_and_analyze(self, start_url: str) -> tuple[int | str, int, str, str, str, str, str]:
+        """巡回を行い、用途を優先判定しつつ解析を行う。100ページに達した時点で打ち切る。"""
         if not start_url.startswith(("http://", "https://")):
             primary_url = f"https://{start_url}"
             fallback_url = f"http://{start_url}"
@@ -184,6 +184,7 @@ class WebCrawler:
 
         visited: set[str] = set()
         queue: list[tuple[str, int]] = []
+        is_over_100 = False  # 100ページ以上フラグ
 
         max_depth = 0
         contact_fields = ""
@@ -215,6 +216,11 @@ class WebCrawler:
                         return (0, 0, "", "", "", "", "")
 
                 while queue:
+                    # 100ページ以上の場合は打ち切り
+                    if len(visited) >= 100:
+                        is_over_100 = True
+                        break
+
                     if time.time() - start_time > self.timeout:
                         break
 
@@ -225,6 +231,11 @@ class WebCrawler:
 
                     try:
                         response = client.get(current_url)
+
+                        if len(visited) >= 100:
+                            is_over_100 = True
+                            break
+
                         visited.add(normalized_url)
                         max_depth = max(max_depth, depth)
 
@@ -274,12 +285,15 @@ class WebCrawler:
 
         site_structure = "\n".join(global_nav_menus[:10])
 
+        # 100ページ以上の判定結果を適用
+        final_page_count = "100ページ以上" if is_over_100 or len(visited) >= 100 else len(visited)
+
         return (
-            len(visited),
+            final_page_count,
             max_depth,
             contact_fields,
             site_structure,
             site_purpose,
-            "",  # 備考（site_remarks）は常に空文字列を返却
+            "",
             cms_name,
         )

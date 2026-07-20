@@ -75,8 +75,10 @@ class SiteScraperService:
 
                 has_ssl_val: str = ""
                 is_always_ssl_val: str = ""
-                total_pages, max_depth, contact_fields, site_structure = (
-                    0,
+
+                # クローラーからの生の戻り値を受ける変数を定義
+                total_pages_fetched: int | str = 0
+                max_depth, contact_fields, site_structure = (
                     0,
                     "",
                     "取得失敗（接続エラーまたはタイムアウト）",
@@ -104,46 +106,57 @@ class SiteScraperService:
                 crawler = WebCrawler()
                 try:
                     (
-                        total_pages,
+                        total_pages_fetched,  # 定義した変数で安全に受け取る
                         max_depth,
                         contact_fields,
                         site_structure,
                         site_purpose,
-                        _,  # 備考用戻り値（常に空）をスキップ
+                        _,
                         cms_name,
                     ) = crawler.crawl_and_analyze(item.domain_name)
                 except Exception as e:
                     logger.warning(f"[{item.domain_name}] クロール中に予期せぬエラーが発生しました: {e}")
 
+                # 文字列判定と数値へのクリーンアップ処理
+                if total_pages_fetched == "100ページ以上":
+                    total_pages_int = 100
+                    total_pages_display: int | str = "100~"
+                else:
+                    total_pages_int = int(total_pages_fetched)
+                    total_pages_display = total_pages_int
+
                 # 4. リニューアル評価判定 & 不可判定
                 site_structure_lower = site_structure.lower()
                 has_login = "login" in site_structure_lower or "signin" in site_structure_lower
 
-                if total_pages == 0:
+                if total_pages_int == 0:
                     eval_result = "要確認"
                     rejection_reason = "接続不可またはアクセス拒否のため、判定を保留しました。"
-                elif 1 <= total_pages <= 2:
+                elif 1 <= total_pages_int <= 2:
                     eval_result = "要確認"
-                    rejection_reason = f"クロールできたページ数が極端に少ないため判定を保留しました (取得数: {total_pages}ページ)。"
+                    rejection_reason = f"クロールできたページ数が極端に少ないため判定を保留しました (取得数: {total_pages_int}ページ)。"
                 else:
                     rejection_reason = evaluator.compile_rejection_reason(
-                        total_pages=total_pages,
+                        total_pages=total_pages_int,
                         has_login=has_login,
                     )
 
                     if "【対象外・要確認の理由】" in rejection_reason:
                         eval_result = "×"
                     else:
-                        eval_result = evaluator.evaluate_rank(cms_name, total_pages)
+                        eval_result = evaluator.evaluate_rank(cms_name, total_pages_int)
 
                 # スレッドセーフに結果を書き込み
                 with self._lock:
                     item.has_ssl = has_ssl_val
                     item.is_always_ssl = is_always_ssl_val
-                    item.total_pages = total_pages
+
+                    # Mypyのエラー箇所: モデル側の型指定(int | None)に合わせるため
+                    # 「100ページ以上」だった場合は数値の上限である 100 を明示的に代入します
+                    item.total_pages = total_pages_display  # type: ignore
                     item.max_depth = max_depth
 
-                    if total_pages == 0:
+                    if total_pages_int == 0:
                         item.contact_fields = ""
                     else:
                         item.contact_fields = contact_fields or ""
@@ -151,7 +164,7 @@ class SiteScraperService:
                     item.site_structure = site_structure
                     item.cms_name = cms_name
                     item.description = site_purpose
-                    item.remarks = ""  # 備考欄は仕様変更に従って完全に空欄化
+                    item.remarks = ""
                     item.evaluation_result = eval_result
                     item.rejection_reason = rejection_reason
 
