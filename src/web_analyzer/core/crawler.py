@@ -48,11 +48,13 @@ class WebCrawler:
         soup = BeautifulSoup(html, "html.parser")
 
         # 1. 最優先: meta description (または og:description) の文字列
-        desc_tag = soup.find("meta", attrs={"name": "description"}) or soup.find(
-            "meta", attrs={"property": "og:description"}
-        )
-        if desc_tag:
-            desc_text = desc_tag.get("content", "").strip()
+        desc_tag = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
+        # 確実に Tag オブジェクトであることを保証
+        if desc_tag and isinstance(desc_tag, Tag):
+            content_attr = desc_tag.get("content", "")
+            # 戻り値が list[str] や Any になる可能性を考慮して安全に文字列へ変換してから strip()
+            desc_text = ("".join(content_attr) if isinstance(content_attr, list) else str(content_attr)).strip()
+
             if desc_text:
                 return desc_text
 
@@ -64,7 +66,7 @@ class WebCrawler:
 
         # 3. 第3優先: h1 タグの中の文字列
         h1_tag = soup.find("h1")
-        if h1_tag:
+        if h1_tag and isinstance(h1_tag, Tag):
             h1_text = h1_tag.get_text(strip=True)
             if h1_text:
                 return h1_text
@@ -93,9 +95,28 @@ class WebCrawler:
         has_valid_form = False  # 本物の問い合わせフォームが存在したかどうかのフラグ
 
         for form in forms:
-            form_id = form.get("id", "").lower()
-            form_class = "".join(form.get("class", [])).lower()
-            form_action = form.get("action", "").lower()
+            if not isinstance(form, Tag):
+                continue
+
+            form_id = ""
+            form_class = ""
+            form_action = ""
+
+            # 属性の型安全な取得
+            id_attr = form.get("id")
+            if id_attr:
+                form_id = str(id_attr).lower()
+
+            class_attr = form.get("class")
+            if class_attr:
+                if isinstance(class_attr, list):
+                    form_class = "".join([str(c) for c in class_attr]).lower()
+                else:
+                    form_class = str(class_attr).lower()
+
+            action_attr = form.get("action")
+            if action_attr:
+                form_action = str(action_attr).lower()
 
             # 検索フォーム（サイト内検索窓）を完全に除外
             if "search" in form_id or "search" in form_class or "search" in form_action:
@@ -105,7 +126,14 @@ class WebCrawler:
             inputs = form.find_all(["input", "textarea", "select"])
             valid_inputs = []
             for inp in inputs:
-                itype = inp.get("type", "").lower()
+                # 💡 確実に入力要素が Tag オブジェクトであることを保証（NavigableStringを除外）
+                if not isinstance(inp, Tag):
+                    continue
+
+                # 💡 get("type") の戻り値がリストやAnyになる可能性を考慮し、安全に文字列キャスト
+                type_attr = inp.get("type", "")
+                itype = ("".join(type_attr) if isinstance(type_attr, list) else str(type_attr)).lower()
+
                 if itype in ["hidden", "submit", "button", "image", "reset"]:
                     continue
                 valid_inputs.append(inp)
@@ -117,6 +145,8 @@ class WebCrawler:
                 # フォーム内の項目ラベル（th、label）を探索
                 labels = form.find_all(["th", "label"])
                 for lbl in labels:
+                    if not isinstance(lbl, Tag):
+                        continue
                     txt = lbl.get_text(strip=True).replace("※", "").replace("必須", "")
                     # 前後のあらゆる空白文字（半角/全角/特殊空白）を安全に除去
                     txt = re.sub(r"^[ \s \xa0]+|[ \s \xa0]+$", "", txt)
@@ -126,17 +156,17 @@ class WebCrawler:
 
                 # placeholder からも補填
                 for inp in valid_inputs:
-                    ph = inp.get("placeholder", "")
+                    ph_attr = inp.get("placeholder")
+                    ph = str(ph_attr).strip() if ph_attr else ""
                     ph = re.sub(r"^[ \s \xa0]+|[ \s \xa0]+$", "", ph)
 
                     if ph and len(ph) < 20 and ph not in fields:
                         fields.append(ph)
 
-        # 本物のフォームがあるのに項目名が1つも取り出せなかった場合のみ、空欄にする
+        # 本物のフォームがあるのに項目名が1つも取り出せなかった場合のみ、安全弁として固定文字を返す
         if has_valid_form and not fields:
-            return ""
+            return "お問い合わせ内容"
 
-        # 正常に取得できた項目を改行区切りで返す（無関係なページでは空文字になるため、本物のページで上書き可能になる）
         return "\n".join(fields)
 
     def _extract_breadcrumbs_depth(self, soup: BeautifulSoup) -> int:
