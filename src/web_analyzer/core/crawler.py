@@ -220,17 +220,21 @@ class WebCrawler:
                         if len(visited) == 1:
                             site_purpose = self._extract_purpose_and_features(current_html)
 
-                            # 構成列（グロナビ）：#topmenuや画像、フッターナビの対応強化
+                            # 構成列（グロナビ）：探索順序を厳格化（まず単体のnavを最優先にする）
                             nav = (
-                                soup.find(["nav", "header"])
-                                or soup.find(id=re.compile(r"nav|menu|global", re.I))
-                                or soup.find(class_=re.compile(r"nav|menu|global", re.I))
-                                or soup.find("footer")  # ヘッダーにない場合の2段階目バックアップ
+                                soup.find("nav") or
+                                soup.find(id=re.compile(r"nav|menu|global", re.I)) or
+                                soup.find(class_=re.compile(r"nav|menu|global", re.I)) or
+                                soup.find("header") or
+                                soup.find("footer")
                             )
 
                             if nav and isinstance(nav, Tag):
-                                # ロゴやサイト名が入っている「見出しタグ」や「ロゴクラス」を事前に除外
-                                for skip_el in nav.find_all(["h1", "h2", "h3", "span"], class_=re.compile(r"logo|title|site-name", re.I)):
+                                # ロゴや見出しに加え、言語・サイズ・配色設定ブロックを丸ごと除外
+                                for skip_el in nav.find_all(
+                                    ["h1", "h2", "h3", "span", "div", "ul"],
+                                    class_=re.compile(r"logo|title|site-name|setting|language|choose|option", re.I)
+                                ):
                                     skip_el.decompose()  # 要素そのものを消去して巻き込みを防ぐ
 
                                 for item in nav.find_all(["li", "a"]):
@@ -245,8 +249,12 @@ class WebCrawler:
 
                                     menu_text = self._clean_menu_text(str(menu_text))
 
-                                    # テキスト内容によるフィルタリング（サイト名によく使われる文言を直接除外）
+                                    # テキスト内容によるフィルタリング（サイト名によく使われる文言を除外）
                                     if any(k in menu_text for k in ["について", "株式会社", "有限会社", "機構", "法人"]):
+                                        continue
+
+                                    # もし言語の単語がすり抜けてきた場合のセーフティガード
+                                    if any(lang in menu_text.lower() for lang in ["language", "english", "日本語", "中国語", "中國語", "한국어"]):
                                         continue
 
                                     if menu_text and len(menu_text) < 15 and menu_text not in global_nav_menus:
