@@ -181,7 +181,7 @@ class WebCrawler:
                     # URL正規化のクレンジング強化（末尾のスラッシュ違いやindex.htmlの重複防止）
                     normalized_url = current_url.split("#")[0].split("?")[0].rstrip("/")
                     if normalized_url.endswith("/index.html") or normalized_url.endswith("/index.php"):
-                        normalized_url = re.sub(r'/index\.(html|php)$', '', normalized_url)
+                        normalized_url = re.sub(r"/index\.(html|php)$", "", normalized_url)
 
                     if normalized_url in visited:
                         continue
@@ -216,10 +216,10 @@ class WebCrawler:
 
                             # 構成列（グロナビ）：#topmenuや画像、フッターナビの対応強化
                             nav = (
-                                soup.find(["nav", "header"]) or
-                                soup.find(id=re.compile(r"nav|menu|global", re.I)) or
-                                soup.find(class_=re.compile(r"nav|menu|global", re.I)) or
-                                soup.find("footer")  # ヘッダーにない場合の2段階目バックアップ
+                                soup.find(["nav", "header"])
+                                or soup.find(id=re.compile(r"nav|menu|global", re.I))
+                                or soup.find(class_=re.compile(r"nav|menu|global", re.I))
+                                or soup.find("footer")  # ヘッダーにない場合の2段階目バックアップ
                             )
 
                             if nav and isinstance(nav, Tag):
