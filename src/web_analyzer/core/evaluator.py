@@ -21,6 +21,11 @@ class RenewalEvaluator:
         if "lightbox" in html_lower or "fancybox" in html_lower or "data-lightbox" in html_lower:
             reasons.append("ギャラリーコンテンツ（Lightbox等）が導入されているため")
 
+        # 多言語対応（言語切り替え機能）の検知
+        if "translate.google" in html_lower or any(k in html_lower for k in ["language-list", "lang-select", "言語切り替え", 'aria-label="メニュー"']):
+            # ※より確実にするため、今回問題になったクラス名やキーワードをフックにします
+            reasons.append("多言語対応（言語切り替え機能）があるため")
+
         if reasons:
             return "\n".join(reasons)
         return ""
