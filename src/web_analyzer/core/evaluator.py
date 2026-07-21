@@ -1,69 +1,42 @@
 class RenewalEvaluator:
-    """Webサイトのリニューアル（移行）可否を、ページ数や機能制限の条件から判定・評価するクラス。"""
+    """収集したサイトデータに基づき、Webサイトのリニューアル適性ランク（◎/〇/×/要確認）および不可理由を判定するクラス。"""
 
-    def __init__(self, threshold_1: int = 10, threshold_2: int = 15, threshold_3: int = 20) -> None:
+    def __init__(self, threshold_1: int = 30, threshold_2: int = 50, threshold_3: int = 100) -> None:
         self.threshold_1 = threshold_1
         self.threshold_2 = threshold_2
         self.threshold_3 = threshold_3
 
-    def evaluate_rank(self, cms_name: str, total_pages: int) -> str:
-        """ページ数に基づいてリニューアルの推奨度（◎, ◯, △, ×）のベース評価を行う。"""
-        # 1. ページ数がしきい値1（デフォルト10）以下
-        if total_pages <= self.threshold_1:
-            return "◎"
-
-        # 2. ページ数がしきい値2（デフォルト15）以下
-        if total_pages <= self.threshold_2:
-            return "◯"
-
-        # 3. ページ数がしきい値3（デフォルト20）以下
-        if total_pages <= self.threshold_3:
-            return "△"
-
-        # 4. それ以上は移行非推奨
-        return "×"
-
-    def compile_rejection_reason(
-        self,
-        total_pages: int,
-        has_login: bool,
-        has_search: bool = False,
-        has_heavy_animation: bool = False,
-        has_floating_sidebar: bool = False,
-        is_multilingual: bool = False,
-        has_file_upload: bool = False,
-    ) -> str:
-        """判定が「×」や「△」となる対象外・懸念となる具体的な理由を複合的に判定して出力する。"""
-
+    def compile_rejection_reason(self, total_pages: int, has_login: bool, html_src: str = "") -> str:
+        """判定ロジックに基づいて不適合の理由テキストを構築する。"""
         reasons = []
 
-        # --- 即時対象外（一発で×にする致命的条件） ---
-        if has_login:
-            reasons.append("ログイン機能・マイページ（会員限定ページなど）が存在するため")
-
-        if is_multilingual:
-            reasons.append("多言語サイト対応の構造であるため")
-
-        if has_file_upload:
-            reasons.append("フォームにファイル添付機能（履歴書や図面等）があるため")
-
-        # 設定された「最大しきい値3」を超えた場合に対象外理由とする
         if total_pages > self.threshold_3:
             reasons.append("ページ数が多いため")
 
-        # --- 追加された対象外・減点条件 ---
-        if has_search:
-            reasons.append("サイト内検索機能が存在するため")
+        if has_login:
+            reasons.append("ログイン機能（マイページ、会員システムなど）があるため")
 
-        if has_heavy_animation:
-            reasons.append("高度なリッチアニメーションが多用されているため")
+        # Lightbox や Fancybox などのギャラリーコンテンツ検知
+        html_lower = html_src.lower()
+        if "lightbox" in html_lower or "fancybox" in html_lower or "data-lightbox" in html_lower:
+            reasons.append("ギャラリーコンテンツ（Lightbox等）が導入されているため")
 
-        if has_floating_sidebar:
-            reasons.append("追従型のフローティングサイドバーを利用しているため")
-
-        # 理由があれば「【対象外・要確認の理由】」を付けて返し、なければ空欄にする
         if reasons:
-            return " / ".join(reasons)
-
-        # 移行対象（問題なし）の場合は、何も出力しない
+            return "\n".join(reasons)
         return ""
+
+    def evaluate_rank(self, cms_name: str, total_pages: int, site_purpose: str = "") -> str:
+        """適性ランクを評価（◎、◯、×）"""
+        # 物件検索サイトなど、埋め込みシステムが存在する場合は即座に不可
+        if site_purpose == "物件検索サイト":
+            return "×"
+
+        if cms_name != "":
+            return "×"
+
+        if total_pages <= self.threshold_1:
+            return "◎"
+        elif total_pages <= self.threshold_2:
+            return "◯"
+        else:
+            return "×"

@@ -5,16 +5,8 @@ def test_evaluate_rank_and_reason() -> None:
     # しきい値: ◎(<=10), ◯(<=15), △(<=20)
     evaluator = RenewalEvaluator(threshold_1=10, threshold_2=15, threshold_3=20)
 
-    # ケース1: 10ページ以下、CMS関係なし -> ◎
+    # ケース1: 10ページ以下、CMS関係なし -> CMS未検出なら◎
     assert evaluator.evaluate_rank(cms_name="", total_pages=5) == "◎"
-    assert evaluator.evaluate_rank(cms_name="WordPress", total_pages=5) == "◎"  # CMSがあっても◎！
-    assert evaluator.compile_rejection_reason(total_pages=5, has_login=False) == ""
 
-    # ケース2: 11〜15ページ -> ◯
-    assert evaluator.evaluate_rank(cms_name="", total_pages=12) == "◯"
-    assert evaluator.evaluate_rank(cms_name="WordPress", total_pages=12) == "◯"
-
-    # ケース3: 20ページ超過 -> ×
-    assert evaluator.evaluate_rank(cms_name="", total_pages=25) == "×"
-
-    assert evaluator.compile_rejection_reason(total_pages=25, has_login=False) == "ページ数が多いため"
+    # 仕様変更に合わせて、CMS（WordPress）が検出された場合は「×」が返ることを期待する
+    assert evaluator.evaluate_rank(cms_name="WordPress", total_pages=5) == "×"

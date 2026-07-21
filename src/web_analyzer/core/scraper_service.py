@@ -85,6 +85,7 @@ class SiteScraperService:
                 )
                 site_purpose = ""
                 cms_name = ""
+                html_src = ""  # HTMLソース受け渡し用（必要に応じてクローラー側から取得可能な設計にあわせる）
 
                 # 1. SSL判定の実行
                 try:
@@ -111,7 +112,7 @@ class SiteScraperService:
                         contact_fields,
                         site_structure,
                         site_purpose,
-                        _,
+                        html_src,  # 空白文字スキップのプレースホルダーから実際のソース受け取りへ変更
                         cms_name,
                     ) = crawler.crawl_and_analyze(item.domain_name)
                 except Exception as e:
@@ -136,15 +137,18 @@ class SiteScraperService:
                     eval_result = "要確認"
                     rejection_reason = f"クロールできたページ数が極端に少ないため判定を保留しました (取得数: {total_pages_int}ページ)。"
                 else:
+                    # 引数に html_src を追加
                     rejection_reason = evaluator.compile_rejection_reason(
                         total_pages=total_pages_int,
                         has_login=has_login,
+                        html_src=html_src,
                     )
 
-                    if "【対象外・要確認の理由】" in rejection_reason:
+                    # 物件検索サイトの一発対象外条件を判定にも連動
+                    if rejection_reason != "" or site_purpose == "物件検索サイト":
                         eval_result = "×"
                     else:
-                        eval_result = evaluator.evaluate_rank(cms_name, total_pages_int)
+                        eval_result = evaluator.evaluate_rank(cms_name, total_pages_int, site_purpose=site_purpose)
 
                 # スレッドセーフに結果を書き込み
                 with self._lock:

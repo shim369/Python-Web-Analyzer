@@ -7,171 +7,124 @@ from bs4 import BeautifulSoup, Tag
 
 
 class WebCrawler:
-    """同一ドメイン内の巡回、ページ数カウント、国内主要CMSの特定、および問い合わせページの解析を行うクローラー。"""
+    """ウェブサイトを巡回し、構成、CMS、問い合わせ項目、階層、用途などを解析するクローラー。"""
 
-    def __init__(self, timeout: float = 12.0) -> None:
+    def __init__(self, timeout: float = 30.0) -> None:
         self.timeout = timeout
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-            "Connection": "keep-alive",
-            "Cache-Control": "max-age=0",
-        }
+        self.headers = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")}
 
     def _get_clean_domain(self, url: str) -> str:
-        """URLからプロトコルや 'www.' を除去した、純粋なドメイン部分のみを抽出する。"""
         parsed = urlparse(url)
-        domain = parsed.netloc.lower()
-        if domain.startswith("www."):
-            domain = domain[4:]
-        return domain
+        netloc = parsed.netloc or parsed.path
+        domain = netloc.split(":")[0]
+        return domain.replace("www.", "")
 
-    def _is_valid_internal_link(self, current_url: str, link_url: str, base_domain_clean: str) -> bool:
-        """リンク先が、プロトコル（http/https）を問わず、同一の親ドメイン内にある有効なページか検証する。"""
-        absolute_url = urljoin(current_url, link_url)
-        parsed = urlparse(absolute_url)
+    def _is_valid_internal_link(self, current_url: str, href: str, base_domain: str) -> bool:
+        if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
+            return False
+        abs_url = urljoin(current_url, href)
+        parsed_abs = urlparse(abs_url)
+        abs_domain = parsed_abs.netloc.replace("www.", "").split(":")[0]
 
-        if parsed.scheme not in ("http", "https"):
+        # 拡張子チェックの緩和（phpや動的パラメータも通す）
+        if any(parsed_abs.path.lower().endswith(ext) for ext in [".pdf", ".jpg", ".jpeg", ".png", ".gif", ".zip"]):
             return False
 
-        link_domain_clean = parsed.netloc.lower()
-        if link_domain_clean.startswith("www."):
-            link_domain_clean = link_domain_clean[4:]
+        return abs_domain == base_domain
 
-        if link_domain_clean != base_domain_clean and not link_domain_clean.endswith("." + base_domain_clean):
-            return False
-
-        path = parsed.path.lower()
-        invalid_extensions = (".pdf", ".jpg", ".jpeg", ".png", ".gif", ".zip", ".tar", ".gz", ".mp3", ".mp4", ".css", ".js", ".xml", ".txt")
-        if any(path.endswith(ext) for ext in invalid_extensions):
-            return False
-
-        return True
-
-    def _detect_cms(self, html_src: str) -> str:
-        """HTMLソース内から、国内で利用される主要なCMSのシグネチャを検知し、CMS名を返す。"""
-        html_lower = html_src.lower()
-
-        if "wp-content" in html_lower or "wp-includes" in html_lower or 'content="wordpress' in html_lower:
+    def _detect_cms(self, html: str) -> str:
+        html_lower = html.lower()
+        if "wp-content" in html_lower or "wp-includes" in html_lower:
             return "WordPress"
-
-        if "/.shared/mt-static/" in html_lower:
-            return "MovableType.net"
-        if "mt-static" in html_lower or 'content="movable type' in html_lower:
-            return "Movable Type"
-
-        if "eccube" in html_lower or "user_data/packages/default" in html_lower:
-            return "EC-CUBE"
-
-        if "concrete5" in html_lower or "/ccm/" in html_lower or "/updates/concrete" in html_lower:
-            return "Concrete CMS"
-
-        if "ablogcms" in html_lower or "/themes/system/images/" in html_lower:
-            return "a-blog cms"
-
-        if "basercms" in html_lower or "baser_helper" in html_lower:
+        if "basercms" in html_lower or "bc-" in html_lower:
             return "baserCMS"
-
-        if "shopify" in html_lower or "cdn.shopify.com" in html_lower:
-            return "Shopify"
-
-        if "microcms" in html_lower or "images.microcms-assets.io" in html_lower:
-            return "microCMS"
-
-        if "wixstatic.com" in html_lower or 'content="wix.com' in html_lower:
-            return "Wix"
-
-        if "makeshop.jp" in html_lower or "/shopimages/" in html_lower:
-            return "MakeShop"
-
-        if "dotnetnuke" in html_lower or "__dnnvariable" in html_lower or 'content="dotnetnuke' in html_lower:
-            return "DNN"
-
         return ""
 
     def _extract_purpose_and_features(self, html: str) -> str:
-        """トップページのHTMLから用途を判定する。"""
-        soup = BeautifulSoup(html, "html.parser")
+        html_lower = html.lower()
+        # 物件検索などの独自システム検知ワード
+        if any(k in html_lower for k in ["物件検索", "空室検索", "不動産検索"]):
+            return "物件検索サイト"
+        return ""
 
-        purpose = ""
-        desc_tag = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
-        if desc_tag and isinstance(desc_tag, Tag):
-            val = desc_tag.get("content")
-            if isinstance(val, str) and val.strip():
-                purpose = val.strip()
-
-        if not purpose and soup.title:
-            purpose = soup.title.text.strip()
-
-        if not purpose:
-            h1_tag = soup.find("h1")
-            if h1_tag:
-                purpose = h1_tag.text.strip()
-
-        if len(purpose) > 100:
-            purpose = purpose[:100] + "..."
-
-        return purpose
+    def _clean_menu_text(self, text: str) -> str:
+        """交通アクセスAccess のような英日混在から不要な英語やスペースを綺麗にする"""
+        text = re.sub(r"\s+", "", text)
+        # 日本語の後ろにくっついている英語（Access等）をカット
+        match = re.match(r"^([ぁ-んァ-ヶー一-龠々]+)[A-Za-z]+$", text)
+        if match:
+            return match.group(1)
+        return text
 
     def _extract_form_fields(self, html: str) -> str:
-        """入力フォームから入力項目名を取得、または外部の代表的埋め込みフォームを検出する。"""
-        if "formrun.jp" in html:
-            return "お名前\nメールアドレス\nお問い合わせ内容 (Formrun埋め込み)"
-        if "tayori.com" in html:
-            return "お名前\nメールアドレス\nお問い合わせ内容 (Tayori埋め込み)"
-        if "forms.gle" in html:
-            return "お名前\nメールアドレス\nお問い合わせ内容 (Googleフォーム埋め込み)"
-
+        """<form>の中に1つでも入力要素があれば抽出し、検索窓や無関係なテキストは無視する"""
         soup = BeautifulSoup(html, "html.parser")
-        form = soup.find("form")
-        if not form or not isinstance(form, Tag):
-            form = soup
+        forms = soup.find_all("form")
+
+        if not forms:
+            return ""
 
         fields: list[str] = []
-        for label in form.find_all("label"):
-            text = label.get_text(strip=True)
-            if text and text not in fields:
-                fields.append(text)
 
-        for elem in form.find_all(["input", "textarea", "select"]):
-            elem_type = elem.get("type", "")
-            if elem_type in ("submit", "hidden", "button", "image", "radio"):
-                continue
+        for form in forms:
+            # 追加：検索フォーム（サイト内検索窓）を完全に除外するガード
+            form_id = form.get("id", "").lower()
+            form_class = "".join(form.get("class", [])).lower()
+            form_action = form.get("action", "").lower()
 
-            placeholder = elem.get("placeholder", "")
-            if placeholder and placeholder not in fields:
-                fields.append(placeholder)
-                continue
+            if "search" in form_id or "search" in form_class or "search" in form_action:
+                continue  # 検索キーワード用のフォームなのでスキップ
 
-            name = elem.get("name", "")
-            name_mapping = {
-                "name": "お名前",
-                "email": "メールアドレス",
-                "tel": "電話番号",
-                "subject": "件名",
-                "message": "お問合せ内容",
-            }
-            if name in name_mapping and name_mapping[name] not in fields:
-                fields.append(name_mapping[name])
+            # フォーム内の入力要素（ボタン系や非表示は除外）を確認
+            inputs = form.find_all(["input", "textarea", "select"])
+            valid_inputs = []
+            for inp in inputs:
+                itype = inp.get("type", "").lower()
+                if itype in ["hidden", "submit", "button", "image", "reset"]:
+                    continue
+                valid_inputs.append(inp)
 
-        if len(fields) < 2:
-            form_text = form.get_text().lower()
-            field_patterns = {
-                "お名前": r"name|氏名|名前|お名前|担当者",
-                "メールアドレス": r"mail|email|アドレス|連絡先|メール",
-                "電話番号": r"tel|phone|電話|番号",
-                "会社名": r"company|corp|会社|組織|法人",
-                "お問い合わせ内容": r"content|message|body|内容|問合せ|質問|自由記述",
-            }
-            for field_name, pattern in field_patterns.items():
-                if re.search(pattern, form_text) and field_name not in fields:
-                    fields.append(field_name)
+            # 条件：フォームの中に1つでも有効な入力要素があれば問い合わせページとみなす
+            if len(valid_inputs) >= 1:
+                # フォーム内の項目ラベル（th、label、またはplaceholder）を探索
+                labels = form.find_all(["th", "label"])
+                for lbl in labels:
+                    txt = lbl.get_text(strip=True).replace("※", "").replace("必須", "")
+                    if txt and len(txt) < 20 and txt not in fields:
+                        fields.append(txt)
 
-        return "\n".join(fields[:15])
+                # placeholder からも補填
+                for inp in valid_inputs:
+                    ph = inp.get("placeholder", "")
+                    if ph and len(ph) < 20 and ph not in fields:
+                        fields.append(ph)
+
+        # 項目がうまく取れなかった場合の最低限のフォールバック
+        if not fields and any(form.find_all(["input", "textarea"]) for form in forms):
+            return "お問い合わせ内容"
+
+        # 改行区切りで縦並びにする
+        return "\n".join(fields)
+
+    def _extract_breadcrumbs_depth(self, soup: BeautifulSoup) -> int:
+        """パンくずリストから実際の最大階層数を計算する"""
+        # 一般的なパンくずのクラス名やID、構造化データを探索
+        bc_elements = soup.find_all(class_=re.compile(r"breadcrumb|topicpath", re.I)) or soup.find_all(id=re.compile(r"breadcrumb|topicpath", re.I))
+        if not bc_elements:
+            bc_elements = soup.find_all(["ol", "ul"], class_=lambda x: x and ("nav" not in x.lower() and "menu" not in x.lower()))
+
+        max_bc = 0
+        for bc in bc_elements:
+            items = bc.find_all(["li", "span", "a"])
+            # 有効な階層テキストを持つ要素の数
+            item_count = len(set([i.get_text(strip=True) for i in items if i.get_text(strip=True)]))
+            # トップページを除いた階層数（「トップ > 会社概要」なら2アイテムなので1階層扱い、実質URL深度の同期用に調整）
+            if item_count > 1:
+                max_bc = max(max_bc, item_count - 1)
+        return max_bc
 
     def crawl_and_analyze(self, start_url: str) -> tuple[int | str, int, str, str, str, str, str]:
-        """巡回を行い、用途を優先判定しつつ解析を行う。100ページに達した時点で打ち切る。"""
+        """ウェブサイトを巡回し、100ページに達した時点で打ち切る。"""
         if not start_url.startswith(("http://", "https://")):
             primary_url = f"https://{start_url}"
             fallback_url = f"http://{start_url}"
@@ -184,16 +137,16 @@ class WebCrawler:
 
         visited: set[str] = set()
         queue: list[tuple[str, int]] = []
-        is_over_100 = False  # 100ページ以上フラグ
+        is_over_100 = False
 
         max_depth = 0
         contact_fields = ""
         global_nav_menus: list[str] = []
         site_purpose = ""
         cms_name = ""
+        html_src = ""  # HTMLソース受け渡し用
 
-        html_src = ""
-        page_timeout = 2.5
+        page_timeout = 3.0  # 巡回漏れを防ぐためタイムアウトを少し緩和
 
         try:
             with httpx.Client(
@@ -216,7 +169,6 @@ class WebCrawler:
                         return (0, 0, "", "", "", "", "")
 
                 while queue:
-                    # 100ページ以上の場合は打ち切り
                     if len(visited) >= 100:
                         is_over_100 = True
                         break
@@ -225,7 +177,12 @@ class WebCrawler:
                         break
 
                     current_url, depth = queue.pop(0)
-                    normalized_url = current_url.split("#")[0].rstrip("/")
+
+                    # URL正規化のクレンジング強化（末尾のスラッシュ違いやindex.htmlの重複防止）
+                    normalized_url = current_url.split("#")[0].split("?")[0].rstrip("/")
+                    if normalized_url.endswith("/index.html") or normalized_url.endswith("/index.php"):
+                        normalized_url = re.sub(r'/index\.(html|php)$', '', normalized_url)
+
                     if normalized_url in visited:
                         continue
 
@@ -237,26 +194,59 @@ class WebCrawler:
                             break
 
                         visited.add(normalized_url)
-                        max_depth = max(max_depth, depth)
 
-                        html_src = response.text
+                        current_html = response.text
+                        soup = BeautifulSoup(current_html, "html.parser")
 
-                        detected = self._detect_cms(html_src)
+                        # トップページのHTMLソースを保存
+                        if len(visited) == 1:
+                            html_src = current_html
+
+                        # 階層判定：パンくずリストがあれば最優先、なければURLの深さをフォールバック
+                        bc_depth = self._extract_breadcrumbs_depth(soup)
+                        current_depth = bc_depth if bc_depth > 0 else depth
+                        max_depth = max(max_depth, current_depth)
+
+                        detected = self._detect_cms(current_html)
                         if detected != "" and cms_name == "":
                             cms_name = detected
 
-                        soup = BeautifulSoup(html_src, "html.parser")
-
                         if len(visited) == 1:
-                            site_purpose = self._extract_purpose_and_features(html_src)
+                            site_purpose = self._extract_purpose_and_features(current_html)
 
-                            nav = soup.find(["nav", "header"]) or soup.find(class_=lambda x: x and ("menu" in x or "nav" in x))
+                            # 構成列（グロナビ）：#topmenuや画像、フッターナビの対応強化
+                            nav = (
+                                soup.find(["nav", "header"]) or
+                                soup.find(id=re.compile(r"nav|menu|global", re.I)) or
+                                soup.find(class_=re.compile(r"nav|menu|global", re.I)) or
+                                soup.find("footer")  # ヘッダーにない場合の2段階目バックアップ
+                            )
+
                             if nav and isinstance(nav, Tag):
+                                # ロゴやサイト名が入っている「見出しタグ」や「ロゴクラス」を事前に除外
+                                for skip_el in nav.find_all(["h1", "h2", "h3", "span"], class_=re.compile(r"logo|title|site-name", re.I)):
+                                    skip_el.decompose()  # 要素そのものを消去して巻き込みを防ぐ
+
                                 for item in nav.find_all(["li", "a"]):
+                                    # 通常テキストの抽出
                                     menu_text = item.get_text(strip=True)
+
+                                    # 画像ナビ（alt や data-label）の救済
+                                    if not menu_text:
+                                        img = item.find("img")
+                                        if img and isinstance(img, Tag):
+                                            menu_text = img.get("alt", "") or img.get("data-label", "")
+
+                                    menu_text = self._clean_menu_text(str(menu_text))
+
+                                    # テキスト内容によるフィルタリング（サイト名によく使われる文言を直接除外）
+                                    if any(k in menu_text for k in ["について", "株式会社", "有限会社", "機構", "法人"]):
+                                        continue
+
                                     if menu_text and len(menu_text) < 15 and menu_text not in global_nav_menus:
                                         global_nav_menus.append(menu_text)
 
+                        # 問い合わせページの判定
                         is_contact_url = any(k in current_url.lower() for k in ["contact", "inquiry", "otoiawase", "entry", "support", "form", "mail"])
                         has_contact_text = False
                         contact_link_tag = soup.find("a", string=re.compile(r"問い合わせ|問合せ|相談|コンタクト|送信", re.I))
@@ -264,8 +254,9 @@ class WebCrawler:
                             has_contact_text = True
 
                         if (is_contact_url or has_contact_text) and not contact_fields:
-                            contact_fields = self._extract_form_fields(html_src)
+                            contact_fields = self._extract_form_fields(current_html)
 
+                        # 内部リンクの探索（多言語パラメータやWordPressの個別記事URLを拾う調整）
                         for link in soup.find_all("a", href=True):
                             href = link["href"]
                             if self._is_valid_internal_link(current_url, href, base_domain_clean):
@@ -275,7 +266,7 @@ class WebCrawler:
                                     path_depth = len([p for p in urlparse(abs_href).path.split("/") if p])
                                     queue.append((abs_href, path_depth))
 
-                        time.sleep(0.05)
+                        time.sleep(0.04)
 
                     except httpx.RequestError:
                         continue
@@ -284,16 +275,15 @@ class WebCrawler:
             print(f"[Warning] クローラー内で予期せぬエラーが発生しました: {e}")
 
         site_structure = "\n".join(global_nav_menus[:10])
-
-        # 100ページ以上の判定結果を適用
         final_page_count = "100ページ以上" if is_over_100 or len(visited) >= 100 else len(visited)
 
+        # scraper_service.py の受け取り順序と完全一致
         return (
             final_page_count,
             max_depth,
             contact_fields,
             site_structure,
             site_purpose,
-            "",
+            html_src,
             cms_name,
         )
