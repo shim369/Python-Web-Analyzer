@@ -90,12 +90,18 @@ class WebCrawler:
                 labels = form.find_all(["th", "label"])
                 for lbl in labels:
                     txt = lbl.get_text(strip=True).replace("※", "").replace("必須", "")
+                    # 正規表現で先頭と末尾のあらゆる空白文字（半角/全角/特殊空白/改行）を安全に除去
+                    txt = re.sub(r"^[ \s \xa0]+|[ \s \xa0]+$", "", txt)
+
                     if txt and len(txt) < 20 and txt not in fields:
                         fields.append(txt)
 
                 # placeholder からも補填
                 for inp in valid_inputs:
                     ph = inp.get("placeholder", "")
+                    # 同様に安全にトリミング
+                    ph = re.sub(r"^[ \s \xa0]+|[ \s \xa0]+$", "", ph)
+
                     if ph and len(ph) < 20 and ph not in fields:
                         fields.append(ph)
 
