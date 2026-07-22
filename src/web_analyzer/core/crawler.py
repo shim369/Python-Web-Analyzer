@@ -274,9 +274,21 @@ class WebCrawler:
                         if len(visited) == 1:
                             html_src = current_html
 
-                        # 階層判定：パンくずリストがあれば最優先、なければURLの深さをフォールバック
-                        bc_depth = self._extract_breadcrumbs_depth(soup)
-                        current_depth = bc_depth if bc_depth > 0 else depth
+                        # 階層判定：現在のページのURLから、トップページ（ドメイン）以降の純粋な階層の深さを正確に計算
+                        parsed_current = urlparse(current_url)
+                        # パスを「/」で分割し、空文字を除外した純粋なディレクトリ数をカウント
+                        path_segments = [p for p in parsed_current.path.split("/") if p]
+                        current_depth = len(path_segments)
+
+                        # index.html や index.php などのファイル名は階層数としてカウントしないよう除外
+                        if path_segments and path_segments[-1] in [
+                            "index.html",
+                            "index.php",
+                            "index.htm",
+                        ]:
+                            current_depth = max(0, current_depth - 1)
+
+                        # サイト全体を通じて最も深い階層数を記録
                         max_depth = max(max_depth, current_depth)
 
                         detected = self._detect_cms(current_html)
