@@ -85,6 +85,11 @@ class WebCrawler:
 
     def _extract_form_fields(self, html: str) -> str:
         """<form>の中から検索窓を除外し、有効な入力項目のラベルを抽出する"""
+        # JavaScriptによる外部埋め込みフォーム（HubSpot等）の検知を最初に行う
+        html_lower = html.lower()
+        if "hbspt.forms.create" in html_lower or "hsforms.net" in html_lower:
+            return "外部埋め込みフォーム検出"
+
         soup = BeautifulSoup(html, "html.parser")
         forms = soup.find_all("form")
 
@@ -92,7 +97,6 @@ class WebCrawler:
             return ""
 
         fields: list[str] = []
-        has_valid_form = False  # 本物の問い合わせフォームが存在したかどうかのフラグ
 
         for form in forms:
             if not isinstance(form, Tag):
@@ -102,7 +106,6 @@ class WebCrawler:
             form_class = ""
             form_action = ""
 
-            # 属性の型安全な取得
             id_attr = form.get("id")
             if id_attr:
                 form_id = str(id_attr).lower()
@@ -118,19 +121,15 @@ class WebCrawler:
             if action_attr:
                 form_action = str(action_attr).lower()
 
-            # 検索フォーム（サイト内検索窓）を完全に除外
             if "search" in form_id or "search" in form_class or "search" in form_action:
                 continue
 
-            # フォーム内の入力要素（ボタン系や非表示は除外）を確認
             inputs = form.find_all(["input", "textarea", "select"])
             valid_inputs = []
             for inp in inputs:
-                # 💡 確実に入力要素が Tag オブジェクトであることを保証（NavigableStringを除外）
                 if not isinstance(inp, Tag):
                     continue
 
-                # 💡 get("type") の戻り値がリストやAnyになる可能性を考慮し、安全に文字列キャスト
                 type_attr = inp.get("type", "")
                 itype = ("".join(type_attr) if isinstance(type_attr, list) else str(type_attr)).lower()
 
@@ -138,35 +137,38 @@ class WebCrawler:
                     continue
                 valid_inputs.append(inp)
 
-            # 条件：検索窓ではなく、有効な入力要素が1つ以上あるフォームを本物とみなす
-            if len(valid_inputs) >= 1:
-                has_valid_form = True
+            # 有効な入力要素がない場合はスキップ
+            if len(valid_inputs) < 1:
+                continue
 
-                # フォーム内の項目ラベル（th、label）を探索
-                labels = form.find_all(["th", "label"])
-                for lbl in labels:
-                    if not isinstance(lbl, Tag):
-                        continue
-                    txt = lbl.get_text(strip=True).replace("※", "").replace("必須", "")
-                    # 前後のあらゆる空白文字（半角/全角/特殊空白）を安全に除去
-                    txt = re.sub(r"^[ \s \xa0]+|[ \s \xa0]+$", "", txt)
+            # 1. まずはタグ（th, label, dt, td）から項目名を探索
+            labels = form.find_all(["th", "label", "dt", "td"])
+            for lbl in labels:
+                if not isinstance(lbl, Tag):
+                    continue
 
-                    if txt and len(txt) < 20 and txt not in fields:
-                        fields.append(txt)
+                # 子要素に「必須」や「※」があれば先に消し去る
+                for badge in lbl.find_all(string=re.compile(r"必須|※")):
+                    badge.extract()
 
-                # placeholder からも補填
+                txt = lbl.get_text(strip=True)
+                txt = txt.replace("※", "").replace("必須", "")
+                txt = re.sub(r"^[ \s \xa0 \n \r]+|[ \s \xa0 \n \r]+$", "", txt)
+
+                if txt and len(txt) < 25 and txt not in fields:
+                    fields.append(txt)
+
+            # 2. タグから項目名が1つも拾えなかった場合に限り、placeholderをバックアップとして拾う
+            if not fields:
                 for inp in valid_inputs:
                     ph_attr = inp.get("placeholder")
                     ph = str(ph_attr).strip() if ph_attr else ""
-                    ph = re.sub(r"^[ \s \xa0]+|[ \s \xa0]+$", "", ph)
+                    ph = re.sub(r"^[ \s \xa0 \n \r]+|[ \s \xa0 \n \r]+$", "", ph)
 
-                    if ph and len(ph) < 20 and ph not in fields:
+                    if ph and len(ph) < 25 and ph not in fields:
                         fields.append(ph)
 
-        # 本物のフォームがあるのに項目名が1つも取り出せなかった場合のみ、安全弁として固定文字を返す
-        if has_valid_form and not fields:
-            return "お問い合わせ内容"
-
+        # 何も取得できなかった場合は、空の文字列（""）が綺麗に返ります
         return "\n".join(fields)
 
     def _extract_breadcrumbs_depth(self, soup: BeautifulSoup) -> int:
@@ -188,7 +190,7 @@ class WebCrawler:
 
     import re
 
-    def crawl_and_analyze(self, start_url: str) -> tuple[int | str, int, str, str, str, str, str]:
+    def crawl_and_analyze(self, start_url: str) -> tuple[int | str, int | str, str, str, str, str, str]:
         """ウェブサイトを巡回し、100ページに達した時点で打ち切る。"""
         if not start_url.startswith(("http://", "https://")):
             primary_url = f"https://{start_url}"
@@ -213,10 +215,26 @@ class WebCrawler:
 
         page_timeout = 3.0  # 巡回漏れを防ぐためタイムアウトを少し緩和
 
+        import posixpath
+
         def normalize_url(url: str) -> str:
-            """URLの重複を排除するための正規化クレンジング"""
-            u = url.split("#")[0].split("?")[0].rstrip("/")
-            return re.sub(r"/index\.(html|php)$", "", u)
+            """URLの重複を排除するための正規化クレンジング（.. や . も完全に解消）"""
+            parsed = urlparse(url)
+
+            # パス部分の「.」や「..」を正しく解消する
+            clean_path = posixpath.normpath(parsed.path)
+            if clean_path == ".":
+                clean_path = "/"
+
+            # index.html や index.php の削除
+            clean_path = re.sub(r"/index\.(html|php)$", "", clean_path)
+
+            # ルート以外の末尾スラッシュを削除
+            if clean_path.endswith("/") and clean_path != "/":
+                clean_path = clean_path.rstrip("/")
+
+            # クエリとフラグメントを除去して再構成
+            return parsed._replace(path=clean_path, query="", fragment="").geturl()
 
         try:
             with httpx.Client(
@@ -263,30 +281,59 @@ class WebCrawler:
                         # 訪問済みに即時登録（エラー時も何度も同じURLを叩かないためのガード）
                         visited.add(norm_current)
 
+                        # urlparse をここに移動（ガードと階層判定の両方で使い回します）
+                        parsed_current = urlparse(norm_current)
+
+                        # ループによる階層の無限増殖（例: /news/news/news/）を検知して弾く安全弁
+                        if re.search(r"([^/]+)/\1/\1", parsed_current.path):
+                            continue
+
                         response = client.get(current_url)
                         if response.status_code != 200:
                             continue
 
-                        current_html = response.text
+                        # 1. まずレスポンスの生バイト列から文字コードを正規表現で仮抽出（metaタグ優先）
+                        # Shift_JIS や EUC-JP などの古いサイト対策
+                        raw_content_head = response.content[:2048].decode("ascii", errors="ignore")
+                        meta_charset = re.search(r'charset=["\']?([a-zA-Z0-9_-]+)', raw_content_head, re.IGNORECASE)
+
+                        if meta_charset:
+                            encoding = meta_charset.group(1)
+                        else:
+                            # metaタグに見つからない場合は httpx の判定を使用
+                            encoding = response.charset_encoding if response.charset_encoding else "utf-8"
+
+                        # 「shift_jis」や「cp932」の表記揺れに対応し、日本語環境で安全な「cp932（拡張版Shift_JIS）」に統一
+                        if encoding.lower() in ["shift_jis", "shift-jis", "sjis"]:
+                            encoding = "cp932"
+
+                        try:
+                            # 決定したエンコーディングでデコード
+                            current_html = response.content.decode(encoding, errors="replace")
+                        except Exception:
+                            # 万が一失敗した場合は utf-8 でフォールバック
+                            current_html = response.content.decode("utf-8", errors="replace")
                         soup = BeautifulSoup(current_html, "html.parser")
 
                         # トップページのHTMLソースを保存
                         if len(visited) == 1:
                             html_src = current_html
 
-                        # 階層判定：現在のページのURLから、トップページ（ドメイン）以降の純粋な階層の深さを正確に計算
-                        parsed_current = urlparse(current_url)
-                        # パスを「/」で分割し、空文字を除外した純粋なディレクトリ数をカウント
+                        # 階層判定：現在のページのURLから階層の深さを計算
+                        parsed_current = urlparse(norm_current)
                         path_segments = [p for p in parsed_current.path.split("/") if p]
-                        current_depth = len(path_segments)
 
-                        # index.html や index.php などのファイル名は階層数としてカウントしないよう除外
+                        # index.html などを除外した純粋なディレクトリ数
+                        current_depth = len(path_segments)
                         if path_segments and path_segments[-1] in [
                             "index.html",
                             "index.php",
                             "index.htm",
                         ]:
                             current_depth = max(0, current_depth - 1)
+
+                        # トップページを「階層1」とし、直下の同階層ページを「階層2」にするため +1 する
+                        current_depth = current_depth + 1
 
                         # サイト全体を通じて最も深い階層数を記録
                         max_depth = max(max_depth, current_depth)
@@ -391,8 +438,12 @@ class WebCrawler:
 
                                 # キューに入れる前にも訪問済み・タスク上限チェックを行う（無駄なキュー肥大化を防止）
                                 if norm_abs not in visited and len(visited) < 100:
-                                    path_depth = len([p for p in urlparse(abs_href).path.split("/") if p])
-                                    queue.append((abs_href, path_depth))
+                                    # 階層数の計算も正規化済みの norm_abs をベースにする
+                                    parsed_abs = urlparse(norm_abs)
+                                    path_depth = len([p for p in parsed_abs.path.split("/") if p])
+
+                                    # 次のループのベースURLが汚れないよう、正規化済みの URL をキューに入れる
+                                    queue.append((norm_abs, path_depth))
 
                         time.sleep(0.04)
 
@@ -402,12 +453,18 @@ class WebCrawler:
         except Exception as e:
             print(f"[Warning] クローラー内で予期せぬエラーが発生しました: {e}")
 
+        # サイト構成のテキスト整形
         site_structure = "\n".join(global_nav_menus[:10])
         final_page_count = "100ページ以上" if is_over_100 or len(visited) >= 100 else len(visited)
 
+        # 10階層を超えた場合は異常値（無限ループ等）とみなし、数値を返さず空欄にする
+        display_depth: int | str = max_depth
+        if max_depth > 10:
+            display_depth = "要確認"
+
         return (
             final_page_count,
-            max_depth,
+            display_depth,  # max_depth の代わりに display_depth を返す
             contact_fields,
             site_structure,
             site_purpose,

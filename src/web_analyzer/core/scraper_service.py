@@ -78,11 +78,12 @@ class SiteScraperService:
 
                 # クローラーからの生の戻り値を受ける変数を定義
                 total_pages_fetched: int | str = 0
-                max_depth, contact_fields, site_structure = (
-                    0,
-                    "",
-                    "取得失敗（接続エラーまたはタイムアウト）",
-                )
+
+                # max_depth に明示的に int | str 型のヒントを付与して初期化
+                max_depth: int | str = 0
+                contact_fields = ""
+                site_structure = "取得失敗（接続エラーまたはタイムアウト）"
+
                 site_purpose = ""
                 cms_name = ""
                 html_src = ""  # HTMLソース受け渡し用（必要に応じてクローラー側から取得可能な設計にあわせる）
@@ -137,18 +138,22 @@ class SiteScraperService:
                     eval_result = "要確認"
                     rejection_reason = f"クロールできたページ数が極端に少ないため判定を保留しました (取得数: {total_pages_int}ページ)。"
                 else:
-                    # 引数に html_src を追加
+                    # site_purpose も含めてすべての判定材料を evaluator に安全に渡す
                     rejection_reason = evaluator.compile_rejection_reason(
                         total_pages=total_pages_int,
                         has_login=has_login,
+                        site_purpose=site_purpose,
                         html_src=html_src,
                     )
 
-                    # 物件検索サイトの一発対象外条件を判定にも連動
-                    if rejection_reason != "" or site_purpose == "物件検索サイト":
-                        eval_result = "×"
-                    else:
-                        eval_result = evaluator.evaluate_rank(cms_name, total_pages_int, site_purpose=site_purpose)
+                    # evaluate_rank から cms_name を削除し、名前付き引数で同期させる
+                    # (物件検索や各種リッチコンテンツによる × 判定はすべて evaluator 内で自動処理されます)
+                    eval_result = evaluator.evaluate_rank(
+                        total_pages=total_pages_int,
+                        has_login=has_login,
+                        site_purpose=site_purpose,
+                        html_src=html_src,
+                    )
 
                 # スレッドセーフに結果を書き込み
                 with self._lock:
@@ -158,7 +163,7 @@ class SiteScraperService:
                     # Mypyのエラー箇所: モデル側の型指定(int | None)に合わせるため
                     # 「100ページ以上」だった場合は数値の上限である 100 を明示的に代入します
                     item.total_pages = total_pages_display  # type: ignore
-                    item.max_depth = max_depth
+                    item.max_depth = max_depth  # type: ignore
 
                     if total_pages_int == 0:
                         item.contact_fields = ""
