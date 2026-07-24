@@ -27,7 +27,7 @@ class WebCrawler:
         abs_domain = parsed_abs.netloc.replace("www.", "").split(":")[0]
 
         # 拡張子チェックの緩和（phpや動的パラメータも通す）
-        if any(parsed_abs.path.lower().endswith(ext) for ext in [".pdf", ".jpg", ".jpeg", ".png", ".gif", ".zip"]):
+        if any(parsed_abs.path.lower().endswith(ext) for ext in [".pdf", ".jpg", ".jpeg", ".png", ".gif", ".zip", "mp4", ".mov", ".avi", ".wmv", ".mp3", ".wav", ".tar", ".gz"]):
             return False
 
         return abs_domain == base_domain
