@@ -63,11 +63,7 @@ class SiteScraperService:
             return
 
         self._update_job_status(job_id, "processing")
-        evaluator = RenewalEvaluator(
-            threshold_1=job.threshold_1,
-            threshold_2=job.threshold_2,
-            threshold_3=job.threshold_3,
-        )
+        evaluator = RenewalEvaluator()
 
         try:
             for item in assessments:
@@ -115,6 +111,7 @@ class SiteScraperService:
                         site_purpose,
                         html_src,  # 空白文字スキップのプレースホルダーから実際のソース受け取りへ変更
                         cms_name,
+                        has_attachment,
                     ) = crawler.crawl_and_analyze(item.domain_name)
                 except Exception as e:
                     logger.warning(f"[{item.domain_name}] クロール中に予期せぬエラーが発生しました: {e}")
@@ -129,8 +126,18 @@ class SiteScraperService:
 
                 # 4. リニューアル評価判定 & 不可判定
                 site_structure_lower = site_structure.lower()
-                has_login = "login" in site_structure_lower or "signin" in site_structure_lower
+                LOGIN_KEYWORDS = [
+                    "login",
+                    "signin",
+                    "mypage",
+                    "member",
+                    "account",
+                    "ログイン",
+                    "マイページ",
+                    "会員",
+                ]
 
+                has_login = any(keyword.lower() in site_structure_lower for keyword in LOGIN_KEYWORDS)
                 if total_pages_int == 0:
                     eval_result = "要確認"
                     rejection_reason = "接続不可またはアクセス拒否のため、判定を保留しました。"
@@ -138,21 +145,18 @@ class SiteScraperService:
                     eval_result = "要確認"
                     rejection_reason = f"クロールできたページ数が極端に少ないため判定を保留しました (取得数: {total_pages_int}ページ)。"
                 else:
-                    # site_purpose も含めてすべての判定材料を evaluator に安全に渡す
                     rejection_reason = evaluator.compile_rejection_reason(
                         total_pages=total_pages_int,
+                        max_depth=int(max_depth),
                         has_login=has_login,
-                        site_purpose=site_purpose,
-                        html_src=html_src,
+                        has_attachment=has_attachment,
                     )
 
-                    # evaluate_rank から cms_name を削除し、名前付き引数で同期させる
-                    # (物件検索や各種リッチコンテンツによる × 判定はすべて evaluator 内で自動処理されます)
                     eval_result = evaluator.evaluate_rank(
                         total_pages=total_pages_int,
+                        max_depth=int(max_depth),
                         has_login=has_login,
-                        site_purpose=site_purpose,
-                        html_src=html_src,
+                        has_attachment=has_attachment,
                     )
 
                 # スレッドセーフに結果を書き込み

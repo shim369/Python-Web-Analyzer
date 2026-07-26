@@ -385,18 +385,20 @@ class WebCrawler:
         base_url: str,
         client: httpx.Client | None = None,
         depth: int = 0,
-    ) -> str:
+    ) -> tuple[str, bool]:
         """フォーム内の入力項目ラベルを抽出する。iframe内フォームは再帰的に解析する。"""
+
+        fields: list[str] = []
+        has_attachment = False
         html_lower = html.lower()
         if "hbspt.forms.create" in html_lower or "hsforms.net" in html_lower:
-            return "外部埋め込みフォーム検出(HubSpot)"
+            return "外部埋め込みフォーム検出(HubSpot)", False
+
         if "tayori.com" in html_lower:
-            return "外部埋め込みフォーム検出(Tayori)"
+            return "外部埋め込みフォーム検出(Tayori)", False
 
         soup = BeautifulSoup(html, "html.parser")
         containers = self._find_form_containers(soup)
-
-        fields: list[str] = []
 
         for form in containers:
             form_id = str(form.get("id", "")).lower()
@@ -423,10 +425,10 @@ class WebCrawler:
 
             # 1. th/label/dt/td/legend/span/strong/p + for=/aria-labelledby の紐付けから取得
             for inp in valid_inputs:
+                if inp.name == "input" and str(inp.get("type", "")).lower() == "file":
+                    has_attachment = True
+
                 txt = self._get_label_for_input(inp, form, soup)
-                txt = self._remove_required_marks(txt)
-                if txt and len(txt) < 25 and txt not in fields:
-                    fields.append(txt)
 
             # 2. 上記で拾いきれなかった場合、th/label/dt/tdの総当たりでバックアップ
             if not fields:
@@ -465,19 +467,22 @@ class WebCrawler:
                 except Exception:
                     continue
                 iframe_html = self._decode_response(resp)
-                iframe_fields_str = self._extract_form_fields(iframe_html, abs_src, client, depth + 1)
-                if iframe_fields_str:
-                    for line in iframe_fields_str.split("\n"):
+                iframe_fields, iframe_has_attachment = self._extract_form_fields(iframe_html, abs_src, client, depth + 1)
+
+                has_attachment |= iframe_has_attachment
+
+                if iframe_fields:
+                    for line in iframe_fields.split("\n"):
                         if line and line not in fields:
                             fields.append(line)
 
-        return "\n".join(fields)
+        return "\n".join(fields), has_attachment
 
     # ------------------------------------------------------------------
     # メインクロール処理
     # ------------------------------------------------------------------
 
-    def crawl_and_analyze(self, start_url: str) -> tuple[int | str, int | str, str, str, str, str, str]:
+    def crawl_and_analyze(self, start_url: str) -> tuple[int | str, int | str, str, str, str, str, str, bool]:
         """ウェブサイトを巡回し、100ページに達した時点で打ち切る。"""
         if not start_url.startswith(("http://", "https://")):
             primary_url = f"https://{start_url}"
@@ -496,6 +501,7 @@ class WebCrawler:
 
         max_depth = 0
         contact_fields = ""
+        has_attachment = False
         global_nav_menus: list[str] = []
         site_purpose = ""
         cms_name = ""
@@ -530,6 +536,8 @@ class WebCrawler:
                 try:
                     response = client.get(primary_url)
                     response.raise_for_status()
+                    first_url = str(response.url)
+                    first_html = self._decode_response(response)
                     queue.append((str(response.url), 0))
                     queued_urls.add(str(response.url))
                 except Exception:
@@ -540,11 +548,13 @@ class WebCrawler:
                             queue.append((str(response.url), 0))
                             queued_urls.add(str(response.url))
                         except Exception:
-                            return (0, 0, "", "", "", "", "")
+                            return (0, 0, "", "", "", "", "", False)
                     else:
-                        return (0, 0, "", "", "", "", "")
+                        return (0, 0, "", "", "", "", "", False)
 
                 previous_url = ""
+                first_html = ""
+                first_url = ""
 
                 while queue:
                     if len(visited) >= 100:
@@ -571,11 +581,14 @@ class WebCrawler:
                         if previous_url:
                             req_headers["Referer"] = previous_url
 
-                        response = client.get(current_url, headers=req_headers)
-                        if response.status_code != 200:
-                            continue
+                        if current_url == first_url and first_html:
+                            current_html = first_html
+                        else:
+                            response = client.get(current_url, headers=req_headers)
+                            if response.status_code != 200:
+                                continue
 
-                        current_html = self._decode_response(response)
+                            current_html = self._decode_response(response)
 
                         # render_js指定時、初回ページのみPlaywrightでの再取得を試みる
                         if self.render_js and len(visited) == 1:
@@ -640,7 +653,13 @@ class WebCrawler:
                         has_contact_text = contact_link_tag is not None
 
                         if (is_contact_url or has_contact_text) and not contact_fields:
-                            contact_fields = self._extract_form_fields(current_html, current_url, client, depth=0)
+                            contact_fields, has_attachment = self._extract_form_fields(
+                                current_html,
+                                current_url,
+                                client,
+                                depth=0,
+                            )
+
                             if not contact_fields:
                                 framework = self._detect_js_framework(current_html)
                                 if framework:
@@ -690,4 +709,5 @@ class WebCrawler:
             site_purpose,
             html_src,
             cms_name,
+            has_attachment,
         )
