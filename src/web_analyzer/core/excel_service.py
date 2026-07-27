@@ -1,3 +1,4 @@
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -11,7 +12,7 @@ from web_analyzer.models import ScrapingJob, SiteAssessment
 
 
 class ExcelService:
-    """Excelファイルのパースおよび生成を担当するサービス。"""
+    """Excelファイルのパースおよび生成を担当する服务。"""
 
     @staticmethod
     def import_excel(
@@ -141,7 +142,14 @@ class ExcelService:
                 item.remarks,
                 item.operator_name,
             ]
-            ws.append(row_data)
+
+            # Excelで保存できない制御文字（\x00〜\x1Fの改行等を除く文字）を消去する正規表現
+            illegal_chars = re.compile(r"[\x00-\x08\x0b-\x0c\x0e-\x1f]")
+
+            # openpyxl標準のclean_stringを使って安全に除去する
+            cleaned_row_data = [illegal_chars.sub("", str(val)) if isinstance(val, str) else val for val in row_data]
+
+            ws.append(cleaned_row_data)
 
             # 追加したデータ行にデザインを適用（上揃え + 罫線 + フォント）
             current_row = ws.max_row
@@ -159,7 +167,6 @@ class ExcelService:
                 else:
                     cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
 
-        # --- 【自動調整】各列の幅をコンテンツの最大長に合わせて調整する ---
         # --- 【自動調整】各列の幅をコンテンツの最大長に合わせて調整する ---
         for col in ws.columns:
             max_len = 0
