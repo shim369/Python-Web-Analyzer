@@ -12,7 +12,7 @@ class RenewalEvaluator:
         reasons = []
 
         if total_pages > 10:
-            reasons.append("ページ数が11ページ以上のため")
+            reasons.append("ページ数が多いため")
 
         if max_depth > 2:
             reasons.append("サイト構成が3階層以上のため")
