@@ -169,7 +169,7 @@ class WebCrawler:
     def _detect_cms(self, html: str) -> str:
         html_lower = html.lower()
         if "wp-content" in html_lower or "wp-includes" in html_lower:
-            return "WordPress"
+            return "WP"
         if "basercms" in html_lower or "bc-" in html_lower:
             return "baserCMS"
         return ""
@@ -357,6 +357,59 @@ class WebCrawler:
                     return txt
 
         return ""
+
+    def _is_multilang_element(self, item: Tag, menu_text: str) -> bool:
+        """要素が多言語切り替え用メニューであるかを強固に判定する"""
+        # 1. テキスト（メニュー名）による判定の強化
+        menu_text_lower = menu_text.lower()
+        lang_keywords = [
+            "language",
+            "lang",
+            "select language",
+            "global",
+            "multilingual",
+            "日本語",
+            "japanese",
+            "jp",
+            "en",
+            "english",
+            "繁体",
+            "簡体",
+            "chinese",
+            "中文",
+            "한국어",
+            "korean",
+            "tiếng việt",
+            "thai",
+            "español",
+            "français",
+            "deutsch",
+        ]
+        if any(lk in menu_text_lower for lk in lang_keywords):
+            return True
+
+        # 2. リンク先 (href) やクラス名、id に言語切り替えの痕跡がないかチェック
+        #    (li や a 要素そのもの、およびその親要素まで確認)
+        check_targets = [item] + list(item.parents)[:2]
+        for target in check_targets:
+            if not isinstance(target, Tag):
+                continue
+
+            # href 属性の確認 (例: /en/, /zh/, lang=en など)
+            href = str(target.get("href", "")).lower()
+            if any(p in href for p in ["/en/", "/zh/", "/ko/", "lang="]):
+                return True
+
+            # class や id 名の確認 (例: class="lang-select")
+            attr_str = "".join(target.get("class", [])) + str(target.get("id", ""))
+            if any(ck in attr_str.lower() for ck in ["lang", "switch", "globe"]):
+                return True
+
+            # hreflang 属性があれば確実に多言語リンク
+            if target.has_attr("hreflang"):
+                return True
+
+        return False
 
     def _find_form_containers(self, soup: BeautifulSoup) -> list[Tag]:
         """<form>タグに加え、role="form"やdata-form、divベースの疑似フォームも拾う。"""
@@ -640,10 +693,10 @@ class WebCrawler:
                                             menu_text = img.get("alt", "") or img.get("data-label", "")
                                     menu_text = self._clean_menu_text(str(menu_text))
 
-                                    if any(k in menu_text for k in ["about", "について", "株式会社", "有限会社", "機構", "法人"]):
+                                    # 多言語判定メソッドを呼び出す
+                                    if self._is_multilang_element(item, menu_text):
                                         continue
-                                    if any(lang in menu_text.lower() for lang in ["language", "english", "日本語", "中国語", "中國語", "한국어"]):
-                                        continue
+
                                     if menu_text and len(menu_text) < 15 and menu_text not in global_nav_menus:
                                         global_nav_menus.append(menu_text)
 

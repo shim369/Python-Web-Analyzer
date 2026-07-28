@@ -7,6 +7,7 @@ import streamlit as st
 from web_analyzer.core.excel_service import ExcelService
 from web_analyzer.core.scraper_service import SiteScraperService
 from web_analyzer.models import ScrapingJob
+
 # ここで判定クラスをインポート（パスは実際の環境に合わせて調整してください）
 # from web_analyzer.core.evaluator import RenewalEvaluator
 
@@ -113,10 +114,7 @@ if uploaded_file:
     try:
         # 【変更点】引数としてのしきい値は渡さず、インポートを実行
         # （ExcelService側もこれに合わせて引数を不要にするか、内部でRenewalEvaluatorを呼ぶ形に修正が必要です）
-        job, assessments = ExcelService.import_excel(
-            file_path=input_path,
-            operator_name=operator_name if operator_name.strip() else "未指定"
-        )
+        job, assessments = ExcelService.import_excel(file_path=input_path, operator_name=operator_name if operator_name.strip() else "未指定")
 
         st.success(f"ファイルを正常に読み込みました。 (対象ドメイン数: {len(assessments)}件)")
 
@@ -158,11 +156,20 @@ if job_id:
 
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.markdown(f'<div class="metric-card"><p style="margin:0;color:#666;font-size:0.9rem;">総ドメイン数</p><h2 style="margin:5px 0;color:#1F4E78;font-weight:700;">{total} 件</h2></div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="metric-card"><p style="margin:0;color:#666;font-size:0.9rem;">総ドメイン数</p><h2 style="margin:5px 0;color:#1F4E78;font-weight:700;">{total} 件</h2></div>',
+                unsafe_allow_html=True,
+            )
         with col2:
-            st.markdown(f'<div class="metric-card"><p style="margin:0;color:#666;font-size:0.9rem;">解析完了</p><h2 style="margin:5px 0;color:#2e7d32;font-weight:700;">{completed} 件</h2></div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="metric-card"><p style="margin:0;color:#666;font-size:0.9rem;">解析完了</p><h2 style="margin:5px 0;color:#2e7d32;font-weight:700;">{completed} 件</h2></div>',
+                unsafe_allow_html=True,
+            )
         with col3:
-            st.markdown(f'<div class="metric-card"><p style="margin:0;color:#666;font-size:0.9rem;">現在の進捗率</p><h2 style="margin:5px 0;color:#333;font-weight:700;">{percent} %</h2></div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="metric-card"><p style="margin:0;color:#666;font-size:0.9rem;">現在の進捗率</p><h2 style="margin:5px 0;color:#333;font-weight:700;">{percent} %</h2></div>',
+                unsafe_allow_html=True,
+            )
 
         if current_job_opt.status == "processing":
             st.info(f"処理実行中... ({completed}/{total} 件完了)")
