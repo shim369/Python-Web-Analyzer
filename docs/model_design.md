@@ -4,32 +4,34 @@
 
 ### 1.1. `ScrapingJob` (一括処理ジョブモデル)
 
-* `id`: ジョブID (PK)
-* `operator_name`: 担当者名 (ExcelのO列用)
-* `threshold_1`: ◎ 判定の最大ページ数 (デフォルト: 10)
-* `threshold_2`: ◯ 判定の最大ページ数 (デフォルト: 15)
-* `threshold_3`: △ 判定の最大ページ数 (デフォルト: 20)
-* `status`: 状態（`pending`, `processing`, `completed`, `failed`）
-* `created_at`: 実行日時
+画面から設定された判定閾値と、処理全体のステータスを管理するイミュータブル（不変）なデータモデル。
+
+* `id`: ジョブID (UUID文字列)
+* `operator_name`: 担当者名 (ExcelのO列に引き継がれる値)
+* `threshold_1`: ◎ 判定の最大ページ数 (デフォルト: `10`)
+* `threshold_2`: ◯ 判定の最大ページ数 (デフォルト: `15`)
+* `threshold_3`: △ 判定の最大ページ数 (デフォルト: `20`)
+* `status`: 状態（`pending`: 開始前, `processing`: 処理中, `completed`: 正常終了, `failed`: 異常終了）
+* `created_at`: 実行日時 (`datetime` 型)
 
 ### 1.2. `SiteAssessment` (サイト調査結果モデル)
 
-Excelの1行分の解析データを保持するモデル。
+Excelの1行分の解析・調査結果を保持するミュータブル（可変）なデータモデル。バックグラウンド処理によって各フィールドが順次書き換えられる。
 
-* `id`: ID (PK)
-* `job_id`: ジョブID (FK)
-* `date_str`: 日付 (A列 - 例: `7/16`)
-* `domain_name`: サイト名 (B列 - ドメインそのまま、または www 自動吸収)
-* `evaluation_result`: 調査結果 (C列 - `◎`, `◯`, `△`, `×` に加え、ページ極小時に `要確認` を追加)
-* `has_ssl`: SSLあり (D列)
-* `is_always_ssl`: SSL常時 (E列)
-* `max_depth`: 階層数 (F列)
-* `svcmd`: svcmd (G列 - 常に空)
-* `site_structure`: 構成 (H列 - グローバルナビゲーション項目を改行区切りで表示)
-* `total_pages`: ページ数 (I列)
-* `cms_name`: 使用CMS (J列 - WordPress、Shopify、microCMS等の優先高精度検知)
-* `description`: 用途 (K列 - Description ➔ Title ➔ H1 の高精度フォールバック抽出、最大100文字)
-* `contact_fields`: 問合せ項目 (L列 - Formrun, Tayori, Googleフォームなどの埋め込み自動検知、日本語リンク巡回)
-* `rejection_reason`: 不可の理由 (M列 - ページ数超過、会員ログイン検知、または要確認時の理由)
-* `remarks`: 備考 (N列 - クロール中HTML解析によるサイトの特徴文。WP運用、採用注力、EC機能、SNS連携を自動合成)
-* `operator_name`: 担当 (O列)
+* `id`: 調査レコードID (UUID文字列)
+* `job_id`: 紐付くジョブのID (FK)
+* `date_str`: 日付 (A列 - アプリ実行時の日付を `M/D` 形式で格納)
+* `domain_name`: サイト名 (B列 - インポートされたドメイン名)
+* `evaluation_result`: 調査結果 (C列 - 閾値判定に基づく `◎`, `◯`, `△`, `×`。ただし、接続失敗時やページ数が2ページ以下の場合は最優先で **`要確認`** となる)
+* `has_ssl`: SSLあり (D列 - 有効なSSL証明書が確認できれば **`あり`**、不可なら **`なし`**)
+* `is_always_ssl`: SSL常時 (E列 - `http://` から `https://` への自動リダイレクトが確認できれば **`◯`**、そうでなければ **`×`**)
+* `max_depth`: 階層数 (F列 - `int | None` 型。スラッシュの数を基準とした最大階層数)
+* `svcmd`: svcmd (G列 - 常に**空欄**を維持)
+* `site_structure`: 構成 (H列 - 自動検出したグローバルナビゲーションのメニューテキストを最大10件、**改行区切り**で格納)
+* `total_pages`: ページ数 (I列 - `int | None` 型。巡回できた総ページ数。接続失敗時は `0`。※Excel出力時に100以上の場合は `100~` という文字列に変換されて書き込まれる)
+* `cms_name`: 使用CMS (J列 - HTMLシグネチャから国内主要CMSを多角的に判定。WordPress, Movable Type, EC-CUBE, Shopifyなどを検知し、非CMSなら **`なし`**)
+* `description`: 用途 (K列 - メタ記述 ➔ Title ➔ H1 の優先度順で抽出したWebサイトの概要文。最大100文字)
+* `contact_fields`: 問合せ項目 (L列 - 日本語の問い合わせリンクや外部埋め込みフォームを自動判別し、項目名を**改行区切り**で格納)
+* `rejection_reason`: 不可の理由 (M列 - 判定保留時（接続不可・ページ数極小）の理由や、ページ数超過、会員ログイン検知などの具体的な理由テキストを格納)
+* `remarks`: 備考 (N列 - クロールしたテキスト群から自動生成されたサイトの特徴文。例:「採用活動に注力している、WordPressによるWeb運用を行っている特徴が見受けられます。」)
+* `operator_name`: 担当 (O列 - アプリ実行時に指定された担当者名をそのまま格納)
