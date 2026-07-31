@@ -167,11 +167,105 @@ class WebCrawler:
         return abs_domain == base_domain
 
     def _detect_cms(self, html: str) -> str:
-        html_lower = html.lower()
-        if "wp-content" in html_lower or "wp-includes" in html_lower:
-            return "WP"
-        if "basercms" in html_lower or "bc-" in html_lower:
-            return "baserCMS"
+        html = html.lower()
+
+        cms_patterns = {
+            "WP": [
+                "wp-content",
+                "wp-includes",
+            ],
+            "baserCMS": [
+                "basercms",
+                "bc-",
+            ],
+            "EC-CUBE": [
+                "eccube",
+            ],
+            "Movable Type": [
+                "mt-content",
+                "mt-static",
+            ],
+            "MODX": [
+                "modx",
+            ],
+            "Drupal": [
+                "drupal",
+                "sites/default",
+                "drupal-settings-json",
+            ],
+            "Joomla!": [
+                "/media/system/",
+                "joomla!",
+            ],
+            "TYPO3": [
+                "typo3",
+            ],
+            "concrete5": [
+                "concretecms",
+                "concrete5",
+            ],
+            "XOOPS": [
+                "xoops",
+            ],
+            "NetCommons": [
+                "netcommons",
+            ],
+            "PowerCMS": [
+                "powercms",
+            ],
+            "Craft CMS": [
+                "craftcms",
+            ],
+            "Sitecore": [
+                "sitecore",
+            ],
+            "Kentico": [
+                "kentico",
+            ],
+            "SilverStripe": [
+                "silverstripe",
+            ],
+            "Jimdo": [
+                "jimdo",
+            ],
+            "Wix": [
+                "wix.com",
+                "_wixcss",
+            ],
+            "Shopify": [
+                "shopify",
+                "cdn.shopify.com",
+            ],
+            "ColorMe Shop": [
+                "colorme",
+            ],
+            "MakeShop": [
+                "makeshop",
+            ],
+            "futureshop": [
+                "futureshop",
+            ],
+            "a-blog cms": [
+                "a-blog",
+            ],
+            "RCMS": [
+                "rcms",
+            ],
+            "HeartCore": [
+                "heartcore",
+            ],
+            "BlueMonkey": [
+                "bluemonkey",
+            ],
+            "BiNDup": [
+                "bindup",
+            ],
+        }
+
+        for cms, patterns in cms_patterns.items():
+            if any(pattern in html for pattern in patterns):
+                return cms
+
         return ""
 
     def _detect_js_framework(self, html: str) -> str:
@@ -243,22 +337,40 @@ class WebCrawler:
     # ------------------------------------------------------------------
 
     def _decode_response(self, response: httpx.Response) -> str:
-        """レスポンスの文字コードを判定してデコードする(meta charset優先、Shift_JIS系はcp932に正規化)。"""
-        raw_content_head = response.content[:2048].decode("ascii", errors="ignore")
+        """レスポンスの文字コードを判定してデコードする(Shift_JIS系はcp932に正規化し、文字化けを防ぐ)"""
+        # 1. まずHTMLの先頭部分から meta charset を安全に探す
+        # asciiの代わりに latin-1 を使うと、バイト値を壊さずに文字列化して正規表現にかけられます
+        raw_content_head = response.content[:2048].decode("latin-1", errors="ignore")
         meta_charset = re.search(r'charset=["\']?([a-zA-Z0-9_-]+)', raw_content_head, re.IGNORECASE)
 
         if meta_charset:
             encoding = meta_charset.group(1)
         else:
-            encoding = response.charset_encoding if response.charset_encoding else "utf-8"
+            # 2. metaタグにない場合は、httpxがヘッダー等から推測したエンコーディングを使用
+            # (※ None や 'X-USER-DEFINED' などの無効な値への対策)
+            guessed = response.encoding or response.charset_encoding
+            encoding = guessed if (guessed and len(guessed) > 1) else "utf-8"
 
-        if encoding.lower() in ["shift_jis", "shift-jis", "sjis"]:
+        # 3. Shift_JIS系のエンコーディングをWindows拡張の cp932 に統一
+        # 「〜」や「①」、特殊な漢字（藏 など）の化け・欠損を防ぎます
+        enc_lower = encoding.lower()
+        if enc_lower in ["shift_jis", "shift-jis", "sjis", "x-sjis", "cp932"]:
             encoding = "cp932"
+        elif enc_lower in ["euc-jp", "eucjp", "x-euc-jp"]:
+            encoding = "euc-jp"
+        else:
+            # 念のため utf-8 と明示されていても、実際は別コードのケースへのフォールバック用
+            pass
 
+        # 4. 決定したエンコーディングでデコードを試みる
         try:
             return response.content.decode(encoding, errors="replace")
         except Exception:
-            return response.content.decode("utf-8", errors="replace")
+            # 失敗した場合は、httpx標準の自動デコードに頼る
+            try:
+                return response.text
+            except Exception:
+                return response.content.decode("utf-8", errors="replace")
 
     def _fetch_rendered_html(self, url: str) -> str:
         """Playwrightが利用可能ならレンダリング後のHTMLを取得する。未導入時は空文字を返す。"""

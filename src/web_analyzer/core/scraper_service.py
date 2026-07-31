@@ -145,16 +145,22 @@ class SiteScraperService:
                     eval_result = "要確認"
                     rejection_reason = f"クロールできたページ数が極端に少ないため判定を保留しました (取得数: {total_pages_int}ページ)。"
                 else:
+                    # max_depth が文字列（'要確認' など）だった場合は安全に 0 に変換する
+                    try:
+                        max_depth_int = int(max_depth)
+                    except ValueError:
+                        max_depth_int = 0
+
                     rejection_reason = evaluator.compile_rejection_reason(
                         total_pages=total_pages_int,
-                        max_depth=int(max_depth),
+                        max_depth=max_depth_int,
                         has_login=has_login,
                         has_attachment=has_attachment,
                     )
 
                     eval_result = evaluator.evaluate_rank(
                         total_pages=total_pages_int,
-                        max_depth=int(max_depth),
+                        max_depth=max_depth_int,
                         has_login=has_login,
                         has_attachment=has_attachment,
                     )
