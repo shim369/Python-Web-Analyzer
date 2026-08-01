@@ -63,9 +63,29 @@ class SslChecker:
             return False, False
 
         except requests.exceptions.RequestException as e:
-            # タイムアウト、DNSエラー、Google等の403/401ブロックなどの接続エラー時
-            logger.warning(f"[{domain}] 接続エラーまたはボット拒否のため判定不能: {e}")
-            return None, None
+            # http:// 自体が失敗した場合(ポート80を受け付けない等)、
+            # HTTPS専用サイトの可能性があるため https:// への直接接続を試みる
+            logger.warning(f"[{domain}] http://での接続に失敗したため、https://への直接接続を試みます: {e}")
+
+            try:
+                https_url = start_url.replace("http://", "https://")
+                https_response = requests.get(https_url, headers=self.headers, timeout=self.timeout, allow_redirects=True)
+
+                final_url = https_response.url
+                parsed_final = urlparse(final_url)
+
+                if parsed_final.scheme == "https":
+                    # http://自体には接続できないため「常時SSL」とまでは断定できないが、
+                    # SSL対応かつ実質https以外にアクセス手段がない状態として扱う
+                    return True, True
+
+                return False, False
+
+            except requests.exceptions.RequestException as https_e:
+                # https:// でも接続できない場合は、純粋な接続エラーとして判定不能
+                logger.warning(f"[{domain}] https://への接続にも失敗したため判定不能: {https_e}")
+                return None, None
+
         except Exception as e:
             logger.exception(f"[{domain}] SSLチェック中に予期せぬエラー: {e}")
             return None, None

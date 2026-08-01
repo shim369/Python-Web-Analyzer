@@ -12,7 +12,7 @@ from web_analyzer.core.models import ScrapingJob, SiteAssessment
 
 
 class ExcelService:
-    """Excelファイルのパースおよび生成を担当する服务。"""
+    """Excelファイルのパースおよび生成を担当するサービス"""
 
     @staticmethod
     def import_excel(
