@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 
@@ -10,7 +10,7 @@ class ScrapingJob:
     operator_name: str
     page_threshold: int = 10  # ◯判定の最大ページ数
     status: str = "pending"  # pending, processing, completed, failed
-    created_at: datetime = datetime.now()
+    created_at: datetime = field(default_factory=datetime.now)
 
 
 @dataclass
