@@ -3,6 +3,8 @@ from urllib.parse import urlparse
 
 import requests
 
+from web_analyzer.utils.decorators import measure_time
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,6 +28,7 @@ class SslChecker:
 
         return f"http://{domain}"
 
+    @measure_time
     def check_ssl_status(self, domain: str) -> tuple[bool | None, bool | None]:
         """ドメインのSSL対応状況をチェックする。
 

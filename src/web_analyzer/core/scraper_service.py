@@ -6,11 +6,6 @@ from web_analyzer.core.evaluator import RenewalEvaluator
 from web_analyzer.core.models import ScrapingJob, SiteAssessment
 from web_analyzer.core.ssl_checker import SslChecker
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
-    handlers=[logging.StreamHandler()],
-)
 logger = logging.getLogger(__name__)
 
 

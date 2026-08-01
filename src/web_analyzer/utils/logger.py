@@ -4,24 +4,22 @@ from datetime import datetime
 from pathlib import Path
 
 
-def setup_logger() -> None:
+def setup_logger(level: int = logging.INFO) -> None:
     """ロガーの初期設定。
 
     fileConfig ではフィルターの詳細制御ができない制限を考慮し、dictConfig を採用。
     """
-    # 1. ログディレクトリとファイル名の作成（あなたの素晴らしいロジックをそのまま継承！）
     log_directory = Path("logs")
     log_directory.mkdir(parents=True, exist_ok=True)
     log_file = log_directory / f"app_{datetime.now().strftime('%Y%m%d')}.log"
 
-    # 2. dictConfig による厳格な設定
     config = {
         "version": 1,
-        # ★要求仕様: 既存のロガー（customtkinter等）を勝手に無効化せず保護する
+        # 既存のロガー（streamlit等）を勝手に無効化せず保護する
         "disable_existing_loggers": False,
         "formatters": {
             "standard": {
-                "format": "%(asctime)s [%(levelname)s] %(name)s:%(lineno)d - %(message)s",
+                "format": "%(asctime)s [%(levelname)s] %(threadName)s %(name)s:%(lineno)d - %(message)s",
                 "datefmt": "%Y-%m-%d %H:%M:%S",
             },
         },
@@ -29,7 +27,7 @@ def setup_logger() -> None:
             "console": {
                 "class": "logging.StreamHandler",
                 "formatter": "standard",
-                "level": "DEBUG",
+                "level": level,
             },
             "file": {
                 "class": "logging.FileHandler",
@@ -37,17 +35,17 @@ def setup_logger() -> None:
                 "encoding": "utf-8",
                 "mode": "a",
                 "formatter": "standard",
-                "level": "DEBUG",
+                "level": level,
             },
         },
         "root": {
             "handlers": ["console", "file"],
-            "level": "DEBUG",
+            "level": level,
         },
     }
 
     logging.config.dictConfig(config)
-    logging.info("ロガーを初期化しました.")
+    logging.info("ロガーを初期化しました。ログファイル: %s", log_file)
 
 
 def get_logger(name: str) -> logging.Logger:

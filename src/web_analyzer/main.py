@@ -7,9 +7,7 @@ import streamlit as st
 from web_analyzer.core.excel_service import ExcelService
 from web_analyzer.core.models import ScrapingJob
 from web_analyzer.core.scraper_service import SiteScraperService
-
-# ここで判定クラスをインポート（パスは実際の環境に合わせて調整してください）
-# from web_analyzer.core.evaluator import RenewalEvaluator
+from web_analyzer.utils.logger import setup_logger
 
 st.set_page_config(
     page_title="Web Site Analyzer",
@@ -63,6 +61,10 @@ st.markdown(
 )
 
 # 2. 初期化とサービス生成
+if "logger_initialized" not in st.session_state:
+    setup_logger()
+    st.session_state.logger_initialized = True
+
 if "scraper_service" not in st.session_state:
     st.session_state.scraper_service = SiteScraperService()
 if "current_job_id" not in st.session_state:

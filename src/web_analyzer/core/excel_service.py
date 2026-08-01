@@ -9,6 +9,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from web_analyzer.core.models import ScrapingJob, SiteAssessment
+from web_analyzer.utils.decorators import log_action
 
 
 class ExcelService:
@@ -64,6 +65,7 @@ class ExcelService:
         return job, assessments
 
     @staticmethod
+    @log_action("Excel出力")
     def export_excel(assessments: list[SiteAssessment], output_path: Path) -> None:
         """指定された解析結果リストをスタイリッシュなデザインでExcel出力する。"""
         wb = Workbook()

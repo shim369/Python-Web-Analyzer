@@ -9,6 +9,7 @@ import httpx
 from bs4 import BeautifulSoup, Tag
 
 from web_analyzer.core.models import LOGIN_KEYWORDS
+from web_analyzer.utils.decorators import measure_time
 
 logger = logging.getLogger(__name__)
 
@@ -664,6 +665,7 @@ class WebCrawler:
     # メインクロール処理
     # ------------------------------------------------------------------
 
+    @measure_time
     def crawl_and_analyze(self, start_url: str) -> tuple[int | str, int | str, str, str, str, str, str, bool, bool]:
         """ウェブサイトを巡回し、100ページに達した時点で打ち切る。
 
