@@ -8,7 +8,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
-from web_analyzer.models import ScrapingJob, SiteAssessment
+from web_analyzer.core.models import ScrapingJob, SiteAssessment
 
 
 class ExcelService:
@@ -18,18 +18,14 @@ class ExcelService:
     def import_excel(
         file_path: Path,
         operator_name: str,
-        threshold_1: int = 10,
-        threshold_2: int = 15,
-        threshold_3: int = 20,
+        page_threshold: int = 10,
     ) -> tuple[ScrapingJob, list[SiteAssessment]]:
         """Excelからドメイン名(B列)を抽出し、パラメータを紐付けてモデルを生成する。"""
         job_id = str(uuid.uuid4())
         job = ScrapingJob(
             id=job_id,
             operator_name=operator_name,
-            threshold_1=threshold_1,
-            threshold_2=threshold_2,
-            threshold_3=threshold_3,
+            page_threshold=page_threshold,
             status="processing",
         )
 

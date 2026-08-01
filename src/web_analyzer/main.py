@@ -5,8 +5,8 @@ from pathlib import Path
 import streamlit as st
 
 from web_analyzer.core.excel_service import ExcelService
+from web_analyzer.core.models import ScrapingJob
 from web_analyzer.core.scraper_service import SiteScraperService
-from web_analyzer.models import ScrapingJob
 
 # ここで判定クラスをインポート（パスは実際の環境に合わせて調整してください）
 # from web_analyzer.core.evaluator import RenewalEvaluator

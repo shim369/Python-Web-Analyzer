@@ -8,9 +8,7 @@ class ScrapingJob:
 
     id: str
     operator_name: str
-    threshold_1: int = 10
-    threshold_2: int = 15
-    threshold_3: int = 20
+    page_threshold: int = 10  # ◯判定の最大ページ数
     status: str = "pending"  # pending, processing, completed, failed
     created_at: datetime = datetime.now()
 
@@ -39,3 +37,16 @@ class SiteAssessment:
     rejection_reason: str = ""  # M列
     remarks: str = ""  # N列
     operator_name: str = ""  # O列
+
+
+# プロジェクト共通の定数として定義
+LOGIN_KEYWORDS: list[str] = [
+    "login",
+    "signin",
+    "mypage",
+    "member",
+    "account",
+    "ログイン",
+    "マイページ",
+    "会員",
+]

@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from web_analyzer.core.excel_service import ExcelService
-from web_analyzer.models import SiteAssessment
+from web_analyzer.core.models import SiteAssessment
 
 
 def test_excel_export_and_import(tmp_path: Path) -> None:
@@ -21,7 +21,7 @@ def test_excel_export_and_import(tmp_path: Path) -> None:
             contact_fields="名前,メールアドレス",
             site_structure="Top -> Contact",
             cms_name="",
-            evaluation_result="◎",
+            evaluation_result="◯",
             rejection_reason="",
         )
     ]

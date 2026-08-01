@@ -3,8 +3,8 @@ import threading
 
 from web_analyzer.core.crawler import WebCrawler
 from web_analyzer.core.evaluator import RenewalEvaluator
+from web_analyzer.core.models import ScrapingJob, SiteAssessment
 from web_analyzer.core.ssl_checker import SslChecker
-from web_analyzer.models import ScrapingJob, SiteAssessment
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,7 +82,9 @@ class SiteScraperService:
 
                 site_purpose = ""
                 cms_name = ""
-                html_src = ""  # HTMLソース受け渡し用（必要に応じてクローラー側から取得可能な設計にあわせる）
+                html_src = ""
+                has_attachment_raw: bool = False
+                has_login_raw: bool = False
 
                 # 1. SSL判定の実行
                 try:
@@ -104,17 +106,21 @@ class SiteScraperService:
                 crawler = WebCrawler()
                 try:
                     (
-                        total_pages_fetched,  # 定義した変数で安全に受け取る
+                        total_pages_fetched,
                         max_depth,
                         contact_fields,
                         site_structure,
                         site_purpose,
-                        html_src,  # 空白文字スキップのプレースホルダーから実際のソース受け取りへ変更
+                        html_src,
                         cms_name,
-                        has_attachment,
+                        has_attachment_raw,
+                        has_login_raw,
                     ) = crawler.crawl_and_analyze(item.domain_name)
                 except Exception as e:
                     logger.warning(f"[{item.domain_name}] クロール中に予期せぬエラーが発生しました: {e}")
+
+                has_attachment = bool(has_attachment_raw)
+                has_login = bool(has_login_raw)
 
                 # 文字列判定と数値へのクリーンアップ処理
                 if total_pages_fetched == "100ページ以上":
@@ -124,20 +130,6 @@ class SiteScraperService:
                     total_pages_int = int(total_pages_fetched)
                     total_pages_display = total_pages_int
 
-                # 4. リニューアル評価判定 & 不可判定
-                site_structure_lower = site_structure.lower()
-                LOGIN_KEYWORDS = [
-                    "login",
-                    "signin",
-                    "mypage",
-                    "member",
-                    "account",
-                    "ログイン",
-                    "マイページ",
-                    "会員",
-                ]
-
-                has_login = any(keyword.lower() in site_structure_lower for keyword in LOGIN_KEYWORDS)
                 if total_pages_int == 0:
                     eval_result = "要確認"
                     rejection_reason = "接続不可またはアクセス拒否のため、判定を保留しました。"
@@ -145,24 +137,19 @@ class SiteScraperService:
                     eval_result = "要確認"
                     rejection_reason = f"クロールできたページ数が極端に少ないため判定を保留しました (取得数: {total_pages_int}ページ)。"
                 else:
-                    # max_depth が文字列（'要確認' など）だった場合は安全に 0 に変換する
                     try:
                         max_depth_int = int(max_depth)
                     except ValueError:
                         max_depth_int = 0
 
-                    rejection_reason = evaluator.compile_rejection_reason(
+                    # 一本化された evaluate メソッドを呼び出す
+                    eval_result, rejection_reason = evaluator.evaluate(
                         total_pages=total_pages_int,
                         max_depth=max_depth_int,
                         has_login=has_login,
                         has_attachment=has_attachment,
-                    )
-
-                    eval_result = evaluator.evaluate_rank(
-                        total_pages=total_pages_int,
-                        max_depth=max_depth_int,
-                        has_login=has_login,
-                        has_attachment=has_attachment,
+                        html_src=html_src,
+                        page_threshold=job.page_threshold,  # jobモデルから単一の閾値を取得
                     )
 
                 # スレッドセーフに結果を書き込み
@@ -170,8 +157,6 @@ class SiteScraperService:
                     item.has_ssl = has_ssl_val
                     item.is_always_ssl = is_always_ssl_val
 
-                    # Mypyのエラー箇所: モデル側の型指定(int | None)に合わせるため
-                    # 「100ページ以上」だった場合は数値の上限である 100 を明示的に代入します
                     item.total_pages = total_pages_display  # type: ignore
                     item.max_depth = max_depth  # type: ignore
 
@@ -201,12 +186,11 @@ class SiteScraperService:
         with self._lock:
             current_job = self._jobs_cache.get(job_id)
             if current_job:
+                # 【修正ポイント】旧 threshold_1~3 を一掃し、page_threshold に準拠させる
                 updated_job = ScrapingJob(
                     id=current_job.id,
                     operator_name=current_job.operator_name,
-                    threshold_1=current_job.threshold_1,
-                    threshold_2=current_job.threshold_2,
-                    threshold_3=current_job.threshold_3,
+                    page_threshold=current_job.page_threshold,
                     status=status,
                     created_at=current_job.created_at,
                 )

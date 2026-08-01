@@ -8,6 +8,8 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup, Tag
 
+from web_analyzer.core.models import LOGIN_KEYWORDS
+
 logger = logging.getLogger(__name__)
 
 
@@ -16,7 +18,10 @@ class WebCrawler:
 
     v2: iframe内フォーム解析、JS遷移検知、label紐付け強化、div/dlフォーム対応、
     優先度キューのdeque化、logging化などを反映。
+    v3: crawl_and_analyzeをtuple(9要素)返却に変更、繰り返しパストラップ検知を強化。
     """
+
+    LOGIN_KEYWORDS = LOGIN_KEYWORDS
 
     # 必須マーク・記号として除去する表記のバリエーション
     REQUIRED_MARK_PATTERNS = [
@@ -314,22 +319,29 @@ class WebCrawler:
     def _has_repeating_path_pattern(self, path: str) -> bool:
         """カレンダーページ等が生む無限リンクトラップを検知する。
 
-        `/a/a/a` のような単純な繰り返しに加え、`/a/b/a/b/a/b` のような
-        2セグメント単位の交互パターンも検知する。
+        `/a/a/a` のような単純な繰り返しに加え、URLエンコードされたスラッグ等を
+        含む任意長のセグメント塊(1〜6セグメント)が**連続して2回**現れるケースも
+        検知する。JS遷移リンクの相対パス誤解決などで
+        `/blog/2023/01/11/blog/2023/01/11/...` のように塊がどんどん
+        追加されていくトラップは、3回繰り返しを待たずにここで早期に弾く。
         """
+        # 単一セグメントの3連続繰り返し(/a/a/a など)は従来通り即弾く
         if re.search(r"([^/]+)/\1/\1", path):
             return True
 
         segments = [p for p in path.split("/") if p]
-        for chunk_size in (2, 3):
-            if len(segments) < chunk_size * 3:
-                continue
-            for i in range(len(segments) - chunk_size * 3 + 1):
+        if len(segments) < 2:
+            return False
+
+        # 1〜6セグメント単位の塊が、隣接して2回連続で出現していないかをチェック
+        max_chunk_size = min(6, len(segments) // 2)
+        for chunk_size in range(1, max_chunk_size + 1):
+            for i in range(len(segments) - chunk_size * 2 + 1):
                 a = segments[i : i + chunk_size]
                 b = segments[i + chunk_size : i + chunk_size * 2]
-                c = segments[i + chunk_size * 2 : i + chunk_size * 3]
-                if a == b == c:
+                if a == b:
                     return True
+
         return False
 
     # ------------------------------------------------------------------
@@ -588,14 +600,19 @@ class WebCrawler:
             if not valid_inputs:
                 continue
 
-            # 1. th/label/dt/td/legend/span/strong/p + for=/aria-labelledby の紐付けから取得
+            # 1. label紐付けロジックの結果を格納
             for inp in valid_inputs:
                 if inp.name == "input" and str(inp.get("type", "")).lower() == "file":
                     has_attachment = True
 
                 txt = self._get_label_for_input(inp, form, soup)
+                txt = self._remove_required_marks(txt)
 
-            # 2. 上記で拾いきれなかった場合、th/label/dt/tdの総当たりでバックアップ
+                # 25文字未満かつ重複のない有効なテキストであれば追加
+                if txt and len(txt) < 25 and txt not in fields:
+                    fields.append(txt)
+
+            # 2. 上記で1つも拾いきれなかった場合のみ、総当たりでバックアップ
             if not fields:
                 labels = form.find_all(["th", "label", "dt", "td", "legend"])
                 for lbl in labels:
@@ -605,7 +622,7 @@ class WebCrawler:
                     if txt and len(txt) < 25 and txt not in fields:
                         fields.append(txt)
 
-            # 3. それでも拾えない場合、placeholder/aria-label/title/nameを候補として利用
+            # 3. それでもなお拾えない場合、属性値から候補を利用
             if not fields:
                 for inp in valid_inputs:
                     for attr in ("placeholder", "aria-label", "title", "name"):
@@ -615,7 +632,7 @@ class WebCrawler:
                         txt = self._remove_required_marks(str(val).strip())
                         if txt and len(txt) < 25 and txt not in fields:
                             fields.append(txt)
-                        break
+                            break  # 1つのインプットに対して1つの属性が取れれば次へ
 
         # iframe内フォームの再帰解析
         if client is not None and depth < self.max_iframe_depth:
@@ -647,8 +664,13 @@ class WebCrawler:
     # メインクロール処理
     # ------------------------------------------------------------------
 
-    def crawl_and_analyze(self, start_url: str) -> tuple[int | str, int | str, str, str, str, str, str, bool]:
-        """ウェブサイトを巡回し、100ページに達した時点で打ち切る。"""
+    def crawl_and_analyze(self, start_url: str) -> tuple[int | str, int | str, str, str, str, str, str, bool, bool]:
+        """ウェブサイトを巡回し、100ページに達した時点で打ち切る。
+
+        戻り値(9要素のtuple):
+            (total_pages, max_depth, contact_fields, site_structure,
+             description, combined_html_src, cms_name, has_attachment, has_login)
+        """
         if not start_url.startswith(("http://", "https://")):
             primary_url = f"https://{start_url}"
             fallback_url = f"http://{start_url}"
@@ -667,10 +689,11 @@ class WebCrawler:
         max_depth = 0
         contact_fields = ""
         has_attachment = False
+        has_login = False
         global_nav_menus: list[str] = []
         site_purpose = ""
         cms_name = ""
-        html_src = ""
+        combined_html_src = ""  # 判定用に全ページのHTMLを蓄積する
 
         def normalize_url(url: str) -> str:
             parsed = urlparse(url)
@@ -698,6 +721,9 @@ class WebCrawler:
                 follow_redirects=True,
                 verify=self.verify_ssl,
             ) as client:
+                first_url = ""
+                first_html = ""
+
                 try:
                     response = client.get(primary_url)
                     response.raise_for_status()
@@ -710,16 +736,16 @@ class WebCrawler:
                         try:
                             response = client.get(fallback_url)
                             response.raise_for_status()
+                            first_url = str(response.url)
+                            first_html = self._decode_response(response)
                             queue.append((str(response.url), 0))
                             queued_urls.add(str(response.url))
                         except Exception:
-                            return (0, 0, "", "", "", "", "", False)
+                            return (0, 0, "", "", "", "", "", False, False)
                     else:
-                        return (0, 0, "", "", "", "", "", False)
+                        return (0, 0, "", "", "", "", "", False, False)
 
                 previous_url = ""
-                first_html = ""
-                first_url = ""
 
                 while queue:
                     if len(visited) >= 100:
@@ -752,7 +778,6 @@ class WebCrawler:
                             response = client.get(current_url, headers=req_headers)
                             if response.status_code != 200:
                                 continue
-
                             current_html = self._decode_response(response)
 
                         # render_js指定時、初回ページのみPlaywrightでの再取得を試みる
@@ -762,10 +787,19 @@ class WebCrawler:
                                 current_html = rendered
 
                         previous_url = current_url
+
+                        # 全ページのソースを蓄積（GSAPや多言語、Lightbox検知用）
+                        combined_html_src += "\n" + current_html
+
                         soup = BeautifulSoup(current_html, "html.parser")
 
-                        if len(visited) == 1:
-                            html_src = current_html
+                        # ログイン機能チェック (URLやテキストから判定)
+                        url_lower = current_url.lower()
+                        if any(k in url_lower for k in self.LOGIN_KEYWORDS):
+                            has_login = True
+                        login_el = soup.find(["a", "button"], string=re.compile(r"ログイン|サインin|myページ", re.I))
+                        if login_el:
+                            has_login = True
 
                         # 階層判定(トップページを深度1として扱う)
                         path_segments = [p for p in parsed_current.path.split("/") if p]
@@ -779,6 +813,7 @@ class WebCrawler:
                         if detected and not cms_name:
                             cms_name = detected
 
+                        # 初回（トップ）ページのみナビゲーションと目的を取得
                         if len(visited) == 1:
                             site_purpose = self._extract_purpose_and_features(current_html)
 
@@ -803,6 +838,7 @@ class WebCrawler:
                                         img = item.find("img")
                                         if img and isinstance(img, Tag):
                                             menu_text = img.get("alt", "") or img.get("data-label", "")
+
                                     menu_text = self._clean_menu_text(str(menu_text))
 
                                     # 多言語判定メソッドを呼び出す
@@ -859,6 +895,7 @@ class WebCrawler:
         except Exception as e:
             logger.warning("クローラー内で予期せぬエラーが発生しました: %s", e)
 
+        # 出力データの整形
         site_structure = "\n".join(global_nav_menus[:10])
         final_page_count = "100ページ以上" if is_over_100 or len(visited) >= 100 else len(visited)
 
@@ -872,7 +909,8 @@ class WebCrawler:
             contact_fields,
             site_structure,
             site_purpose,
-            html_src,
+            combined_html_src,
             cms_name,
             has_attachment,
+            has_login,
         )
