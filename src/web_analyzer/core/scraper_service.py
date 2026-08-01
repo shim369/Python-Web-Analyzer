@@ -125,7 +125,7 @@ class SiteScraperService:
                 # 文字列判定と数値へのクリーンアップ処理
                 if total_pages_fetched == "100ページ以上":
                     total_pages_int = 100
-                    total_pages_display: int | str = "100~"
+                    total_pages_display: int | str = "100以上"
                 else:
                     total_pages_int = int(total_pages_fetched)
                     total_pages_display = total_pages_int

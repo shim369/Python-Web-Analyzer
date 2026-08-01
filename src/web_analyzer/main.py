@@ -73,7 +73,7 @@ scraper_service: SiteScraperService = st.session_state.scraper_service
 # 3. サイドバーの設定
 with st.sidebar:
     st.markdown("### 解析設定")
-    st.write("調査パラメータおよび担当者名を設定してください。")
+    st.write("担当者名を設定してください。")
 
     operator_name = st.text_input("担当者名", value="", placeholder="氏名を入力")
 
