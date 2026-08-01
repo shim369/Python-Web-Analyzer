@@ -136,20 +136,22 @@ class SiteScraperService:
                 elif 1 <= total_pages_int <= 2:
                     eval_result = "要確認"
                     rejection_reason = f"クロールできたページ数が極端に少ないため判定を保留しました (取得数: {total_pages_int}ページ)。"
+                elif max_depth == "要確認":
+                    eval_result = "要確認"
+                    rejection_reason = "サイト階層が深すぎるため、別途サイトエクスプローラー等での確認をお願いします。"
                 else:
                     try:
                         max_depth_int = int(max_depth)
-                    except ValueError:
+                    except (ValueError, TypeError):
                         max_depth_int = 0
 
-                    # 一本化された evaluate メソッドを呼び出す
                     eval_result, rejection_reason = evaluator.evaluate(
                         total_pages=total_pages_int,
                         max_depth=max_depth_int,
                         has_login=has_login,
                         has_attachment=has_attachment,
                         html_src=html_src,
-                        page_threshold=job.page_threshold,  # jobモデルから単一の閾値を取得
+                        page_threshold=job.page_threshold,
                     )
 
                 # スレッドセーフに結果を書き込み
