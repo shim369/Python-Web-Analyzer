@@ -128,30 +128,15 @@ class SiteScraperService:
                     total_pages_int = int(total_pages_fetched)
                     total_pages_display = total_pages_int
 
-                if total_pages_int == 0:
-                    eval_result = "要確認"
-                    rejection_reason = "接続不可またはアクセス拒否のため、判定を保留しました。"
-                elif 1 <= total_pages_int <= 2:
-                    eval_result = "要確認"
-                    rejection_reason = f"クロールできたページ数が極端に少ないため判定を保留しました (取得数: {total_pages_int}ページ)。"
-                elif max_depth == "要確認":
-                    eval_result = "要確認"
-                    rejection_reason = "サイト階層が深すぎるため、別途サイトエクスプローラー等での確認をお願いします。"
-                else:
-                    try:
-                        max_depth_int = int(max_depth)
-                    except (ValueError, TypeError):
-                        max_depth_int = 0
-
-                    eval_result, rejection_reason = evaluator.evaluate(
-                        total_pages=total_pages_int,
-                        max_depth=max_depth_int,
-                        has_login=has_login,
-                        has_attachment=has_attachment,
-                        has_basic_auth=has_basic_auth,
-                        html_src=html_src,
-                        page_threshold=job.page_threshold,
-                    )
+                eval_result, rejection_reason = evaluator.decide(
+                    total_pages=total_pages_int,
+                    max_depth=max_depth,
+                    has_login=has_login,
+                    has_attachment=has_attachment,
+                    has_basic_auth=has_basic_auth,
+                    html_src=html_src,
+                    page_threshold=job.page_threshold,
+                )
 
                 # スレッドセーフに結果を書き込み
                 with self._lock:

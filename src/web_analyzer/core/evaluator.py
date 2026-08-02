@@ -11,6 +11,46 @@ class RenewalEvaluator:
 
     PDF_LINK_THRESHOLD = 5  # この件数以上PDFリンクがあれば「資料が多い」と判定
 
+    def decide(
+        self,
+        total_pages: int | str,
+        max_depth: int | str,
+        has_login: bool,
+        has_attachment: bool,
+        has_basic_auth: bool = False,
+        html_src: str = "",
+        page_threshold: int = 10,
+    ) -> tuple[str, str]:
+        """クロール結果から調査結果（◯/×/要確認）と理由を一括で決定する。
+
+        「そもそも判定不能として要確認に倒すか」という、接続失敗・ページ数極小・
+        階層数計測不能といった特殊ケースの判断もここに集約する。
+        evaluate() を直接呼ぶより、こちらを呼ぶことを推奨する。
+        """
+        if total_pages == 0:
+            return "要確認", "接続不可またはアクセス拒否のため、判定を保留しました。"
+
+        if isinstance(total_pages, int) and 1 <= total_pages <= 2:
+            return "要確認", f"クロールできたページ数が極端に少ないため判定を保留しました (取得数: {total_pages}ページ)。"
+
+        if max_depth == "要確認":
+            return "要確認", "サイト階層が深すぎるため、別途サイトエクスプローラー等での確認をお願いします。"
+
+        try:
+            max_depth_int = int(max_depth)
+        except (ValueError, TypeError):
+            max_depth_int = 0
+
+        return self.evaluate(
+            total_pages=int(total_pages),
+            max_depth=max_depth_int,
+            has_login=has_login,
+            has_attachment=has_attachment,
+            has_basic_auth=has_basic_auth,
+            html_src=html_src,
+            page_threshold=page_threshold,
+        )
+
     def evaluate(
         self,
         total_pages: int,
@@ -21,18 +61,23 @@ class RenewalEvaluator:
         html_src: str = "",
         page_threshold: int = 10,
     ) -> tuple[str, str]:
-        """判定結果(◯/×)と、NGの場合の理由（改行区切り文字列）を一括で返す。"""
+        """判定結果(◯/×)と、NGの場合の理由（改行区切り文字列）を一括で返す。
+
+        接続失敗・ページ数極小・階層数計測不能などの特殊ケースを考慮せず、
+        純粋なビジネスルールのみで◯/×を決める。特殊ケースを含めた
+        最終判定が必要な場合は decide() を使うこと。
+        """
         reasons: list[str] = []
         html_lower = html_src.lower()
 
         # --- ページ数・階層構成 ---
         if total_pages > page_threshold:
-            reasons.append(f"ページ数が多いため ({total_pages}ページ)")
+            reasons.append("ページ数が多いため")
 
         if max_depth > 2:
             reasons.append("サイト構成が3階層以上のため")
 
-        # --- ログイン・添付機能（クローラー側で検知済みの値を使用） ---
+        # --- ログイン・添付・認証機能（クローラー側で検知済みの値を使用） ---
         if has_login:
             reasons.append("ログイン・マイページ機能があるため")
 
