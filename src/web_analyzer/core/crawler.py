@@ -8,7 +8,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup, Tag
 
-from web_analyzer.core.models import LOGIN_KEYWORDS
+from web_analyzer.models import LOGIN_KEYWORDS
 from web_analyzer.utils.decorators import measure_time
 
 logger = logging.getLogger(__name__)
@@ -666,12 +666,13 @@ class WebCrawler:
     # ------------------------------------------------------------------
 
     @measure_time
-    def crawl_and_analyze(self, start_url: str) -> tuple[int | str, int | str, str, str, str, str, str, bool, bool]:
+    def crawl_and_analyze(self, start_url: str) -> tuple[int | str, int | str, str, str, str, str, str, bool, bool, bool]:
         """ウェブサイトを巡回し、100ページに達した時点で打ち切る。
 
-        戻り値(9要素のtuple):
-            (total_pages, max_depth, contact_fields, site_structure,
-             description, combined_html_src, cms_name, has_attachment, has_login)
+        戻り値(10要素のtuple):
+        (total_pages, max_depth, contact_fields, site_structure,
+         description, combined_html_src, cms_name, has_attachment,
+         has_login, has_basic_auth)
         """
         if not start_url.startswith(("http://", "https://")):
             primary_url = f"https://{start_url}"
@@ -692,6 +693,7 @@ class WebCrawler:
         contact_fields = ""
         has_attachment = False
         has_login = False
+        has_basic_auth = False
         global_nav_menus: list[str] = []
         site_purpose = ""
         cms_name = ""
@@ -728,6 +730,8 @@ class WebCrawler:
 
                 try:
                     response = client.get(primary_url)
+                    if response.status_code == 401:
+                        has_basic_auth = True
                     response.raise_for_status()
                     first_url = str(response.url)
                     first_html = self._decode_response(response)
@@ -737,15 +741,18 @@ class WebCrawler:
                     if fallback_url:
                         try:
                             response = client.get(fallback_url)
+                            if response.status_code == 401:
+                                has_basic_auth = True
+                            response = client.get(fallback_url)
                             response.raise_for_status()
                             first_url = str(response.url)
                             first_html = self._decode_response(response)
                             queue.append((str(response.url), 0))
                             queued_urls.add(str(response.url))
                         except Exception:
-                            return (0, 0, "", "", "", "", "", False, False)
+                            return (0, 0, "", "", "", "", "", False, False, has_basic_auth)
                     else:
-                        return (0, 0, "", "", "", "", "", False, False)
+                        return (0, 0, "", "", "", "", "", False, False, has_basic_auth)
 
                 previous_url = ""
 
@@ -778,6 +785,8 @@ class WebCrawler:
                             current_html = first_html
                         else:
                             response = client.get(current_url, headers=req_headers)
+                            if response.status_code == 401:
+                                has_basic_auth = True
                             if response.status_code != 200:
                                 continue
                             current_html = self._decode_response(response)
@@ -915,4 +924,5 @@ class WebCrawler:
             cms_name,
             has_attachment,
             has_login,
+            has_basic_auth,
         )

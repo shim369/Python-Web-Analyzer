@@ -3,8 +3,8 @@ import threading
 
 from web_analyzer.core.crawler import WebCrawler
 from web_analyzer.core.evaluator import RenewalEvaluator
-from web_analyzer.core.models import ScrapingJob, SiteAssessment
 from web_analyzer.core.ssl_checker import SslChecker
+from web_analyzer.models import ScrapingJob, SiteAssessment
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +80,7 @@ class SiteScraperService:
                 html_src = ""
                 has_attachment_raw: bool = False
                 has_login_raw: bool = False
+                has_basic_auth_raw: bool = False
 
                 # 1. SSL判定の実行
                 try:
@@ -110,12 +111,14 @@ class SiteScraperService:
                         cms_name,
                         has_attachment_raw,
                         has_login_raw,
+                        has_basic_auth_raw,
                     ) = crawler.crawl_and_analyze(item.domain_name)
                 except Exception as e:
                     logger.warning(f"[{item.domain_name}] クロール中に予期せぬエラーが発生しました: {e}")
 
                 has_attachment = bool(has_attachment_raw)
                 has_login = bool(has_login_raw)
+                has_basic_auth = bool(has_basic_auth_raw)
 
                 # 文字列判定と数値へのクリーンアップ処理
                 if total_pages_fetched == "100ページ以上":
@@ -145,6 +148,7 @@ class SiteScraperService:
                         max_depth=max_depth_int,
                         has_login=has_login,
                         has_attachment=has_attachment,
+                        has_basic_auth=has_basic_auth,
                         html_src=html_src,
                         page_threshold=job.page_threshold,
                     )

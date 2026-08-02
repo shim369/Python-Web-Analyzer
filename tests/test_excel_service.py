@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from web_analyzer.core.excel_service import ExcelService
-from web_analyzer.core.models import SiteAssessment
+from web_analyzer.models import SiteAssessment
 
 
 def test_excel_export_and_import(tmp_path: Path) -> None:

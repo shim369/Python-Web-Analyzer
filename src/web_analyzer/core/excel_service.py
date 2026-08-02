@@ -8,7 +8,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
-from web_analyzer.core.models import ScrapingJob, SiteAssessment
+from web_analyzer.models import ScrapingJob, SiteAssessment
 from web_analyzer.utils.decorators import log_action
 
 

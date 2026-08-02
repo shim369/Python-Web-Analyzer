@@ -5,8 +5,8 @@ from pathlib import Path
 import streamlit as st
 
 from web_analyzer.core.excel_service import ExcelService
-from web_analyzer.core.models import ScrapingJob
 from web_analyzer.core.scraper_service import SiteScraperService
+from web_analyzer.models import ScrapingJob
 from web_analyzer.utils.logger import setup_logger
 
 st.set_page_config(
