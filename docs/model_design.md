@@ -96,13 +96,10 @@ C列（調査結果）全体、すなわち`"◯"` / `"×"` / `"要確認"`の3�
 * `SCROLL_ANIMATION_KEYWORDS`: GSAP等のスクロールアニメーション検知用
 * `VIDEO_KEYWORDS`: `<video>`タグ・YouTube/Vimeo埋め込み検知用
 * `FLOATING_BUTTON_KEYWORDS`: 画面追従ボタン検知用
-* `ACCORDION_MODAL_KEYWORDS`: アコーディオン／タブ切り替え／モーダル検知用
-* `RECRUIT_KEYWORDS`: 採用（リクルート）ページ検知用
-* `BLOG_NEWS_KEYWORDS`: ブログ・お知らせ系リンク検知用（`BLOG_NEWS_LINK_THRESHOLD`件以上の出現で該当）
-* `WORKS_KEYWORDS`: 製品・実績系リンク検知用（`WORKS_LINK_THRESHOLD`件以上の出現で該当）
-* `PDF_LINK_THRESHOLD` / `BLOG_NEWS_LINK_THRESHOLD` / `WORKS_LINK_THRESHOLD`: いずれもデフォルト5。`combined_html_src`内での該当文字列の出現回数がこの値以上であれば「多い」と判定する（巡回ページ数そのものをカウントしているわけではなく、該当リンク文字列の出現回数を代理指標として利用している点に注意）。
+* `ACCORDION_KEYWORDS` / `TAB_KEYWORDS` / `MODAL_KEYWORDS`: アコーディオン・タブ切り替え・モーダルウィンドウをそれぞれ独立して検知（それぞれ別の理由文として列挙される）。当初は`ACCORDION_MODAL_KEYWORDS`として1つのリストにまとめていたが、`data-toggle`/`aria-expanded`という汎用的な属性（アコーディオンやモーダルに限らず、ハンバーガーメニュー等の一般的なナビゲーションUIにも広く使われる）が誤検知の原因になり得たため、この2語は削除し、機能ごとに独立したクラス名のみで判定する形に分割した。
+* `PDF_LINK_THRESHOLD`: PDFリンクの出現数がこの値（デフォルト5）以上であれば「資料が多い」と判定。`combined_html_src`内での`.pdf`という文字列の出現回数をカウントしている（巡回ページ数そのものをカウントしているわけではなく、出現回数を代理指標として利用している点に注意）。
 
-Google Map埋め込みは、ほぼすべてのコーポレートサイトのアクセスページに存在し単独では判定基準として機能しにくいため、検知対象から意図的に除外されている。
+Google Map埋め込みは、ほぼすべてのコーポレートサイトのアクセスページに存在し単独では判定基準として機能しにくいため、検知対象から意図的に除外されている。同様に、採用ページの有無やブログ・実績ページのボリュームによる判定も、検討の結果採用を見送っている。
 
 ## 3. ユーティリティ層 (`utils/`)
 

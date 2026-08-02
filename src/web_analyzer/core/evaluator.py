@@ -10,14 +10,11 @@ class RenewalEvaluator:
     SCROLL_ANIMATION_KEYWORDS = ["gsap", "scrolltrigger", "data-aos", "locomotive-scroll"]
     VIDEO_KEYWORDS = ["<video", "youtube.com/embed", "vimeo.com"]
     FLOATING_BUTTON_KEYWORDS = ["floating", "fixed-btn", "pagetop", "to-top", "follow-window"]
-    ACCORDION_MODAL_KEYWORDS = ["accordion", "tab-content", "data-toggle", "aria-expanded", "modal-window"]
-    RECRUIT_KEYWORDS = ["/recruit/", "採用情報", "リクルートサイト"]
-    BLOG_NEWS_KEYWORDS = ["/blog/", "/news/", "/topics/"]
-    WORKS_KEYWORDS = ["/works/", "/case/", "/products/"]
+    ACCORDION_KEYWORDS = ["accordion"]
+    TAB_KEYWORDS = ["tab-content", "nav-tabs"]
+    MODAL_KEYWORDS = ["modal-window", "modal-dialog"]
 
     PDF_LINK_THRESHOLD = 5  # この件数以上PDFリンクがあれば「資料が多い」と判定
-    BLOG_NEWS_LINK_THRESHOLD = 5  # ブログ・お知らせ系リンクの出現数の閾値
-    WORKS_LINK_THRESHOLD = 5  # 製品・実績系リンクの出現数の閾値
 
     def decide(
         self,
@@ -80,7 +77,7 @@ class RenewalEvaluator:
 
         # --- ページ数・階層構成 ---
         if total_pages > page_threshold:
-            reasons.append("ページ数が多いため")
+            reasons.append(f"ページ数が多いため ({total_pages}ページ)")
 
         if max_depth > 2:
             reasons.append("サイト構成が3階層以上のため")
@@ -127,18 +124,14 @@ class RenewalEvaluator:
         if any(k in html_lower for k in self.FLOATING_BUTTON_KEYWORDS):
             reasons.append("フローティングボタン（画面追従ボタン）があるため")
 
-        if any(k in html_lower for k in self.ACCORDION_MODAL_KEYWORDS):
-            reasons.append("アコーディオン／タブ切り替え／モーダルが多用されているため")
+        if any(k in html_lower for k in self.ACCORDION_KEYWORDS):
+            reasons.append("アコーディオンが使用されているため")
 
-        # --- コンテンツ・構造面 ---
-        if any(k in html_lower for k in self.RECRUIT_KEYWORDS):
-            reasons.append("下層にリクルート（採用）サイトがあるため")
+        if any(k in html_lower for k in self.TAB_KEYWORDS):
+            reasons.append("タブ切り替えが使用されているため")
 
-        if sum(html_lower.count(k) for k in self.BLOG_NEWS_KEYWORDS) >= self.BLOG_NEWS_LINK_THRESHOLD:
-            reasons.append("ブログ・お知らせ等の更新コンテンツが多いため")
-
-        if sum(html_lower.count(k) for k in self.WORKS_KEYWORDS) >= self.WORKS_LINK_THRESHOLD:
-            reasons.append("製品詳細・施工実績等のページが多いため")
+        if any(k in html_lower for k in self.MODAL_KEYWORDS):
+            reasons.append("モーダルウィンドウが使用されているため")
 
         # --- リッチコンテンツ ---
         if any(k in html_lower for k in self.RICH_UI_KEYWORDS):
