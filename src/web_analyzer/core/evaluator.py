@@ -80,7 +80,7 @@ class RenewalEvaluator:
 
         # --- ページ数・階層構成 ---
         if total_pages > page_threshold:
-            reasons.append(f"ページ数が多いため ({total_pages}ページ)")
+            reasons.append("ページ数が多いため")
 
         if max_depth > 2:
             reasons.append("サイト構成が3階層以上のため")
