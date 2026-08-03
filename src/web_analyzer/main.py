@@ -15,6 +15,47 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# バックグラウンドスリープ対策のJavaScript埋め込み
+# 画面に影響を与えないよう height=0 で配置し、ユーザーがタブに戻った瞬間に状態をチェックさせます
+st.components.v1.html(
+    """
+    <script>
+    document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") {
+            console.log("タブがアクティブになりました。接続状態を確認します。");
+            
+            // 簡易的なオンラインチェック
+            if (!navigator.onLine) {
+                console.log("ネットワーク自体がオフラインです。");
+                window.parent.location.reload();
+                return;
+            }
+
+            // Streamlitの内部状態（WebSocketなど）が切断されているか、
+            // 画面がフリーズしているかを安全にチェックするロジック
+            try {
+                // 親ウィンドウのコネクション状態を確認する（Streamlitのグローバルオブジェクトにアクセス）
+                // 切断されている、またはエラー画面になっている場合にのみリロードを実行する
+                const parentConnection = window.parent.__streamlit__?.connection;
+                
+                // コネクションオブジェクトが存在し、かつ閉じられている場合
+                if (parentConnection && (parentConnection._socket?.readyState === 3 || parentConnection._state === 'CLOSED')) {
+                    console.log("StreamlitのWebSocket切断を検知したため、リロードします。");
+                    window.parent.location.reload();
+                } else {
+                    console.log("通信は維持されているため、リロードをスキップします。");
+                }
+            } catch (e) {
+                // クロスドメイン制限などでアクセスできない場合のセーフティ
+                console.error("ステータスチェックに失敗しました:", e);
+            }
+        }
+    });
+    </script>
+    """,
+    height=0,
+)
+
 # UIスタイリング
 st.markdown(
     """
@@ -101,7 +142,6 @@ with st.sidebar:
         * カレンダー
         * サイト内検索・絞り込み検索
         * チャットボット導入
-        * PDF資料が多い（目安5件以上）
 
         **UI上の演出**
         * トップイメージ等に動画
@@ -135,8 +175,6 @@ if uploaded_file:
         f.write(uploaded_file.getbuffer())
 
     try:
-        # 【変更点】引数としてのしきい値は渡さず、インポートを実行
-        # （ExcelService側もこれに合わせて引数を不要にするか、内部でRenewalEvaluatorを呼ぶ形に修正が必要です）
         job, assessments = ExcelService.import_excel(file_path=input_path, operator_name=operator_name if operator_name.strip() else "未指定")
 
         st.success(f"ファイルを正常に読み込みました。 (対象ドメイン数: {len(assessments)}件)")
@@ -145,7 +183,6 @@ if uploaded_file:
             if not operator_name.strip():
                 st.error("調査を開始するには、サイドバーから「担当者名」を入力してください。")
             else:
-                # 読み取り専用プロパティの代入を避け、新しいインスタンスを再生成
                 updated_job = ScrapingJob(
                     id=job.id,
                     operator_name=operator_name.strip(),
