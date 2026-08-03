@@ -4,18 +4,20 @@ from datetime import datetime
 from pathlib import Path
 
 
-def setup_logger(level: int = logging.INFO) -> None:
+def setup_logger(level: int = logging.DEBUG) -> None:
     """ロガーの初期設定。
 
-    fileConfig ではフィルターの詳細制御ができない制限を考慮し、dictConfig を採用。
+    実行ごとに日時を秒単位まで含めた個別のログファイルを生成する。
     """
     log_directory = Path("logs")
     log_directory.mkdir(parents=True, exist_ok=True)
-    log_file = log_directory / f"app_{datetime.now().strftime('%Y%m%d')}.log"
+
+    # ★ 実行時の「年月日時分秒」をファイル名に組み込む (例: app_20260803_162005.log)
+    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_directory / f"app_{current_time}.log"
 
     config = {
         "version": 1,
-        # 既存のロガー（streamlit等）を勝手に無効化せず保護する
         "disable_existing_loggers": False,
         "formatters": {
             "standard": {
@@ -27,25 +29,26 @@ def setup_logger(level: int = logging.INFO) -> None:
             "console": {
                 "class": "logging.StreamHandler",
                 "formatter": "standard",
-                "level": level,
+                "level": logging.INFO,  # 画面はスッキリINFOのみ
             },
             "file": {
+                # ★ 実行ごとにファイルを分けるため、通常の FileHandler に戻す
                 "class": "logging.FileHandler",
                 "filename": str(log_file),
                 "encoding": "utf-8",
-                "mode": "a",
+                "mode": "w",  # ★ 'a'(追記) ではなく 'w'(新規書き込み) にすることで確実に新ファイルにする
                 "formatter": "standard",
-                "level": level,
+                "level": logging.DEBUG,  # ファイルには全デバッグログを記録
             },
         },
         "root": {
             "handlers": ["console", "file"],
-            "level": level,
+            "level": logging.DEBUG,
         },
     }
 
     logging.config.dictConfig(config)
-    logging.info("ロガーを初期化しました。ログファイル: %s", log_file)
+    logging.info("ロガーを初期化しました。新規ログファイル: %s", log_file)
 
 
 def get_logger(name: str) -> logging.Logger:
