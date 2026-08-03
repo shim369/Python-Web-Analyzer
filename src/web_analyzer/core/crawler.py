@@ -91,6 +91,19 @@ class WebCrawler:
     _FORM_LIKE_CLASS_RE = re.compile(r"form|contact|inquiry|entry", re.I)
     _LABEL_LIKE_CLASS_RE = re.compile(r"label|title|item-?label|form-?label|field-?name", re.I)
 
+    # 多言語切り替えウィジェットらしきコンテナのclass/id判定用
+    # (グローバルナビの中ではなく、ヘッダー上部などに単独で配置されるケースを拾うための正規表現)
+    _MULTILANG_CONTAINER_RE = re.compile(
+        r"^lang(?:uage)?$"  # class="lang" / class="language" のような単独指定にも対応
+        r"|lang(?:uage)?[-_]?(?:switch|select|selector|list|menu|nav|area|box|bar|toggle|change|btn)"
+        r"|i18n|locale[-_]?switch|multilingual|globalnav.*lang|lang.*nav|header.*lang|gnav.*lang",
+        re.I,
+    )
+
+    # 「header」というタグ名/class/idを持たない(セマンティックなheader要素を使っていない)
+    # レガシーな作りのサイトでも、ヘッダー相当の領域を拾えるようにするための正規表現
+    _HEADER_LIKE_RE = re.compile(r"header|gnav|globalnav|utility|top-?bar|topnav|l-header", re.I)
+
     # location遷移をJSで行うパターン(onclick / インラインscript両対応)
     _JS_LOCATION_RE = re.compile(r"(?:location\.href|window\.location(?:\.href)?)\s*=\s*['\"]([^'\"]+)['\"]")
 
@@ -180,10 +193,7 @@ class WebCrawler:
                 "wp-content",
                 "wp-includes",
             ],
-            "baserCMS": [
-                "basercms",
-                "bc-",
-            ],
+            "baserCMS": ["basercms"],
             "EC-CUBE": [
                 "eccube",
             ],
@@ -196,11 +206,9 @@ class WebCrawler:
             ],
             "Drupal": [
                 "drupal",
-                "sites/default",
                 "drupal-settings-json",
             ],
             "Joomla!": [
-                "/media/system/",
                 "joomla!",
             ],
             "TYPO3": [
@@ -414,6 +422,215 @@ class WebCrawler:
         return self._JS_LOCATION_RE.findall(html)
 
     # ------------------------------------------------------------------
+    # 多言語ページの検知
+    # ------------------------------------------------------------------
+
+    def _is_multilang_element(self, item: Tag, menu_text: str) -> bool:
+        """要素が多言語切り替え用メニューであるかを強固かつ幅広く判定する"""
+
+        # 1. 判定用キーワード（主要言語の英語表記・日本語表記・現地語表記を網羅）
+        lang_keywords = {
+            # 共通・概念
+            "language",
+            "lang",
+            "select language",
+            "global",
+            "multilingual",
+            "言語",
+            "多言語",
+            # 日本語・英語
+            "日本語",
+            "japanese",
+            "jp",
+            "ja",
+            "english",
+            "en",
+            # 中国語（繁体・簡体・各種表記）
+            "繁体",
+            "簡体",
+            "chinese",
+            "中文",
+            "中国語",
+            "簡体字",
+            "繁体字",
+            "zh",
+            # 韓国語
+            "한국어",
+            "korean",
+            "ko",
+            "韓国語",
+            # 東南アジア諸国
+            "tiếng việt",
+            "vietnamese",
+            "vi",
+            "thai",
+            "th",
+            "bahasa",
+            "indonesian",
+            "id",
+            "myanmar",
+            "my",
+            # ヨーロッパ・その他主要言語
+            "español",
+            "spanish",
+            "es",
+            "français",
+            "french",
+            "fr",
+            "deutsch",
+            "german",
+            "de",
+            "italiano",
+            "italian",
+            "it",
+            "português",
+            "portuguese",
+            "pt",
+            "русский",
+            "russian",
+            "ru",
+        }
+
+        # 2. URLパス判定用の「2文字/3文字の言語コード」判定用正規表現
+        # 例: /en/, /ko/, /zh-cn/, /de/ などを安全にキャッチする（他の単語の巻き込みを防ぐ）
+        # ※ 2026年現在の主要なWeb標準（ISO 639-1）に基づく2文字コードおよび拡張表記に対応
+        LANG_CODE_PATTERN = re.compile(r"^(en|ja|ko|zh|es|fr|de|it|pt|ru|vi|th|id|ms|my|tl|hi|ar)(-\w+)?$")
+
+        # --- A. テキスト（メニュー名）による判定 ---
+        # 2文字前後の短いラテン文字コード(en, jp, id, my 等)は英単語の一部と偶然一致しやすい
+        # (例: "Guide"に"id"が含まれる等)ため、完全一致のみを許可する。
+        # それ以外の十分に長いキーワード(language, 日本語 等)は部分一致でも誤検知しにくいので
+        # 従来通り部分一致を許可する。
+        short_latin_codes = {kw for kw in lang_keywords if len(kw) <= 3 and kw.isascii()}
+        long_keywords = lang_keywords - short_latin_codes
+
+        menu_text_lower = menu_text.lower().strip()
+        if menu_text_lower in short_latin_codes:
+            return True
+        if any(lk in menu_text_lower for lk in long_keywords):
+            return True
+
+        # --- B. 画像（imgタグ）のalt属性・src属性による判定 ---
+        img_tags = item.find_all("img")
+        if item.name == "img":
+            img_tags.append(item)
+
+        for img in img_tags:
+            alt_text = img.get("alt", "").strip().lower()
+            if any(lk == alt_text or lk in alt_text for lk in lang_keywords):
+                return True
+
+            src_text = img.get("src", "").lower()
+            if any(lk in src_text for lk in lang_keywords):
+                return True
+
+        # --- C. リンクのURL（href属性）による判定 【超強化】 ---
+        # 1. item が Tag かどうか、および item 自身の href を安全に取得
+        href: str | list[str] | None = None
+        if isinstance(item, Tag):
+            href = item.get("href")
+
+            # 2. item 自身に href がない場合、子要素の <a> から取得
+            if not href:
+                a_tag = item.find("a")
+                if isinstance(a_tag, Tag):
+                    href = a_tag.get("href")
+
+        # 3. href が存在し、かつ通常の文字列（str）である場合のみ処理を進める
+        if href and isinstance(href, str):
+            href_lower = href.lower()
+            path = urlparse(href_lower).path
+            path_segments = [seg for seg in path.split("/") if seg]
+
+            for segment in path_segments:
+                # ① キーワードリスト（english, korean など）と完全一致するか
+                if segment in lang_keywords:
+                    return True
+                # ② URLが「/en/」「/ko/」「/zh-tw/」のような言語コード形式になっているか
+                if LANG_CODE_PATTERN.match(segment):
+                    return True
+
+            # パラメータ形式のURL対策（例: ?lang=en, ?language=korean）
+            if any(p in href_lower for p in ["lang=", "language=", "locale="]):
+                return True
+
+        return False
+
+    def _detect_multilang_switcher(self, soup: BeautifulSoup) -> bool:
+        """多言語切り替え機能の有無を、ページ全体から検知する。
+
+        従来は「グローバルナビの中にある項目」だけを対象に _is_multilang_element()
+        を呼んでいたが、実際には多言語切り替えリンクはグローバルナビの中には無く、
+        ヘッダー上部などに独立したウィジェット（例: <div class="lang-switch">JP / EN</div>）
+        として置かれているサイトが多い。そのため、nav要素の中身に限定せず、
+        ページ全体を対象に以下の複数の手がかりで判定する。
+        """
+        # 1. hreflang属性は最も確実なシグナル(サイト内のどこにあっても多言語対応とみなせる)
+        if soup.find(attrs={"hreflang": True}):
+            return True
+
+        # 2. Google翻訳ウィジェットの検知
+        if soup.find(id="google_translate_element") or soup.find(class_=re.compile(r"goog-te", re.I)):
+            return True
+
+        # 3. class/id が言語切り替えらしいコンテナを、nav/header/独立divを問わずページ全体から探索
+        candidate_containers: list[Tag] = []
+        candidate_containers.extend(soup.find_all(["div", "ul", "nav", "li", "span"], class_=self._MULTILANG_CONTAINER_RE))
+        candidate_containers.extend(soup.find_all(["div", "ul", "nav", "li", "span"], id=self._MULTILANG_CONTAINER_RE))
+
+        for container in candidate_containers:
+            # 1. 最初から通常の list に変換し、明示的に型を list[Tag] (または list[Any]) にする
+            links: list[Tag] = list(container.find_all("a"))
+            if container.name == "a":
+                links = [container] + links
+
+            for link in links:
+                # 2. link が確実に Tag オブジェクト（get_textを持つ）であることを確認
+                if not hasattr(link, "get_text"):
+                    continue
+
+                text = self._clean_menu_text(link.get_text(strip=True))
+                if self._is_multilang_element(link, text):
+                    return True
+
+        # 4. ヘッダー領域限定で、言語コードらしきリンクが複数並んでいないかを最終チェック
+        #    (「lang」等のクラス名を持たない、素の <ul><li><a>JP</a></li><li><a>EN</a></li></ul> 形式の
+        #    ヘッダー内独立ウィジェットを拾うためのフォールバック)
+        #    セマンティックな <header> タグを使っていない古い作りのサイトも多いため、
+        #    class/id に "header" 等を含む div/section もヘッダー相当とみなして対象に含める。
+        header_candidates: list[Tag] = [h for h in soup.find_all("header") if isinstance(h, Tag)]
+        header_candidates.extend(soup.find_all(["div", "section"], id=self._HEADER_LIKE_RE))
+        header_candidates.extend(soup.find_all(["div", "section"], class_=self._HEADER_LIKE_RE))
+
+        seen_header_ids: set[int] = set()
+        for header in header_candidates:
+            if id(header) in seen_header_ids:
+                continue
+            seen_header_ids.add(id(header))
+
+            lang_link_count = 0
+            for link in header.find_all("a", href=True):
+                text = self._clean_menu_text(link.get_text(strip=True))
+                if self._is_multilang_element(link, text):
+                    lang_link_count += 1
+            if lang_link_count >= 2:
+                return True
+
+        # 5. <select>による言語切り替えドロップダウン(JSフレームワーク非依存の素朴な実装で多用される)
+        for select in soup.find_all("select"):
+            if not isinstance(select, Tag):
+                continue
+            lang_option_count = 0
+            for option in select.find_all("option"):
+                text = self._clean_menu_text(option.get_text(strip=True))
+                if self._is_multilang_element(option, text):
+                    lang_option_count += 1
+            if lang_option_count >= 2:
+                return True
+
+        return False
+
+    # ------------------------------------------------------------------
     # フォーム項目抽出
     # ------------------------------------------------------------------
 
@@ -423,14 +640,8 @@ class WebCrawler:
         return re.sub(r"^[\s\xa0\n\r]+|[\s\xa0\n\r]+$", "", text)
 
     def _get_label_for_input(self, inp: Tag, form: Tag, soup: BeautifulSoup) -> str:
-        """input要素に対応するラベル文字列を、複数の手がかりから解決する。
-
-        優先順位:
-        1. aria-labelledby が指す要素のテキスト
-        2. aria-label 属性そのもの
-        3. <label for="id"> の紐付け
-        4. 直近の祖先(tr/dt/div等)から拾えるラベルらしきテキスト
-        """
+        """input要素に対応する厳格なラベル（W3C標準仕様）を解決する。"""
+        # 1. aria-labelledby
         labelledby = inp.get("aria-labelledby")
         if labelledby:
             target = soup.find(id=str(labelledby))
@@ -439,12 +650,14 @@ class WebCrawler:
                 if txt:
                     return txt
 
+        # 2. aria-label
         aria_label = inp.get("aria-label")
         if aria_label:
             txt = str(aria_label).strip()
             if txt:
                 return txt
 
+        # 3. <label for="id">
         input_id = inp.get("id")
         if input_id:
             label_tag = form.find("label", attrs={"for": str(input_id)})
@@ -453,108 +666,68 @@ class WebCrawler:
                 if txt:
                     return txt
 
-        # 祖先を辿ってラベルらしきテキストを探す(dt/th/label-likeクラスのdiv/span等)
-        for ancestor in inp.parents:
-            if not isinstance(ancestor, Tag) or ancestor is form:
-                break
-
-            # dt/dd, th/td のように「ラベルが直前の兄弟要素」になっているケース
-            # (dtはddの祖先ではなく兄弟なので、ancestor自身の直前の兄弟も確認する)
-            prev_sibling = ancestor.find_previous_sibling(["dt", "th"])
-            if prev_sibling and isinstance(prev_sibling, Tag):
-                txt = prev_sibling.get_text(strip=True)
-                if txt:
-                    return txt
-
-            sibling_label = ancestor.find(
-                ["label", "th", "dt", "legend", "span", "strong", "p"],
-                class_=self._LABEL_LIKE_CLASS_RE,
-            )
-            if sibling_label and isinstance(sibling_label, Tag):
-                txt = sibling_label.get_text(strip=True)
-                if txt:
-                    return txt
-            # class指定が無いケース: dt/th/legendであればそのままテキストを使う
-            plain_label = ancestor.find(["th", "dt", "legend"])
-            if plain_label and isinstance(plain_label, Tag):
-                txt = plain_label.get_text(strip=True)
-                if txt:
-                    return txt
+        # 4. <label>入力欄</label> のように、labelタグ自身に内包されている場合
+        parent_label = inp.find_parent("label")
+        if parent_label and isinstance(parent_label, Tag):
+            txt = parent_label.get_text(strip=True)
+            if txt:
+                return txt
 
         return ""
 
-    def _is_multilang_element(self, item: Tag, menu_text: str) -> bool:
-        """要素が多言語切り替え用メニューであるかを強固に判定する"""
-        # 1. テキスト（メニュー名）による判定の強化
-        menu_text_lower = menu_text.lower()
-        lang_keywords = [
-            "language",
-            "lang",
-            "select language",
-            "global",
-            "multilingual",
-            "日本語",
-            "japanese",
-            "jp",
-            "en",
-            "english",
-            "繁体",
-            "簡体",
-            "chinese",
-            "中文",
-            "한국어",
-            "korean",
-            "tiếng việt",
-            "thai",
-            "español",
-            "français",
-            "deutsch",
-        ]
-        if any(lk in menu_text_lower for lk in lang_keywords):
-            return True
-
-        # 2. リンク先 (href) やクラス名、id に言語切り替えの痕跡がないかチェック
-        #    (li や a 要素そのもの、およびその親要素まで確認)
-        check_targets = [item] + list(item.parents)[:2]
-        for target in check_targets:
-            if not isinstance(target, Tag):
-                continue
-
-            # href 属性の確認 (例: /en/, /zh/, lang=en など)
-            href = str(target.get("href", "")).lower()
-            if any(p in href for p in ["/en/", "/zh/", "/ko/", "lang="]):
-                return True
-
-            # class や id 名の確認 (例: class="lang-select")
-            attr_str = "".join(target.get("class", [])) + str(target.get("id", ""))
-            if any(ck in attr_str.lower() for ck in ["lang", "switch", "globe"]):
-                return True
-
-            # hreflang 属性があれば確実に多言語リンク
-            if target.has_attr("hreflang"):
-                return True
-
-        return False
-
     def _find_form_containers(self, soup: BeautifulSoup) -> list[Tag]:
-        """<form>タグに加え、role="form"やdata-form、divベースの疑似フォームも拾う。"""
-        containers: list[Tag] = list(soup.find_all("form"))
-        containers.extend(soup.find_all(attrs={"role": "form"}))
-        containers.extend(soup.find_all(attrs={"data-form": True}))
+        """<form>タグや疑似フォームを探すが、検索窓（Search）関連は最初から完全に除外する。"""
+        raw_containers: list[Tag] = list(soup.find_all("form"))
+        raw_containers.extend(soup.find_all(attrs={"role": "form"}))
+        raw_containers.extend(soup.find_all(attrs={"data-form": True}))
 
-        if not containers:
-            # <form>タグが存在しない場合のみ、divベースの疑似フォームを探索する
+        if not raw_containers:
             for candidate in soup.find_all("div", class_=self._FORM_LIKE_CLASS_RE):
                 if candidate.find(["input", "textarea", "select"]):
-                    containers.append(candidate)
+                    raw_containers.append(candidate)
 
-        # 重複除去(同一Tagが複数条件にヒットする場合がある)
         seen_ids = set()
         unique_containers = []
-        for c in containers:
-            if id(c) not in seen_ids:
-                seen_ids.add(id(c))
-                unique_containers.append(c)
+
+        # 検索窓キーワード定義（ID、クラス名、アクション、テキストにこれらがあれば除外）
+        SEARCH_KEYWORDS = ["search", "keyword", "検索", "kensaku"]
+
+        for c in raw_containers:
+            if id(c) in seen_ids:
+                continue
+
+            # 1. 各属性のチェック
+            c_id = str(c.get("id", "")).lower()
+            class_attr = c.get("class")
+            c_class = ("".join([str(x) for x in class_attr]) if isinstance(class_attr, list) else str(class_attr or "")).lower()
+            c_action = str(c.get("action", "")).lower()
+            c_name = str(c.get("name", "")).lower()
+
+            if any(k in c_id or k in c_class or k in c_action or k in c_name for k in SEARCH_KEYWORDS):
+                continue
+
+            # 2. フォーム内の入力欄自体が検索用１個だけかどうかのチェック
+            inputs = c.find_all(["input", "textarea", "select"])
+            valid_inputs = []
+            for inp in inputs:
+                t_val = inp.get("type", "text")
+                itype = "".join([str(x) for x in t_val]).lower().strip() if isinstance(t_val, list) else str(t_val).lower().strip()
+                if itype not in ["hidden", "submit", "button", "image", "reset"]:
+                    valid_inputs.append(inp)
+
+            # 入力欄が1つしかなく、その名前やプレースホルダーが検索用の場合は除外
+            if len(valid_inputs) == 1:
+                inp = valid_inputs[0]
+                inp_name = str(inp.get("name", "")).lower()
+                inp_id = str(inp.get("id", "")).lower()
+                inp_placeholder = str(inp.get("placeholder", "")).lower()
+                if any(k in inp_name or k in inp_id or k in inp_placeholder for k in SEARCH_KEYWORDS):
+                    continue
+
+            # 全てのチェックをクリアした本命フォームのみ残す
+            seen_ids.add(id(c))
+            unique_containers.append(c)
+
         return unique_containers
 
     def _extract_form_fields(
@@ -564,115 +737,164 @@ class WebCrawler:
         client: httpx.Client | None = None,
         depth: int = 0,
     ) -> tuple[str, bool]:
-        """フォーム内の入力項目ラベルを抽出する。iframe内フォームは再帰的に解析する。"""
+        """フォーム内の入力項目ラベルを抽出する。"""
+        # URL自体がメルマガ用のページなら、フォーム抽出処理そのものをさせない
+        if "magazine" in base_url.lower():
+            logger.info("URLに 'magazine' が含まれるためフォーム抽出をスキップします: %s", base_url)
+            return "", False
 
         fields: list[str] = []
         has_attachment = False
-        html_lower = html.lower()
-        if "hbspt.forms.create" in html_lower or "hsforms.net" in html_lower:
-            return "外部埋め込みフォーム検出(HubSpot)", False
-
-        if "tayori.com" in html_lower:
-            return "外部埋め込みフォーム検出(Tayori)", False
 
         soup = BeautifulSoup(html, "html.parser")
         containers = self._find_form_containers(soup)
 
-        for form in containers:
-            form_id = str(form.get("id", "")).lower()
-            class_attr = form.get("class")
-            form_class = ("".join([str(c) for c in class_attr]) if isinstance(class_attr, list) else str(class_attr or "")).lower()
-            form_action = str(form.get("action", "")).lower()
+        # logger.debug を使う
+        logger.debug("==================================================")
+        logger.debug("[解析対象URL]: %s", base_url)
+        logger.debug("==================================================")
+        logger.debug("=== [DEBUG] 検索用を除外後、%d 個のフォームコンテナを検出 ===", len(containers))
 
-            if "search" in form_id or "search" in form_class or "search" in form_action:
-                continue
+        for i, form in enumerate(containers, 1):
+            form_id = form.get("id", "No ID")
+            form_class = form.get("class", "No Class")
+            # print から logger.debug（または info）に変更
+            logger.debug("\n--- [検証中の本命フォーム #%d] ID: %s | Class: %s ---", i, form_id, form_class)
 
             inputs = form.find_all(["input", "textarea", "select"])
             valid_inputs = []
             for inp in inputs:
                 if not isinstance(inp, Tag):
                     continue
-                type_attr = inp.get("type", "")
-                itype = ("".join(type_attr) if isinstance(type_attr, list) else str(type_attr)).lower()
+                t_val = inp.get("type", "text")
+                itype = "".join([str(x) for x in t_val]).lower().strip() if isinstance(t_val, list) else str(t_val).lower().strip()
                 if itype in ["hidden", "submit", "button", "image", "reset"]:
                     continue
                 valid_inputs.append(inp)
 
-            if not valid_inputs:
-                continue
+            form_fields: list[str] = []
 
-            # 1. label紐付けロジックの結果を格納
+            # ★ 入力欄ごとにループを回し、テキストを抽出した「後」でログを吐く
             for inp in valid_inputs:
                 if inp.name == "input" and str(inp.get("type", "")).lower() == "file":
                     has_attachment = True
 
-                txt = self._get_label_for_input(inp, form, soup)
-                txt = self._remove_required_marks(txt)
+                resolved_text = ""
 
-                # 25文字未満かつ重複のない有効なテキストであれば追加
-                if txt and len(txt) < 25 and txt not in fields:
-                    fields.append(txt)
+                # 1. 厳格な仕様に基づくラベル（id/for, aria）
+                txt_a = self._get_label_for_input(inp, form, soup)
+                txt_a = self._remove_required_marks(txt_a)
+                if txt_a and len(txt_a) < 50 and any(c for c in txt_a if ord(c) > 0x7F):
+                    resolved_text = txt_a
 
-            # 2. 上記で1つも拾いきれなかった場合のみ、総当たりでバックアップ
-            if not fields:
-                labels = form.find_all(["th", "label", "dt", "td", "legend"])
-                for lbl in labels:
-                    if not isinstance(lbl, Tag):
-                        continue
-                    txt = self._remove_required_marks(lbl.get_text(strip=True))
-                    if txt and len(txt) < 25 and txt not in fields:
-                        fields.append(txt)
+                # 2. 周辺のHTML構造から探索（dl/dt/dd, table/tr/th, 兄弟要素）
+                if not resolved_text:
+                    for parent in inp.parents:
+                        if parent is form or not isinstance(parent, Tag):
+                            break
 
-            # 3. それでもなお拾えない場合、属性値から候補を利用
-            if not fields:
-                for inp in valid_inputs:
+                        # dl/dt/dd 構造
+                        if parent.name == "dd":
+                            prev_dts = parent.find_previous_siblings("dt")
+                            if prev_dts:
+                                resolved_text = self._remove_required_marks(prev_dts[0].get_text(strip=True))
+                                break
+
+                        # table/tr/th 構造
+                        if parent.name == "td":
+                            prev_ths = parent.find_previous_siblings("th")
+                            if prev_ths:
+                                resolved_text = self._remove_required_marks(prev_ths[0].get_text(strip=True))
+                                break
+
+                        # 直前の兄弟要素
+                        siblings = parent.find_previous_siblings(["div", "span", "label", "dt", "th"])
+                        # 1. siblings[0] が存在し、かつ Tag インスタンスであることを確認
+                        if siblings and isinstance(siblings[0], Tag):
+                            # 2. Tag 型であることが保証されたため、安全に .find() が呼べる
+                            if not siblings[0].find(["input", "textarea", "select"]):
+                                t = self._remove_required_marks(siblings[0].get_text(strip=True))
+                                if t and len(t) < 50 and any(c for c in t if ord(c) > 0x7F):
+                                    resolved_text = t
+                                    break
+
+                # 3. 最終フォールバック（属性値）
+                if not resolved_text:
                     for attr in ("placeholder", "aria-label", "title", "name"):
                         val = inp.get(attr)
-                        if not val:
-                            continue
-                        txt = self._remove_required_marks(str(val).strip())
-                        if txt and len(txt) < 25 and txt not in fields:
-                            fields.append(txt)
-                            break  # 1つのインプットに対して1つの属性が取れれば次へ
+                        if val:
+                            t = self._remove_required_marks(str(val).strip())
+                            if t and len(t) < 50:
+                                resolved_text = t
+                                break
 
-        # iframe内フォームの再帰解析
-        if client is not None and depth < self.max_iframe_depth:
-            for iframe in soup.find_all("iframe"):
-                src = iframe.get("src")
-                if not src:
-                    continue
-                abs_src = urljoin(base_url, str(src))
-                if not abs_src.startswith(("http://", "https://")):
-                    continue
-                try:
-                    resp = client.get(abs_src, timeout=self.page_timeout)
-                    resp.raise_for_status()
-                except Exception:
-                    continue
-                iframe_html = self._decode_response(resp)
-                iframe_fields, iframe_has_attachment = self._extract_form_fields(iframe_html, abs_src, client, depth + 1)
+                # ここなら resolved_text の抽出が終わっているので安全に出力できます
+                logger.debug("    入力欄 [name=%s] -> 抽出結果: '%s'", inp.get("name"), resolved_text)
 
-                has_attachment |= iframe_has_attachment
+                if resolved_text and not any(k in resolved_text for k in ["送信", "リセット", "確認"]):
+                    if resolved_text not in form_fields:
+                        form_fields.append(resolved_text)
 
-                if iframe_fields:
-                    for line in iframe_fields.split("\n"):
-                        if line and line not in fields:
-                            fields.append(line)
+            logger.debug("  => フォーム #%d から抽出された項目: %s", i, form_fields)
+
+            for f in form_fields:
+                if f not in fields:
+                    fields.append(f)
 
         return "\n".join(fields), has_attachment
+
+    # ネットワーク機器(社内プロキシ・ファイアウォール等のSSLインスペクション機能)が
+    # 実際のサイトの代わりに返してくる警告/ブロックページの検知用シグネチャ。
+    # (キーワードリスト, 該当時にM列へ出力する理由文) のタプルで管理する。
+    _NETWORK_BLOCK_SIGNATURES: list[tuple[list[str], str]] = [
+        (
+            ["fortinet webfilter"],
+            "Fortinet Webfilter（ネットワーク側のセキュリティ機器）によりアクセスがブロックされたため、"
+            "実際のサイト内容を取得できませんでした。別ネットワークからの再調査、または手動確認をお願いします。",
+        ),
+        (
+            ["this connection is invalid", "ssl certificate"],
+            "SSL証明書エラー（期限切れ等）によりセキュリティ機器がアクセスをブロックしたため、"
+            "実際のサイト内容を取得できませんでした。別ネットワークからの再調査、または手動確認をお願いします。",
+        ),
+    ]
+
+    def _detect_network_block_page(self, html: str) -> str:
+        """取得したHTMLが、実際のサイトではなくFortinet等のネットワークセキュリティ機器が
+        返す警告/ブロックページである可能性を検知する。
+
+        該当する場合は、M列（不可の理由）にそのまま出力できる具体的な理由文字列を返す。
+        該当しない場合は空文字を返す。SSL証明書切れ等が原因でこの警告ページが返された場合、
+        中身を見ずに「クロールできたページ数が極端に少ない」等の別の一般的な理由で
+        要確認扱いになってしまい、原因が分かりにくくなることを防ぐのが目的。
+        """
+        if not html:
+            return ""
+
+        html_lower = html.lower()
+        for keywords, reason in self._NETWORK_BLOCK_SIGNATURES:
+            if all(k in html_lower for k in keywords):
+                return reason
+
+        return ""
 
     # ------------------------------------------------------------------
     # メインクロール処理
     # ------------------------------------------------------------------
 
     @measure_time
-    def crawl_and_analyze(self, start_url: str) -> tuple[int | str, int | str, str, str, str, str, str, bool, bool, bool]:
+    def crawl_and_analyze(self, start_url: str) -> tuple[int | str, int | str, str, str, str, str, str, bool, bool, bool, bool, str]:
         """ウェブサイトを巡回し、100ページに達した時点で打ち切る。
 
-        戻り値(10要素のtuple):
+        戻り値(12要素のtuple):
         (total_pages, max_depth, contact_fields, site_structure,
          description, combined_html_src, cms_name, has_attachment,
-         has_login, has_basic_auth)
+         has_login, has_basic_auth, has_multilang, blocked_reason)
+
+        blocked_reasonは、Fortinet等のネットワーク機器によるSSL証明書エラー/アクセスブロック
+        画面を取得してしまった場合にのみ非空文字列となる。この場合、total_pages等の他の値は
+        実サイトの内容を反映していないため、呼び出し側では判定ロジックを通さず
+        blocked_reasonをそのままM列（不可の理由）に採用することを推奨する。
         """
         if not start_url.startswith(("http://", "https://")):
             primary_url = f"https://{start_url}"
@@ -694,6 +916,8 @@ class WebCrawler:
         has_attachment = False
         has_login = False
         has_basic_auth = False
+        has_multilang = False
+        blocked_reason = ""  # Fortinet等のネットワーク機器によるブロックページを検知した場合の理由文
         global_nav_menus: list[str] = []
         site_purpose = ""
         cms_name = ""
@@ -750,9 +974,9 @@ class WebCrawler:
                             queue.append((str(response.url), 0))
                             queued_urls.add(str(response.url))
                         except Exception:
-                            return (0, 0, "", "", "", "", "", False, False, has_basic_auth)
+                            return (0, 0, "", "", "", "", "", False, False, has_basic_auth, False, "")
                     else:
-                        return (0, 0, "", "", "", "", "", False, False, has_basic_auth)
+                        return (0, 0, "", "", "", "", "", False, False, has_basic_auth, False, "")
 
                 previous_url = ""
 
@@ -799,6 +1023,15 @@ class WebCrawler:
 
                         previous_url = current_url
 
+                        # 最初の1ページ目のみ、実際のサイトではなくFortinet等のネットワーク機器による
+                        # ブロック/警告ページを取得していないか確認する。該当する場合、これ以上巡回を
+                        # 続けても同じ警告ページを取得し続けるだけで無意味なため、直ちに打ち切る。
+                        if len(visited) == 1:
+                            blocked_reason = self._detect_network_block_page(current_html)
+                            if blocked_reason:
+                                combined_html_src += "\n" + current_html
+                                break
+
                         # 全ページのソースを蓄積（GSAPや多言語、Lightbox検知用）
                         combined_html_src += "\n" + current_html
 
@@ -823,6 +1056,13 @@ class WebCrawler:
                         detected = self._detect_cms(current_html)
                         if detected and not cms_name:
                             cms_name = detected
+
+                        # 多言語切り替えウィジェットの検知(グローバルナビの外、ヘッダー上部の
+                        # 独立ウィジェット等も含めてページ全体から判定する。一度検知できれば
+                        # それ以降のページでは再チェック不要)
+                        if not has_multilang and self._detect_multilang_switcher(soup):
+                            has_multilang = True
+                            logger.info("多言語切り替えウィジェットを検知しました: %s", current_url)
 
                         # 初回（トップ）ページのみナビゲーションと目的を取得
                         if len(visited) == 1:
@@ -906,6 +1146,12 @@ class WebCrawler:
         except Exception as e:
             logger.warning("クローラー内で予期せぬエラーが発生しました: %s", e)
 
+        # Fortinet等のブロックページを検知していた場合、他の項目は実サイトの内容を反映しておらず
+        # 判定に使うと誤った結果になるため、通常の整形・判定を経由せずここで打ち切って返す。
+        if blocked_reason:
+            logger.warning("ネットワーク機器によるブロックページを検知したため巡回を打ち切りました: %s", start_url)
+            return (0, 0, "", "", "", combined_html_src, "", False, False, has_basic_auth, False, blocked_reason)
+
         # 出力データの整形
         site_structure = "\n".join(global_nav_menus[:10])
         final_page_count = "100ページ以上" if is_over_100 or len(visited) >= 100 else len(visited)
@@ -925,4 +1171,6 @@ class WebCrawler:
             has_attachment,
             has_login,
             has_basic_auth,
+            has_multilang,
+            blocked_reason,
         )

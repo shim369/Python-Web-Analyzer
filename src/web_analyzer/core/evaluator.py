@@ -14,8 +14,6 @@ class RenewalEvaluator:
     TAB_KEYWORDS = ["tab-content", "nav-tabs"]
     MODAL_KEYWORDS = ["modal-window", "modal-dialog"]
 
-    PDF_LINK_THRESHOLD = 5  # この件数以上PDFリンクがあれば「資料が多い」と判定
-
     def decide(
         self,
         total_pages: int | str,
@@ -23,6 +21,7 @@ class RenewalEvaluator:
         has_login: bool,
         has_attachment: bool,
         has_basic_auth: bool = False,
+        has_multilang: bool = False,
         html_src: str = "",
         page_threshold: int = 10,
     ) -> tuple[str, str]:
@@ -36,7 +35,7 @@ class RenewalEvaluator:
             return "要確認", "接続不可またはアクセス拒否のため、判定を保留しました。"
 
         if isinstance(total_pages, int) and 1 <= total_pages <= 2:
-            return "要確認", f"クロールできたページ数が極端に少ないため判定を保留しました (取得数: {total_pages}ページ)。"
+            return "要確認", "クロールできたページ数が極端に少ないため判定を保留しました。"
 
         if max_depth == "要確認":
             return "要確認", "サイト階層が深すぎるため、別途サイトエクスプローラー等での確認をお願いします。"
@@ -52,6 +51,7 @@ class RenewalEvaluator:
             has_login=has_login,
             has_attachment=has_attachment,
             has_basic_auth=has_basic_auth,
+            has_multilang=has_multilang,
             html_src=html_src,
             page_threshold=page_threshold,
         )
@@ -63,6 +63,7 @@ class RenewalEvaluator:
         has_login: bool,
         has_attachment: bool,
         has_basic_auth: bool = False,
+        has_multilang: bool = False,
         html_src: str = "",
         page_threshold: int = 10,
     ) -> tuple[str, str]:
@@ -77,7 +78,7 @@ class RenewalEvaluator:
 
         # --- ページ数・階層構成 ---
         if total_pages > page_threshold:
-            reasons.append(f"ページ数が多いため ({total_pages}ページ)")
+            reasons.append("ページ数が多いため")
 
         if max_depth > 2:
             reasons.append("サイト構成が3階層以上のため")
@@ -91,6 +92,9 @@ class RenewalEvaluator:
 
         if has_basic_auth:
             reasons.append("ベーシック認証がかかっているページがあるため")
+
+        if has_multilang:
+            reasons.append("多言語対応（言語切り替え機能）があるため")
 
         if not html_lower:
             if reasons:
@@ -114,9 +118,6 @@ class RenewalEvaluator:
         if any(k in html_lower for k in self.CHATBOT_KEYWORDS):
             reasons.append("チャットボットが導入されているため")
 
-        if html_lower.count(".pdf") >= self.PDF_LINK_THRESHOLD:
-            reasons.append("PDF資料・ダウンロードデータが多いため")
-
         # --- デザイン・ギミック面 ---
         if any(k in html_lower for k in self.VIDEO_KEYWORDS):
             reasons.append("トップイメージ等に動画が使用されているため")
@@ -137,7 +138,7 @@ class RenewalEvaluator:
         if any(k in html_lower for k in self.RICH_UI_KEYWORDS):
             reasons.append("ギャラリーコンテンツ（Lightbox等）が導入されているため")
 
-        if any(k in html_lower for k in self.MULTILANG_KEYWORDS):
+        if not has_multilang and any(k in html_lower for k in self.MULTILANG_KEYWORDS):
             reasons.append("多言語対応（言語切り替え機能）があるため")
 
         if any(k in html_lower for k in self.SCROLL_ANIMATION_KEYWORDS):

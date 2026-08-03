@@ -81,6 +81,8 @@ class SiteScraperService:
                 has_attachment_raw: bool = False
                 has_login_raw: bool = False
                 has_basic_auth_raw: bool = False
+                has_multilang_raw: bool = False
+                blocked_reason_raw: str = ""
 
                 # 1. SSL判定の実行
                 try:
@@ -112,6 +114,8 @@ class SiteScraperService:
                         has_attachment_raw,
                         has_login_raw,
                         has_basic_auth_raw,
+                        has_multilang_raw,
+                        blocked_reason_raw,
                     ) = crawler.crawl_and_analyze(item.domain_name)
                 except Exception as e:
                     logger.warning(f"[{item.domain_name}] クロール中に予期せぬエラーが発生しました: {e}")
@@ -119,6 +123,8 @@ class SiteScraperService:
                 has_attachment = bool(has_attachment_raw)
                 has_login = bool(has_login_raw)
                 has_basic_auth = bool(has_basic_auth_raw)
+                has_multilang = bool(has_multilang_raw)
+                blocked_reason = str(blocked_reason_raw or "")
 
                 # 文字列判定と数値へのクリーンアップ処理
                 if total_pages_fetched == "100ページ以上":
@@ -128,15 +134,22 @@ class SiteScraperService:
                     total_pages_int = int(total_pages_fetched)
                     total_pages_display = total_pages_int
 
-                eval_result, rejection_reason = evaluator.decide(
-                    total_pages=total_pages_int,
-                    max_depth=max_depth,
-                    has_login=has_login,
-                    has_attachment=has_attachment,
-                    has_basic_auth=has_basic_auth,
-                    html_src=html_src,
-                    page_threshold=job.page_threshold,
-                )
+                if blocked_reason:
+                    # Fortinet等のネットワーク機器によるSSL証明書エラー/ブロックページを取得した場合、
+                    # 他の項目は実サイトの内容を反映していないため、通常の判定ロジックを通さず
+                    # 「要確認」+ 具体的な理由をそのままM列に出力する。
+                    eval_result, rejection_reason = "要確認", blocked_reason
+                else:
+                    eval_result, rejection_reason = evaluator.decide(
+                        total_pages=total_pages_int,
+                        max_depth=max_depth,
+                        has_login=has_login,
+                        has_attachment=has_attachment,
+                        has_basic_auth=has_basic_auth,
+                        has_multilang=has_multilang,
+                        html_src=html_src,
+                        page_threshold=job.page_threshold,
+                    )
 
                 # スレッドセーフに結果を書き込み
                 with self._lock:
