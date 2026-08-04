@@ -452,7 +452,7 @@ class WebCrawler:
                 # 少し待って数回リトライする。
                 html = ""
                 last_error: Exception | None = None
-                for attempt in range(3):
+                for _attempt in range(3):
                     try:
                         html = page.content()
                         last_error = None
@@ -1394,20 +1394,17 @@ class WebCrawler:
                             if not target_area:
                                 header_el = soup.find("header") or soup.find("div", id=re.compile(r"header|lh", re.I))
                                 if isinstance(header_el, Tag):
-                                    target_area = (
-                                        header_el.find(
-                                            ["ul", "nav"],
-                                            class_=re.compile(r"nav|menu|gnav", re.I),
-                                        )
-                                        or header_el.find("nav")
-                                        or header_el
-                                    )
+                                    candidate_nav = header_el.find(
+                                        ["ul", "nav"],
+                                        class_=re.compile(r"nav|menu|gnav", re.I),
+                                    ) or header_el.find("nav")
+                                    target_area = candidate_nav if isinstance(candidate_nav, Tag) else header_el
 
                             if target_area:
                                 target_links: list[Tag] = []
 
                                 if target_area.name == "ul":
-                                    main_ul = target_area
+                                    main_ul: Tag | None = target_area
                                 else:
                                     main_ul = cast(
                                         Tag | None,
