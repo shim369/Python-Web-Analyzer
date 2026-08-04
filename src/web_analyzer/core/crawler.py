@@ -2,16 +2,40 @@ import logging
 import posixpath
 import re
 import time
+import warnings
 from collections import deque
+from typing import cast
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, Tag, XMLParsedAsHTMLWarning
 
 from web_analyzer.models import LOGIN_KEYWORDS
 from web_analyzer.utils.decorators import measure_time
 
 logger = logging.getLogger(__name__)
+
+# フィード(RSS/Atom)やsitemap.xml等、拡張子フィルタをすり抜けてしまったXMLリソースを
+# 誤ってHTMLとしてパースしてしまうケースに備えた保険。実害はないため警告自体は抑制する。
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+
+# HTML解析に使うパーサー。
+# 標準の "html.parser" は寛容すぎて、<li>タグが閉じられていない(</li>が無い)ような
+# 実在の(特に古い/レガシーな)サイトでよくある崩れたHTMLに対し、後続の要素を
+# 誤って「入れ子の子要素」として解釈してしまうことがある。その結果、
+# グローバルナビ内の複数のメニュー項目のテキストが1つの巨大な文字列に
+# 連結されてしまい、「構成」列が読めない内容になる原因となる。
+# "lxml" はHTML5相当のタグ自動補完(暗黙のクローズ処理)を行うため、この種の
+# 崩れたHTMLでも実ブラウザに近い、正しい兄弟要素構造として解釈できる。
+# 万が一 lxml がインストールされていない環境でも動作は継続できるよう、
+# その場合は従来の "html.parser" にフォールバックする。
+try:
+    import lxml  # noqa: F401
+
+    HTML_PARSER = "lxml"
+except ImportError:
+    logger.warning("lxmlが見つからないため、HTML解析精度の低いhtml.parserにフォールバックします。")
+    HTML_PARSER = "html.parser"
 
 
 class WebCrawler:
@@ -183,6 +207,14 @@ class WebCrawler:
         ):
             return False
 
+        # RSS/Atomフィード等のXMLリソースはHTMLページではなく、通常のサイト構成・調査結果としては
+        # 意味を持たない(かつlxmlでHTMLとしてパースするとXMLParsedAsHTMLWarningが出る)ため対象外とする
+        path_lower = parsed_abs.path.lower()
+        if path_lower.endswith((".xml", ".rss", ".atom")) or path_lower.rstrip("/").endswith("/feed"):
+            return False
+        if re.search(r"[?&]feed=", abs_url.lower()):
+            return False
+
         return abs_domain == base_domain
 
     def _detect_cms(self, html: str) -> str:
@@ -295,7 +327,7 @@ class WebCrawler:
         if not html:
             return ""
 
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html, HTML_PARSER)
 
         desc_tag = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
         if desc_tag and isinstance(desc_tag, Tag):
@@ -393,25 +425,52 @@ class WebCrawler:
             except Exception:
                 return response.content.decode("utf-8", errors="replace")
 
-    def _fetch_rendered_html(self, url: str) -> str:
-        """Playwrightが利用可能ならレンダリング後のHTMLを取得する。未導入時は空文字を返す。"""
+    def _fetch_rendered_html(self, url: str) -> tuple[str, str]:
+        """Playwrightが利用可能ならレンダリング後のHTMLと最終URLを取得する。
+
+        未導入時/失敗時は ("", "") を返す。
+        """
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
             logger.warning("Playwright未インストールのためJSレンダリングをスキップします: %s", url)
-            return ""
+            return "", ""
 
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch()
                 page = browser.new_page(user_agent=self.headers["User-Agent"])
-                page.goto(url, timeout=self.page_timeout * 1000)
-                html = page.content()
+                # httpx用のpage_timeoutをそのまま流用すると短すぎる/ネットワーク未落ち着き
+                # のままcontent()を呼んでレース状態になりやすいため、レンダリング用には
+                # 長めのタイムアウトを別途確保し、networkidleまで待つ。
+                render_timeout_ms = max(self.page_timeout, 15.0) * 1000
+                page.goto(url, timeout=render_timeout_ms, wait_until="networkidle")
+
+                # goto完了直後でもクライアント側リダイレクト等でページが再ナビゲーション中の
+                # ことがあり、その瞬間にcontent()を呼ぶと
+                # "Unable to retrieve content because the page is navigating" で失敗するため、
+                # 少し待って数回リトライする。
+                html = ""
+                last_error: Exception | None = None
+                for attempt in range(3):
+                    try:
+                        html = page.content()
+                        last_error = None
+                        break
+                    except Exception as retry_error:
+                        last_error = retry_error
+                        page.wait_for_timeout(500)
+
+                final_url = page.url
                 browser.close()
-                return html
+
+                if last_error is not None:
+                    raise last_error
+
+                return html, final_url
         except Exception as e:
             logger.warning("Playwrightによる取得に失敗しました(%s): %s", url, e)
-            return ""
+            return "", ""
 
     # ------------------------------------------------------------------
     # JS遷移リンクの検知
@@ -438,12 +497,14 @@ class WebCrawler:
             "multilingual",
             "言語",
             "多言語",
-            # 日本語・英語
-            "日本語",
+            "Japanese",
             "japanese",
+            "japan",
             "jp",
             "ja",
+            "English",
             "english",
+            "eng",
             "en",
             # 中国語（繁体・簡体・各種表記）
             "繁体",
@@ -517,11 +578,18 @@ class WebCrawler:
 
         for img in img_tags:
             alt_text = img.get("alt", "").strip().lower()
-            if any(lk == alt_text or lk in alt_text for lk in lang_keywords):
+            if alt_text in short_latin_codes or any(lk in alt_text for lk in long_keywords):
                 return True
 
-            src_text = img.get("src", "").lower()
-            if any(lk in src_text for lk in lang_keywords):
+            # src全体(ドメイン名込みのURL)に対する部分一致だと、日本の.co.jpドメインのように
+            # 短いコード("jp"等)がドメイン名に必ず含まれてしまうサイトで、ロゴ画像等の
+            # 無関係な画像まで軒並み「多言語」と誤判定してしまう。
+            # (例: https://example.co.jp/img/logo.svg は "jp" を含むだけで誤検知していた)
+            # そのため、判定対象はファイル名部分のみに限定する。
+            src = str(img.get("src", "")).lower()
+            src_filename = src.rsplit("/", 1)[-1].split("?")[0]
+            src_stem = re.sub(r"\.[a-z0-9]+$", "", src_filename)
+            if src_stem in short_latin_codes or any(lk in src_stem for lk in long_keywords):
                 return True
 
         # --- C. リンクのURL（href属性）による判定 【超強化】 ---
@@ -557,15 +625,8 @@ class WebCrawler:
         return False
 
     def _detect_multilang_switcher(self, soup: BeautifulSoup) -> bool:
-        """多言語切り替え機能の有無を、ページ全体から検知する。
-
-        従来は「グローバルナビの中にある項目」だけを対象に _is_multilang_element()
-        を呼んでいたが、実際には多言語切り替えリンクはグローバルナビの中には無く、
-        ヘッダー上部などに独立したウィジェット（例: <div class="lang-switch">JP / EN</div>）
-        として置かれているサイトが多い。そのため、nav要素の中身に限定せず、
-        ページ全体を対象に以下の複数の手がかりで判定する。
-        """
-        # 1. hreflang属性は最も確実なシグナル(サイト内のどこにあっても多言語対応とみなせる)
+        """多言語切り替え機能の有無を、ページ全体から検知する。"""
+        # 1. hreflang属性は最も確実なシグナル
         if soup.find(attrs={"hreflang": True}):
             return True
 
@@ -573,32 +634,31 @@ class WebCrawler:
         if soup.find(id="google_translate_element") or soup.find(class_=re.compile(r"goog-te", re.I)):
             return True
 
-        # 3. class/id が言語切り替えらしいコンテナを、nav/header/独立divを問わずページ全体から探索
+        # 3. class/id が言語切り替えらしいコンテナをページ全体から探索
         candidate_containers: list[Tag] = []
         candidate_containers.extend(soup.find_all(["div", "ul", "nav", "li", "span"], class_=self._MULTILANG_CONTAINER_RE))
         candidate_containers.extend(soup.find_all(["div", "ul", "nav", "li", "span"], id=self._MULTILANG_CONTAINER_RE))
 
         for container in candidate_containers:
-            # 1. 最初から通常の list に変換し、明示的に型を list[Tag] (または list[Any]) にする
             links: list[Tag] = list(container.find_all("a"))
             if container.name == "a":
                 links = [container] + links
 
             for link in links:
-                # 2. link が確実に Tag オブジェクト（get_textを持つ）であることを確認
                 if not hasattr(link, "get_text"):
                     continue
-
                 text = self._clean_menu_text(link.get_text(strip=True))
                 if self._is_multilang_element(link, text):
                     return True
 
-        # 4. ヘッダー領域限定で、言語コードらしきリンクが複数並んでいないかを最終チェック
-        #    (「lang」等のクラス名を持たない、素の <ul><li><a>JP</a></li><li><a>EN</a></li></ul> 形式の
-        #    ヘッダー内独立ウィジェットを拾うためのフォールバック)
-        #    セマンティックな <header> タグを使っていない古い作りのサイトも多いため、
-        #    class/id に "header" 等を含む div/section もヘッダー相当とみなして対象に含める。
+        # 4. ヘッダー領域の探索（フォールバック）
         header_candidates: list[Tag] = [h for h in soup.find_all("header") if isinstance(h, Tag)]
+
+        # 【重要】 id="header" や class="header" を持つ div も確実に対象に含める
+        header_candidates.extend(soup.find_all("div", id=re.compile(r"^header$", re.I)))
+        header_candidates.extend(soup.find_all("div", class_=re.compile(r"^header$", re.I)))
+
+        # 既存の正規表現による候補も追加
         header_candidates.extend(soup.find_all(["div", "section"], id=self._HEADER_LIKE_RE))
         header_candidates.extend(soup.find_all(["div", "section"], class_=self._HEADER_LIKE_RE))
 
@@ -610,18 +670,31 @@ class WebCrawler:
 
             lang_link_count = 0
             for link in header.find_all("a", href=True):
+                if not hasattr(link, "get_text"):
+                    continue
                 text = self._clean_menu_text(link.get_text(strip=True))
+
                 if self._is_multilang_element(link, text):
                     lang_link_count += 1
+
+                    # 決定的なキーワードがあれば1つでも即座にTrue
+                    text_lower = text.lower()
+                    strong_keywords = {"language", "lang", "select language", "global", "multilingual", "言語", "多言語"}
+                    if any(sk in text_lower for sk in strong_keywords):
+                        return True
+
+            # このHTMLのように「English」「Japanese」などの言語リンクがヘッダー内に2つ以上あれば検知
             if lang_link_count >= 2:
                 return True
 
-        # 5. <select>による言語切り替えドロップダウン(JSフレームワーク非依存の素朴な実装で多用される)
+        # 5. <select>による言語切り替えドロップダウン
         for select in soup.find_all("select"):
             if not isinstance(select, Tag):
                 continue
             lang_option_count = 0
             for option in select.find_all("option"):
+                if not hasattr(option, "get_text"):
+                    continue
                 text = self._clean_menu_text(option.get_text(strip=True))
                 if self._is_multilang_element(option, text):
                     lang_option_count += 1
@@ -746,7 +819,7 @@ class WebCrawler:
         fields: list[str] = []
         has_attachment = False
 
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html, HTML_PARSER)
         containers = self._find_form_containers(soup)
 
         # logger.debug を使う
@@ -859,6 +932,96 @@ class WebCrawler:
         ),
     ]
 
+    def _detect_delayed_cross_domain_redirect(self, html: str, current_url: str, base_domain_clean: str) -> str:
+        """meta refreshやJavaScriptのsetTimeoutによる「数秒後に自動的に別ドメインへ
+        リダイレクトする」形式の移転案内ページを検知する。
+
+        静的HTML取得(httpx)だけではmeta refreshやJavaScriptによる遷移は実行されず、
+        このページの内容がそのまま(トップページとして)解析されてしまう。しかし実際には
+        既に別ドメインへ移転済みであることが多いため、その場合はリダイレクト先の絶対URLを
+        返し、呼び出し側で「調査結果:×」「不可の理由:すでにリニューアル済のため」
+        「備考:移転先URL」として扱えるようにする。
+
+        検知できない場合や、リダイレクト先が同一ドメイン内(https化・パス変更等)の
+        場合は空文字を返す。
+        """
+        if not html:
+            return ""
+
+        target_url = ""
+
+        # 1. <meta http-equiv="refresh" content="5;url=https://...">形式
+        meta_match = re.search(
+            r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]*content=["\']?[^"\'>]*url=([^"\'>\s]+)',
+            html,
+            re.I,
+        )
+        if meta_match:
+            target_url = meta_match.group(1).strip().rstrip("'\"")
+
+        # 2. JavaScriptのsetTimeoutによるlocation遷移
+        #    例: setTimeout(function(){ location.href = "https://..."; }, 5000);
+        if not target_url:
+            js_match = re.search(
+                r"setTimeout\s*\([^;]*?(?:location(?:\.href)?|window\.location(?:\.href)?)\s*"
+                r"(?:=|\.replace\(|\.assign\()\s*[\"']([^\"']+)[\"']",
+                html,
+                re.I | re.S,
+            )
+            if js_match:
+                target_url = js_match.group(1).strip()
+
+        if not target_url:
+            return ""
+
+        # 相対URLの場合は絶対URLに変換したうえで、ドメインが実際に異なる場合のみ「移転」とみなす
+        # (同一ドメイン内でのhttps化・パス変更等は対象外)
+        absolute_target = urljoin(current_url, target_url)
+        target_domain_clean = self._get_clean_domain(absolute_target)
+
+        if target_domain_clean and target_domain_clean != base_domain_clean:
+            return absolute_target
+
+        return ""
+
+    def _classify_connection_error(self, error: Exception | None) -> str:
+        """初回接続そのものが例外で失敗した場合に、その原因がSSL証明書関連かどうかを分類する。
+
+        Fortinet等のネットワーク機器がSSLインスペクションでコネクションを遮断する場合、
+        ブラウザでは「この接続ではプライバシーが保護されません」という警告画面が先に出て、
+        ユーザーが「詳細を表示」→「サイトに移動」と手動操作して初めてFortinetの警告ページの
+        HTMLが見られる、という2段階になっていることがある。この場合、httpx(verify=False)側は
+        ブラウザのような「詳細を表示」操作を模倣できないわけではないが、証明書の形式自体が
+        壊れている等の理由でTLSハンドシェイクの時点で例外が飛び、HTML本文を一切受け取れない
+        ことがある。その場合 _detect_network_block_page() ではHTML本文を見られないため検知
+        できないので、代わりに例外メッセージそのものから証明書関連のエラーらしさを判定する。
+        該当すればM列にそのまま出力できる理由文を返し、無関係な接続エラー
+        (タイムアウト・DNS失敗等)の場合は空文字を返して従来の汎用メッセージに委ねる。
+        """
+        if error is None:
+            return ""
+
+        err_text = str(error).lower()
+        ssl_error_keywords = [
+            "certificate",
+            "ssl",
+            "self signed certificate",
+            "self-signed certificate",
+            "certificate_verify_failed",
+            "certificate has expired",
+            "certificate verify failed",
+            "unable to get local issuer certificate",
+            "handshake failure",
+            "tlsv1_alert",
+        ]
+        if any(k in err_text for k in ssl_error_keywords):
+            return (
+                "SSL証明書関連のエラー（期限切れ・不正な証明書等）により接続できませんでした。"
+                "Fortinet等のネットワーク機器によるSSLインスペクション/ブロックの可能性もあるため、"
+                "別ネットワークからの再調査、または手動確認をお願いします。"
+            )
+        return ""
+
     def _detect_network_block_page(self, html: str) -> str:
         """取得したHTMLが、実際のサイトではなくFortinet等のネットワークセキュリティ機器が
         返す警告/ブロックページである可能性を検知する。
@@ -883,18 +1046,27 @@ class WebCrawler:
     # ------------------------------------------------------------------
 
     @measure_time
-    def crawl_and_analyze(self, start_url: str) -> tuple[int | str, int | str, str, str, str, str, str, bool, bool, bool, bool, str]:
+    def crawl_and_analyze(
+        self, start_url: str
+    ) -> tuple[
+        int | str,
+        int | str,
+        str,
+        str,
+        str,
+        str,
+        str,
+        bool,
+        bool,
+        bool,
+        bool,
+        str,
+        str,
+    ]:
         """ウェブサイトを巡回し、100ページに達した時点で打ち切る。
 
-        戻り値(12要素のtuple):
-        (total_pages, max_depth, contact_fields, site_structure,
-         description, combined_html_src, cms_name, has_attachment,
-         has_login, has_basic_auth, has_multilang, blocked_reason)
-
-        blocked_reasonは、Fortinet等のネットワーク機器によるSSL証明書エラー/アクセスブロック
-        画面を取得してしまった場合にのみ非空文字列となる。この場合、total_pages等の他の値は
-        実サイトの内容を反映していないため、呼び出し側では判定ロジックを通さず
-        blocked_reasonをそのままM列（不可の理由）に採用することを推奨する。
+        戻り値の最後の要素 redirect_target_url は、meta refresh/JSタイマーによる
+        別ドメインへの自動リダイレクト(移転案内ページ)を検知した場合のみ非空文字列となる。
         """
         if not start_url.startswith(("http://", "https://")):
             primary_url = f"https://{start_url}"
@@ -907,7 +1079,7 @@ class WebCrawler:
         start_time = time.time()
 
         visited: set[str] = set()
-        queued_urls: set[str] = set()  # dequeの線形走査を避けるための重複チェック用
+        queued_urls: set[str] = set()
         queue: deque[tuple[str, int]] = deque()
         is_over_100 = False
 
@@ -917,11 +1089,12 @@ class WebCrawler:
         has_login = False
         has_basic_auth = False
         has_multilang = False
-        blocked_reason = ""  # Fortinet等のネットワーク機器によるブロックページを検知した場合の理由文
+        blocked_reason = ""
+        redirect_target_url = ""  # 移転案内ページ(別ドメインへの自動リダイレクト)を検知した場合のリダイレクト先
         global_nav_menus: list[str] = []
         site_purpose = ""
         cms_name = ""
-        combined_html_src = ""  # 判定用に全ページのHTMLを蓄積する
+        combined_html_src = ""
 
         def normalize_url(url: str) -> str:
             parsed = urlparse(url)
@@ -951,6 +1124,9 @@ class WebCrawler:
             ) as client:
                 first_url = ""
                 first_html = ""
+                first_html_from_playwright = False
+                primary_error: Exception | None = None
+                fallback_error: Exception | None = None
 
                 try:
                     response = client.get(primary_url)
@@ -959,24 +1135,49 @@ class WebCrawler:
                     response.raise_for_status()
                     first_url = str(response.url)
                     first_html = self._decode_response(response)
-                    queue.append((str(response.url), 0))
-                    queued_urls.add(str(response.url))
-                except Exception:
+                except Exception as e:
+                    primary_error = e
                     if fallback_url:
                         try:
                             response = client.get(fallback_url)
                             if response.status_code == 401:
                                 has_basic_auth = True
-                            response = client.get(fallback_url)
                             response.raise_for_status()
                             first_url = str(response.url)
                             first_html = self._decode_response(response)
-                            queue.append((str(response.url), 0))
-                            queued_urls.add(str(response.url))
-                        except Exception:
-                            return (0, 0, "", "", "", "", "", False, False, has_basic_auth, False, "")
-                    else:
-                        return (0, 0, "", "", "", "", "", False, False, has_basic_auth, False, "")
+                        except Exception as e2:
+                            fallback_error = e2
+
+                if not first_url and self.render_js:
+                    # httpxでの初回取得が両方(https/http)とも失敗した場合、WAF/ボット対策等で
+                    # httpxクライアントのみブロックされている可能性があるため、
+                    # 最後の手段として実ブラウザ(Playwright)での取得を試みる。
+                    rendered_html, rendered_url = self._fetch_rendered_html(primary_url)
+                    if rendered_html:
+                        first_url = rendered_url or primary_url
+                        first_html = rendered_html
+                        first_html_from_playwright = True
+
+                if not first_url:
+                    conn_block_reason = self._classify_connection_error(primary_error) or self._classify_connection_error(fallback_error)
+                    return (
+                        0,
+                        0,
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        False,
+                        False,
+                        has_basic_auth,
+                        False,
+                        conn_block_reason,
+                        "",
+                    )
+
+                queue.append((first_url, 0))
+                queued_urls.add(first_url)
 
                 previous_url = ""
 
@@ -1015,93 +1216,263 @@ class WebCrawler:
                                 continue
                             current_html = self._decode_response(response)
 
-                        # render_js指定時、初回ページのみPlaywrightでの再取得を試みる
-                        if self.render_js and len(visited) == 1:
-                            rendered = self._fetch_rendered_html(current_url)
+                        if self.render_js and len(visited) == 1 and not first_html_from_playwright:
+                            rendered, _rendered_url = self._fetch_rendered_html(current_url)
                             if rendered:
                                 current_html = rendered
 
                         previous_url = current_url
+                        soup = BeautifulSoup(current_html, HTML_PARSER)
+                        combined_html_src += f"\n{current_html}"
 
-                        # 最初の1ページ目のみ、実際のサイトではなくFortinet等のネットワーク機器による
-                        # ブロック/警告ページを取得していないか確認する。該当する場合、これ以上巡回を
-                        # 続けても同じ警告ページを取得し続けるだけで無意味なため、直ちに打ち切る。
-                        if len(visited) == 1:
-                            blocked_reason = self._detect_network_block_page(current_html)
-                            if blocked_reason:
-                                combined_html_src += "\n" + current_html
-                                break
+                        if depth > max_depth:
+                            max_depth = depth
 
-                        # 全ページのソースを蓄積（GSAPや多言語、Lightbox検知用）
-                        combined_html_src += "\n" + current_html
-
-                        soup = BeautifulSoup(current_html, "html.parser")
-
-                        # ログイン機能チェック (URLやテキストから判定)
-                        url_lower = current_url.lower()
-                        if any(k in url_lower for k in self.LOGIN_KEYWORDS):
-                            has_login = True
-                        login_el = soup.find(["a", "button"], string=re.compile(r"ログイン|サインin|myページ", re.I))
-                        if login_el:
-                            has_login = True
-
-                        # 階層判定(トップページを深度1として扱う)
-                        path_segments = [p for p in parsed_current.path.split("/") if p]
-                        current_depth = len(path_segments)
-                        if path_segments and path_segments[-1] in ["index.html", "index.php", "index.htm"]:
-                            current_depth = max(0, current_depth - 1)
-                        current_depth += 1  # トップページ自体を深度1として数える
-                        max_depth = max(max_depth, current_depth)
-
-                        detected = self._detect_cms(current_html)
-                        if detected and not cms_name:
-                            cms_name = detected
-
-                        # 多言語切り替えウィジェットの検知(グローバルナビの外、ヘッダー上部の
-                        # 独立ウィジェット等も含めてページ全体から判定する。一度検知できれば
-                        # それ以降のページでは再チェック不要)
-                        if not has_multilang and self._detect_multilang_switcher(soup):
-                            has_multilang = True
-                            logger.info("多言語切り替えウィジェットを検知しました: %s", current_url)
+                        # CMS判定(ページによって検知しやすさが違うため、複数ページに渡って試みる。
+                        # 一度検知できれば以降のページでは上書きしない)
+                        if not cms_name:
+                            detected_cms = self._detect_cms(current_html)
+                            if detected_cms:
+                                cms_name = detected_cms
 
                         # 初回（トップ）ページのみナビゲーションと目的を取得
                         if len(visited) == 1:
+                            # 移転案内ページ(meta refresh / JSタイマーによる別ドメインへの
+                            # 自動リダイレクト)の検知。静的HTML取得ではリダイレクト自体は
+                            # 実行されないため、ページ内容から検知して即座に打ち切る。
+                            redirect_target_url = self._detect_delayed_cross_domain_redirect(current_html, current_url, base_domain_clean)
+                            if redirect_target_url:
+                                logger.info(
+                                    "移転案内ページを検知したため巡回を打ち切ります: %s -> %s",
+                                    start_url,
+                                    redirect_target_url,
+                                )
+                                return (
+                                    0,
+                                    0,
+                                    "",
+                                    "",
+                                    "",
+                                    combined_html_src,
+                                    cms_name,
+                                    False,
+                                    False,
+                                    has_basic_auth,
+                                    False,
+                                    "",
+                                    redirect_target_url,
+                                )
+
+                            # Fortinet等のネットワーク機器によるSSL証明書エラー/ブロックページの検知
+                            detected_block_reason = self._detect_network_block_page(current_html)
+                            if detected_block_reason:
+                                blocked_reason = detected_block_reason
+                                logger.warning(
+                                    "ネットワーク機器によるブロックページを検知したため巡回を打ち切りました: %s",
+                                    start_url,
+                                )
+                                return (
+                                    0,
+                                    0,
+                                    "",
+                                    "",
+                                    "",
+                                    combined_html_src,
+                                    "",
+                                    False,
+                                    False,
+                                    has_basic_auth,
+                                    False,
+                                    blocked_reason,
+                                    "",
+                                )
+
                             site_purpose = self._extract_purpose_and_features(current_html)
 
-                            nav = (
-                                soup.find("nav")
-                                or soup.find(id=re.compile(r"nav|menu|global", re.I))
-                                or soup.find(class_=re.compile(r"nav|menu|global", re.I))
-                                or soup.find("header")
-                                or soup.find("footer")
-                            )
+                            # 多言語切り替え機能の有無を検知
+                            has_multilang = self._detect_multilang_switcher(soup)
 
-                            if nav and isinstance(nav, Tag):
-                                for skip_el in nav.find_all(
-                                    ["h1", "h2", "h3", "span", "div", "ul"],
-                                    class_=re.compile(r"logo|title|site-name|setting|language|choose|option", re.I),
-                                ):
-                                    skip_el.decompose()
+                            # --- 1. メインナビ領域の候補をスコア判定で特定 ---
+                            def find_main_nav_element(soup: BeautifulSoup) -> Tag | None:
+                                nav_pattern = re.compile(
+                                    r"gnav|rglnav|gmenu|global|main-?menu|navbar-?nav|header-?menu|header__nav|navigation",
+                                    re.I,
+                                )
 
-                                for item in nav.find_all(["li", "a"]):
-                                    menu_text = item.get_text(strip=True)
-                                    if not menu_text:
-                                        img = item.find("img")
-                                        if img and isinstance(img, Tag):
-                                            menu_text = img.get("alt", "") or img.get("data-label", "")
+                                candidates = soup.find_all(
+                                    ["nav", "header", "ul", "div"],
+                                    class_=nav_pattern,
+                                )
+                                candidates.extend(
+                                    soup.find_all(
+                                        ["ul", "div", "nav"],
+                                        id=re.compile(r"nav|menu|glnav|gnav|gmenu|lh|header", re.I),
+                                    )
+                                )
 
-                                    menu_text = self._clean_menu_text(str(menu_text))
+                                if not candidates:
+                                    candidates = soup.find_all("nav")
 
-                                    # 多言語判定メソッドを呼び出す
-                                    if self._is_multilang_element(item, menu_text):
+                                best_el = None
+                                max_score = -100
+
+                                for cand in candidates:
+                                    attr_str = f"{cand.get('id', '')} {' '.join(cand.get('class', []))}".lower()
+
+                                    if any(
+                                        k in attr_str
+                                        for k in [
+                                            "footer",
+                                            "side",
+                                            "widget",
+                                            "search",
+                                            "drawer",
+                                            "modal",
+                                            "news",
+                                            "main",
+                                            "page",
+                                            "content",
+                                        ]
+                                    ):
                                         continue
 
-                                    if menu_text and len(menu_text) < 15 and menu_text not in global_nav_menus:
+                                    score = 0
+                                    if cand.name == "nav":
+                                        score += 30
+                                    elif cand.name == "header":
+                                        score += 5
+
+                                    if nav_pattern.search(attr_str):
+                                        score += 50
+                                    elif re.search(r"menu|nav|lh", attr_str):
+                                        score += 20
+
+                                    a_count = len(cand.find_all("a"))
+                                    if 3 <= a_count <= 25:
+                                        score += 30
+                                    elif a_count > 30:
+                                        score -= 40
+
+                                    if score > max_score:
+                                        max_score = score
+                                        best_el = cand
+
+                                return best_el if max_score >= 15 else None
+
+                            # --- 2. リンクからテキストを抽出 ---
+                            def extract_text_from_link(a_tag: Tag) -> str:
+                                a_copy: BeautifulSoup = BeautifulSoup(str(a_tag), HTML_PARSER)
+
+                                for sub in a_copy.find_all(
+                                    ["span", "small", "p", "em", "i"],
+                                    class_=re.compile(r"sub|subtitle|en|english|ruby", re.I),
+                                ):
+                                    sub.decompose()
+
+                                raw_text = a_copy.get_text("\n", strip=True)
+                                if "\n" in raw_text:
+                                    raw_text = raw_text.split("\n")[0]
+
+                                if not raw_text:
+                                    img = a_tag.find("img")
+                                    if img and isinstance(img, Tag):
+                                        alt = img.get("alt")
+                                        title = img.get("title")
+
+                                        if isinstance(alt, list):
+                                            alt = " ".join(alt)
+                                        if isinstance(title, list):
+                                            title = " ".join(title)
+
+                                        raw_text = alt or title or ""
+
+                                return self._clean_menu_text(str(raw_text))
+
+                            # --- 3. メインナビ領域の確定 ---
+                            target_area = find_main_nav_element(soup)
+
+                            if not target_area:
+                                header_el = soup.find("header") or soup.find("div", id=re.compile(r"header|lh", re.I))
+                                if isinstance(header_el, Tag):
+                                    target_area = (
+                                        header_el.find(
+                                            ["ul", "nav"],
+                                            class_=re.compile(r"nav|menu|gnav", re.I),
+                                        )
+                                        or header_el.find("nav")
+                                        or header_el
+                                    )
+
+                            if target_area:
+                                target_links: list[Tag] = []
+
+                                if target_area.name == "ul":
+                                    main_ul = target_area
+                                else:
+                                    main_ul = cast(
+                                        Tag | None,
+                                        (
+                                            target_area.find("ul", class_=re.compile(r"nav|menu|gnav|gmenu", re.I))
+                                            or target_area.find("ul", id=re.compile(r"nav|menu|gnav|gmenu", re.I))
+                                            or target_area.find("ul")
+                                        ),
+                                    )
+
+                                if isinstance(main_ul, Tag):
+                                    lis = main_ul.find_all("li", recursive=False)
+
+                                    if not lis:
+                                        first_li_result = main_ul.find("li")
+
+                                        if isinstance(first_li_result, Tag) and isinstance(first_li_result.parent, Tag):
+                                            lis = first_li_result.parent.find_all("li", recursive=False)
+
+                                    for li in lis:
+                                        all_a = li.find_all("a")
+                                        if all_a and isinstance(all_a[0], Tag):
+                                            target_links.append(all_a[0])
+
+                                else:
+                                    target_links = [link for link in target_area.find_all("a") if isinstance(link, Tag)]
+
+                                for a_tag in target_links:
+                                    href = a_tag.get("href", "")
+
+                                    if isinstance(href, list):
+                                        href = href[0] if href else ""
+
+                                    href = str(href).strip().lower()
+
+                                    menu_text = extract_text_from_link(a_tag)
+
+                                    if not menu_text:
+                                        continue
+                                    if menu_text in [
+                                        "×",
+                                        "閉じる",
+                                        "MENU",
+                                        "メニュー",
+                                        "標準",
+                                        "拡大",
+                                        "検索",
+                                        "メニューを飛ばす",
+                                    ]:
+                                        continue
+                                    if self._is_multilang_element(a_tag, menu_text):
+                                        continue
+
+                                    if menu_text not in global_nav_menus:
                                         global_nav_menus.append(menu_text)
 
-                        # お問い合わせページの判定と解析(iframe再帰込み)
+                        # お問い合わせ判定
                         is_contact_url = any(k.lower() in current_url.lower() for k in self.CONTACT_KEYWORDS)
-                        contact_link_tag = soup.find("a", string=re.compile(r"問い合わせ|問合せ|相談|コンタクト|送信", re.I))
+                        contact_link_tag = soup.find(
+                            "a",
+                            string=re.compile(
+                                r"問い合わせ|問合せ|相談|コンタクト|送信",
+                                re.I,
+                            ),
+                        )
                         has_contact_text = contact_link_tag is not None
 
                         if (is_contact_url or has_contact_text) and not contact_fields:
@@ -1112,30 +1483,26 @@ class WebCrawler:
                                 depth=0,
                             )
 
-                            if not contact_fields:
-                                framework = self._detect_js_framework(current_html)
-                                if framework:
-                                    logger.info("フォーム未検出、JSフレームワーク疑い(%s): %s", framework, current_url)
+                        # 内部リンク巡回
+                        candidate_hrefs = [link["href"] for link in soup.find_all("a", href=True)]
+                        # JS遷移(onclick="location.href='...'"等)によるリンクも対象に含める
+                        candidate_hrefs.extend(self._extract_js_links(current_html))
 
-                        # 通常の内部リンク探索
-                        for link in soup.find_all("a", href=True):
-                            href = link["href"]
+                        for href in candidate_hrefs:
                             if self._is_valid_internal_link(current_url, href, base_domain_clean):
                                 abs_href = urljoin(current_url, href)
                                 norm_abs = normalize_url(abs_href)
                                 parsed_abs = urlparse(norm_abs)
                                 path_depth = len([p for p in parsed_abs.path.split("/") if p])
-                                is_priority = any(k.lower() in norm_abs.lower() for k in ("contact", "inquiry", "otoiawase", "form"))
-                                enqueue(norm_abs, path_depth, is_priority)
-
-                        # JS遷移(onclick="location.href=..."やインラインscript)によるリンクも回収
-                        for raw_href in self._extract_js_links(current_html):
-                            if self._is_valid_internal_link(current_url, raw_href, base_domain_clean):
-                                abs_href = urljoin(current_url, raw_href)
-                                norm_abs = normalize_url(abs_href)
-                                parsed_abs = urlparse(norm_abs)
-                                path_depth = len([p for p in parsed_abs.path.split("/") if p])
-                                is_priority = any(k.lower() in norm_abs.lower() for k in ("contact", "inquiry", "otoiawase", "form"))
+                                is_priority = any(
+                                    k.lower() in norm_abs.lower()
+                                    for k in (
+                                        "contact",
+                                        "inquiry",
+                                        "otoiawase",
+                                        "form",
+                                    )
+                                )
                                 enqueue(norm_abs, path_depth, is_priority)
 
                         time.sleep(0.04)
@@ -1146,13 +1513,23 @@ class WebCrawler:
         except Exception as e:
             logger.warning("クローラー内で予期せぬエラーが発生しました: %s", e)
 
-        # Fortinet等のブロックページを検知していた場合、他の項目は実サイトの内容を反映しておらず
-        # 判定に使うと誤った結果になるため、通常の整形・判定を経由せずここで打ち切って返す。
         if blocked_reason:
-            logger.warning("ネットワーク機器によるブロックページを検知したため巡回を打ち切りました: %s", start_url)
-            return (0, 0, "", "", "", combined_html_src, "", False, False, has_basic_auth, False, blocked_reason)
+            return (
+                0,
+                0,
+                "",
+                "",
+                "",
+                combined_html_src,
+                "",
+                False,
+                False,
+                has_basic_auth,
+                False,
+                blocked_reason,
+                "",
+            )
 
-        # 出力データの整形
         site_structure = "\n".join(global_nav_menus[:10])
         final_page_count = "100ページ以上" if is_over_100 or len(visited) >= 100 else len(visited)
 
@@ -1173,4 +1550,5 @@ class WebCrawler:
             has_basic_auth,
             has_multilang,
             blocked_reason,
+            redirect_target_url,
         )

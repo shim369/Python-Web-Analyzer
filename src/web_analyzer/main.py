@@ -16,44 +16,38 @@ st.set_page_config(
 )
 
 # バックグラウンドスリープ対策のJavaScript埋め込み
-# 画面に影響を与えないよう height=0 で配置し、ユーザーがタブに戻った瞬間に状態をチェックさせます
-st.components.v1.html(
+st.iframe(
     """
     <script>
     document.addEventListener("visibilitychange", () => {
         if (document.visibilityState === "visible") {
-            console.log("タブがアクティブになりました。接続状態を確認します。");
+            console.log("タブがアクティブになりました。3秒後に接続状態を確認します。");
             
-            // 簡易的なオンラインチェック
-            if (!navigator.onLine) {
-                console.log("ネットワーク自体がオフラインです。");
-                window.parent.location.reload();
-                return;
-            }
-
-            // Streamlitの内部状態（WebSocketなど）が切断されているか、
-            // 画面がフリーズしているかを安全にチェックするロジック
-            try {
-                // 親ウィンドウのコネクション状態を確認する（Streamlitのグローバルオブジェクトにアクセス）
-                // 切断されている、またはエラー画面になっている場合にのみリロードを実行する
-                const parentConnection = window.parent.__streamlit__?.connection;
-                
-                // コネクションオブジェクトが存在し、かつ閉じられている場合
-                if (parentConnection && (parentConnection._socket?.readyState === 3 || parentConnection._state === 'CLOSED')) {
-                    console.log("StreamlitのWebSocket切断を検知したため、リロードします。");
+            setTimeout(() => {
+                if (!navigator.onLine) {
+                    console.log("ネットワーク自体がオフラインです。");
                     window.parent.location.reload();
-                } else {
-                    console.log("通信は維持されているため、リロードをスキップします。");
+                    return;
                 }
-            } catch (e) {
-                // クロスドメイン制限などでアクセスできない場合のセーフティ
-                console.error("ステータスチェックに失敗しました:", e);
-            }
+
+                try {
+                    const parentConnection = window.parent.__streamlit__?.connection;
+                    
+                    if (parentConnection && (parentConnection._socket?.readyState === 3 || parentConnection._state === 'CLOSED')) {
+                        console.log("StreamlitのWebSocketが復旧していないため、リロードします。");
+                        window.parent.location.reload();
+                    } else {
+                        console.log("通信は維持（または再接続）されているため、リロードをスキップします。");
+                    }
+                } catch (e) {
+                    console.error("ステータスチェックに失敗しました:", e);
+                }
+            }, 3000);
         }
     });
     </script>
     """,
-    height=0,
+    height=1,
 )
 
 # UIスタイリング
@@ -169,7 +163,10 @@ uploaded_file = st.file_uploader(
 if uploaded_file:
     temp_dir = Path("temp")
     temp_dir.mkdir(exist_ok=True)
-    input_path = temp_dir / uploaded_file.name
+
+    # タイムスタンプをつけてファイル名の競合を防ぐ
+    unique_filename = f"import_{datetime.now().strftime('%Y%m%d%H%M%S_%f')}.xlsx"
+    input_path = temp_dir / unique_filename
 
     with open(input_path, "wb") as f:
         f.write(uploaded_file.getbuffer())

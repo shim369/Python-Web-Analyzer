@@ -83,6 +83,7 @@ class SiteScraperService:
                 has_basic_auth_raw: bool = False
                 has_multilang_raw: bool = False
                 blocked_reason_raw: str = ""
+                redirect_target_url_raw: str = ""
 
                 # 1. SSL判定の実行
                 try:
@@ -101,7 +102,7 @@ class SiteScraperService:
                     is_always_ssl_val = ""
 
                 # 2. クローラー巡回
-                crawler = WebCrawler()
+                crawler = WebCrawler(render_js=True)
                 try:
                     (
                         total_pages_fetched,
@@ -116,6 +117,7 @@ class SiteScraperService:
                         has_basic_auth_raw,
                         has_multilang_raw,
                         blocked_reason_raw,
+                        redirect_target_url_raw,
                     ) = crawler.crawl_and_analyze(item.domain_name)
                 except Exception as e:
                     logger.warning(f"[{item.domain_name}] クロール中に予期せぬエラーが発生しました: {e}")
@@ -125,6 +127,7 @@ class SiteScraperService:
                 has_basic_auth = bool(has_basic_auth_raw)
                 has_multilang = bool(has_multilang_raw)
                 blocked_reason = str(blocked_reason_raw or "")
+                redirect_target_url = str(redirect_target_url_raw or "")
 
                 # 文字列判定と数値へのクリーンアップ処理
                 if total_pages_fetched == "100ページ以上":
@@ -134,7 +137,15 @@ class SiteScraperService:
                     total_pages_int = int(total_pages_fetched)
                     total_pages_display = total_pages_int
 
-                if blocked_reason:
+                remarks_value = ""
+
+                if redirect_target_url:
+                    # meta refresh / JSタイマー等により、数秒後に別ドメインへ自動リダイレクトされる
+                    # 「移転案内ページ」だった場合。既にリニューアル・移転済みとみなし、
+                    # 通常の判定ロジックは通さず固定の結果を採用する。
+                    eval_result, rejection_reason = "×", "すでにリニューアル済のため"
+                    remarks_value = f"移転先：{redirect_target_url}"
+                elif blocked_reason:
                     # Fortinet等のネットワーク機器によるSSL証明書エラー/ブロックページを取得した場合、
                     # 他の項目は実サイトの内容を反映していないため、通常の判定ロジックを通さず
                     # 「要確認」+ 具体的な理由をそのままM列に出力する。
@@ -167,7 +178,7 @@ class SiteScraperService:
                     item.site_structure = site_structure
                     item.cms_name = cms_name
                     item.description = site_purpose
-                    item.remarks = ""
+                    item.remarks = remarks_value
                     item.evaluation_result = eval_result
                     item.rejection_reason = rejection_reason
 

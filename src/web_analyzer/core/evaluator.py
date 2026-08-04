@@ -32,6 +32,11 @@ class RenewalEvaluator:
         evaluate() を直接呼ぶより、こちらを呼ぶことを推奨する。
         """
         if total_pages == 0:
+            if has_basic_auth:
+                # ベーシック認証で弾かれている場合、クロール自体は0ページで終わるが、
+                # これは「接続不可」ではなく明確に判定可能な理由なので、
+                # 汎用の「要確認」メッセージより優先する。
+                return "×", "ベーシック認証がかかっているページがあるため"
             return "要確認", "接続不可またはアクセス拒否のため、判定を保留しました。"
 
         if isinstance(total_pages, int) and 1 <= total_pages <= 2:
