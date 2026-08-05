@@ -442,10 +442,7 @@ class WebCrawler:
 
                 # リアルなブラウザのヘッダー・画面設定を網羅してボット検知を回避
                 context = browser.new_context(
-                    user_agent=self.headers.get(
-                        "User-Agent",
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-                    ),
+                    user_agent=self.headers.get("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
                     viewport={"width": 1280, "height": 800},
                     extra_http_headers={
                         "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
@@ -1051,14 +1048,10 @@ class WebCrawler:
                 )
             if status == 429:
                 return (
-                    "アクセス先のサーバーから429 Too Many Requests（レート制限）が返されたため、"
-                    "実際のサイト内容を取得できませんでした。時間を置いての再調査、または手動確認をお願いします。"
+                    "アクセス先のサーバーから429 Too Many Requests（レート制限）が返されたため、実際のサイト内容を取得できませんでした。時間を置いての再調査、または手動確認をお願いします。"
                 )
             if status >= 500:
-                return (
-                    f"アクセス先のサーバーでエラー（HTTPステータス {status}）が発生しているため、"
-                    "実際のサイト内容を取得できませんでした。手動確認をお願いします。"
-                )
+                return f"アクセス先のサーバーでエラー（HTTPステータス {status}）が発生しているため、実際のサイト内容を取得できませんでした。手動確認をお願いします。"
 
         err_text = str(error).lower()
         ssl_error_keywords = [
@@ -1445,12 +1438,7 @@ class WebCrawler:
                         # 大半を1ページ目だけで使い果たし、2ページ目以降を巡回できず総ページ数が
                         # 極端に少ない「要確認」判定に化けてしまう。JSフレームワークを検知した
                         # ページ（＝静的HTMLだけでは内容が欠落する可能性が高いページ）のみに限定する。
-                        if (
-                            self.render_js
-                            and len(visited) == 1
-                            and not first_html_from_playwright
-                            and self._detect_js_framework(current_html)
-                        ):
+                        if self.render_js and len(visited) == 1 and not first_html_from_playwright and self._detect_js_framework(current_html):
                             rendered, _rendered_url = self._fetch_rendered_html(current_url)
                             if rendered:
                                 current_html = rendered

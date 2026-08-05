@@ -15,15 +15,8 @@ class SslChecker:
         self.timeout = timeout
         # WAF/ボット検知を回避するため、標準的なChromeブラウザのリクエストヘッダーを完全模倣
         self.headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-            "Accept": (
-                "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                "image/avif,image/webp,image/apng,*/*;q=0.8"
-            ),
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
+            "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"),
             "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
             "Accept-Encoding": "gzip, deflate, br",
             "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
@@ -42,9 +35,7 @@ class SslChecker:
         # ConnectionResetErrorやタイムアウト時はすぐに次の判定に進むため、自動リトライは外す
         return session
 
-    def _safe_get(
-        self, session: requests.Session, url: str, allow_redirects: bool = True
-    ) -> requests.Response:
+    def _safe_get(self, session: requests.Session, url: str, allow_redirects: bool = True) -> requests.Response:
         """ConnectionResetError 発生時に 1 度だけ再試行するメソッド。"""
         try:
             return session.get(
@@ -103,15 +94,11 @@ class SslChecker:
             return result
 
         www_domain = f"www.{normalized_domain}"
-        logger.info(
-            f"[{domain}] 証明書のホスト名不一致の可能性があるため、www付きドメインで再試行します: {www_domain}"
-        )
+        logger.info(f"[{domain}] 証明書のホスト名不一致の可能性があるため、www付きドメインで再試行します: {www_domain}")
         result, _ = self._check_ssl_status_once(www_domain)
         return result
 
-    def _check_ssl_status_once(
-        self, domain: str
-    ) -> tuple[tuple[bool | None, bool | None], bool]:
+    def _check_ssl_status_once(self, domain: str) -> tuple[tuple[bool | None, bool | None], bool]:
         """SSL対応状況を1回分チェックする内部メソッド。"""
         start_url = self._normalize_url(domain)
         session = self._get_session()
@@ -130,9 +117,7 @@ class SslChecker:
             # httpsにリダイレクトされなかったが、個別で https:// 接続を試みる
             try:
                 https_url = start_url.replace("http://", "https://")
-                https_response = self._safe_get(
-                    session, https_url, allow_redirects=False
-                )
+                https_response = self._safe_get(session, https_url, allow_redirects=False)
                 if https_response.status_code < 400:
                     return (True, False), False
             except Exception:
@@ -142,16 +127,12 @@ class SslChecker:
             return (False, False), False
 
         except requests.exceptions.RequestException as e:
-            logger.warning(
-                f"[{domain}] http://での接続に失敗したため、https://への直接接続を試みます: {e}"
-            )
+            logger.warning(f"[{domain}] http://での接続に失敗したため、https://への直接接続を試みます: {e}")
             ssl_error_seen = self._is_ssl_verification_error(e)
 
             try:
                 https_url = start_url.replace("http://", "https://")
-                https_response = self._safe_get(
-                    session, https_url, allow_redirects=True
-                )
+                https_response = self._safe_get(session, https_url, allow_redirects=True)
 
                 final_url = https_response.url
                 parsed_final = urlparse(final_url)
@@ -162,12 +143,8 @@ class SslChecker:
                 return (False, False), False
 
             except requests.exceptions.RequestException as https_e:
-                logger.warning(
-                    f"[{domain}] https://への接続にも失敗したため判定不能: {https_e}"
-                )
-                ssl_error_seen = ssl_error_seen or self._is_ssl_verification_error(
-                    https_e
-                )
+                logger.warning(f"[{domain}] https://への接続にも失敗したため判定不能: {https_e}")
+                ssl_error_seen = ssl_error_seen or self._is_ssl_verification_error(https_e)
                 return (None, None), ssl_error_seen
 
         except Exception as e:

@@ -1,62 +1,35 @@
-
 from bs4 import BeautifulSoup
 
 
 class RenewalEvaluator:
     """Webサイトのリニューアル可否を複数の判定基準から総合的に判定する。"""
 
-    CAPTCHA_KEYWORDS = [
-        "captcha", "g-recaptcha", "hcaptcha", "認証コード", "ccm-captcha-image"
-    ]
-    CHATBOT_KEYWORDS = [
-        "sinclo","chamo","zendesk","channel.io",
-        "hubspot-messages","chatbot","intercom",
-        "crisp","tidio","chatplus"
-    ]
-    CALENDAR_KEYWORDS = ["wp-calendar","xo-event-calendar"]
-    SEARCH_KEYWORDS = ["絞り込み検索","条件検索","サイト内検索","キーワード検索"]
-    RICH_UI_KEYWORDS = ["lightbox","fancybox","data-lightbox"]
-    MULTILANG_KEYWORDS = ["translate.google","language-list","lang-select","言語切り替え"]
-    SCROLL_ANIMATION_KEYWORDS = ["gsap","scrolltrigger","data-aos","locomotive-scroll"]
-    VIDEO_KEYWORDS = ["<video","youtube.com/embed","vimeo.com","youtu.be","player.vimeo"]
+    CAPTCHA_KEYWORDS = ["captcha", "g-recaptcha", "hcaptcha", "認証コード", "ccm-captcha-image"]
+    CHATBOT_KEYWORDS = ["sinclo", "chamo", "zendesk", "channel.io", "hubspot-messages", "chatbot", "intercom", "crisp", "tidio", "chatplus"]
+    CALENDAR_KEYWORDS = ["wp-calendar", "xo-event-calendar"]
+    SEARCH_KEYWORDS = ["絞り込み検索", "条件検索", "サイト内検索", "キーワード検索"]
+    RICH_UI_KEYWORDS = ["lightbox", "fancybox", "data-lightbox"]
+    MULTILANG_KEYWORDS = ["translate.google", "language-list", "lang-select", "言語切り替え"]
+    SCROLL_ANIMATION_KEYWORDS = ["gsap", "scrolltrigger", "data-aos", "locomotive-scroll"]
+    VIDEO_KEYWORDS = ["<video", "youtube.com/embed", "vimeo.com", "youtu.be", "player.vimeo"]
 
     def _soup(self, html: str) -> BeautifulSoup:
         return BeautifulSoup(html or "", "html.parser")
 
     def _has_calendar(self, soup: BeautifulSoup) -> bool:
-        return bool(
-            soup.select(
-                ".wp-calendar,.xo-event-calendar,iframe[src*='calendar.google' i],"
-                "[class*='calendar' i],[id*='calendar' i]"
-            )
-        )
+        return bool(soup.select(".wp-calendar,.xo-event-calendar,iframe[src*='calendar.google' i],[class*='calendar' i],[id*='calendar' i]"))
 
     def _has_accordion(self, soup: BeautifulSoup) -> bool:
         # クラス名の完全一致(.accordion)だけだと、WordPressテーマ等でよくある
         # "js-accordion"・"elementor-accordion"のような接頭辞/接尾辞付きクラス名を
         # 見逃してしまうため、calendarと同様に部分一致([class*=...])も併用する。
-        return bool(
-            soup.select(
-                ".accordion,[data-bs-toggle='collapse'],details,"
-                "[class*='accordion' i],[id*='accordion' i]"
-            )
-        )
+        return bool(soup.select(".accordion,[data-bs-toggle='collapse'],details,[class*='accordion' i],[id*='accordion' i]"))
 
     def _has_tabs(self, soup: BeautifulSoup) -> bool:
-        return bool(
-            soup.select(
-                "[role='tab'],.nav-tabs,[data-bs-toggle='tab'],"
-                "[class*='tabs' i],[class*='tab-content' i],[id*='tabs' i]"
-            )
-        )
+        return bool(soup.select("[role='tab'],.nav-tabs,[data-bs-toggle='tab'],[class*='tabs' i],[class*='tab-content' i],[id*='tabs' i]"))
 
     def _has_modal(self, soup: BeautifulSoup) -> bool:
-        return bool(
-            soup.select(
-                ".modal,.modal-dialog,[data-bs-toggle='modal'],"
-                "[class*='modal' i],[id*='modal' i]"
-            )
-        )
+        return bool(soup.select(".modal,.modal-dialog,[data-bs-toggle='modal'],[class*='modal' i],[id*='modal' i]"))
 
     def _has_floating(self, soup: BeautifulSoup) -> bool:
         for tag in soup.find_all(True):
@@ -74,7 +47,6 @@ class RenewalEvaluator:
         if soup.find("input", {"type": "search"}):
             return True
         return any(x in html for x in self.SEARCH_KEYWORDS)
-
 
     def decide(
         self,
