@@ -13,8 +13,58 @@ class SslChecker:
 
     def __init__(self, timeout: float = 10.0) -> None:
         self.timeout = timeout
-        # Google等にブロックされにくいよう、一般的なブラウザのUser-Agentを設定
-        self.headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+        # WAF/ボット検知を回避するため、標準的なChromeブラウザのリクエストヘッダーを完全模倣
+        self.headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,image/apng,*/*;q=0.8"
+            ),
+            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+        }
+
+    def _get_session(self) -> requests.Session:
+        """Simple Session without unnecessary adapters."""
+        session = requests.Session()
+        # ConnectionResetErrorやタイムアウト時はすぐに次の判定に進むため、自動リトライは外す
+        return session
+
+    def _safe_get(
+        self, session: requests.Session, url: str, allow_redirects: bool = True
+    ) -> requests.Response:
+        """ConnectionResetError 発生時に 1 度だけ再試行するメソッド。"""
+        try:
+            return session.get(
+                url,
+                headers=self.headers,
+                timeout=self.timeout,
+                allow_redirects=allow_redirects,
+            )
+        except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
+            # 10054(Reset)はサーバーが応答を拒否しているため、Headerを切り替えて1回だけリトライ
+            if "10054" in str(e) or "Connection aborted" in str(e):
+                headers_copy = self.headers.copy()
+                headers_copy["Connection"] = "close"
+                return session.get(
+                    url,
+                    headers=headers_copy,
+                    timeout=self.timeout,
+                    allow_redirects=allow_redirects,
+                )
+            raise e
 
     def _normalize_url(self, url_or_domain: str) -> str:
         """入力された文字列からドメインを抽出し、検証用の http:// URLを生成する。"""
@@ -29,15 +79,9 @@ class SslChecker:
         return f"http://{domain}"
 
     def _is_ssl_verification_error(self, error: Exception) -> bool:
-        """例外が証明書検証エラー（ホスト名不一致・期限切れ等）によるものかを判定する。
-
-        タイムアウトや接続拒否など、証明書とは無関係な理由での失敗とは区別する。
-        (証明書エラーの場合のみwww付きドメインでの再試行を行うため)
-        """
+        """例外が証明書検証エラー（ホスト名不一致・期限切れ等）によるものかを判定する。"""
         if isinstance(error, requests.exceptions.SSLError):
             return True
-        # requestsはSSLErrorでラップせずConnectionError内に含めて送出することもあるため、
-        # メッセージ文字列からも判定できるようにしておく
         err_text = str(error).lower()
         return "certificate" in err_text or "ssl" in err_text
 
@@ -54,32 +98,27 @@ class SslChecker:
         if result != (None, None) or not ssl_verification_failed:
             return result
 
-        # 証明書のホスト名不一致等が原因で判定できなかった場合、www.付きドメインでも再試行する。
-        # (例: 証明書がwww.example.co.jpにのみ有効で、example.co.jp直打ちだと
-        #  ハンドシェイクの検証エラーでリダイレクトすら辿れず失敗するケースがある。
-        #  実際にサイトを開いた場合は自動的にwww側へ流れて正常に閲覧できることが多いため、
-        #  ここで諦めず再試行する)
         normalized_domain = domain.strip()
         if normalized_domain.lower().startswith("www."):
             return result
 
         www_domain = f"www.{normalized_domain}"
-        logger.info(f"[{domain}] 証明書のホスト名不一致の可能性があるため、www付きドメインで再試行します: {www_domain}")
+        logger.info(
+            f"[{domain}] 証明書のホスト名不一致の可能性があるため、www付きドメインで再試行します: {www_domain}"
+        )
         result, _ = self._check_ssl_status_once(www_domain)
         return result
 
-    def _check_ssl_status_once(self, domain: str) -> tuple[tuple[bool | None, bool | None], bool]:
-        """SSL対応状況を1回分チェックする内部メソッド。
-
-        戻り値は (判定結果, 証明書検証エラーが原因で判定不能になったか) のタプル。
-        2つ目の値は、呼び出し側がwww付きドメインでの再試行を行うべきかどうかの判断に使う。
-        """
+    def _check_ssl_status_once(
+        self, domain: str
+    ) -> tuple[tuple[bool | None, bool | None], bool]:
+        """SSL対応状況を1回分チェックする内部メソッド。"""
         start_url = self._normalize_url(domain)
+        session = self._get_session()
 
         try:
             # 1. http:// でアクセスし、リダイレクトを追跡する
-            # (User-Agentヘッダーを付与してセキュリティブロックを緩和)
-            response = requests.get(start_url, headers=self.headers, timeout=self.timeout, allow_redirects=True)
+            response = self._safe_get(session, start_url, allow_redirects=True)
 
             final_url = response.url
             parsed_final = urlparse(final_url)
@@ -91,43 +130,48 @@ class SslChecker:
             # httpsにリダイレクトされなかったが、個別で https:// 接続を試みる
             try:
                 https_url = start_url.replace("http://", "https://")
-                https_response = requests.get(https_url, headers=self.headers, timeout=self.timeout, allow_redirects=False)
+                https_response = self._safe_get(
+                    session, https_url, allow_redirects=False
+                )
                 if https_response.status_code < 400:
-                    # HTTPSでの接続はできるが、常時リダイレクトはされていない場合
                     return (True, False), False
             except Exception:
-                # HTTPSでの接続に失敗した場合
                 pass
 
             # 通信はできたがHTTPS化されていない場合
             return (False, False), False
 
         except requests.exceptions.RequestException as e:
-            # http:// 自体が失敗した場合(ポート80を受け付けない等)、
-            # HTTPS専用サイトの可能性があるため https:// への直接接続を試みる
-            logger.warning(f"[{domain}] http://での接続に失敗したため、https://への直接接続を試みます: {e}")
+            logger.warning(
+                f"[{domain}] http://での接続に失敗したため、https://への直接接続を試みます: {e}"
+            )
             ssl_error_seen = self._is_ssl_verification_error(e)
 
             try:
                 https_url = start_url.replace("http://", "https://")
-                https_response = requests.get(https_url, headers=self.headers, timeout=self.timeout, allow_redirects=True)
+                https_response = self._safe_get(
+                    session, https_url, allow_redirects=True
+                )
 
                 final_url = https_response.url
                 parsed_final = urlparse(final_url)
 
                 if parsed_final.scheme == "https":
-                    # http://自体には接続できないため「常時SSL」とまでは断定できないが、
-                    # SSL対応かつ実質https以外にアクセス手段がない状態として扱う
                     return (True, True), False
 
                 return (False, False), False
 
             except requests.exceptions.RequestException as https_e:
-                # https:// でも接続できない場合は、純粋な接続エラーとして判定不能
-                logger.warning(f"[{domain}] https://への接続にも失敗したため判定不能: {https_e}")
-                ssl_error_seen = ssl_error_seen or self._is_ssl_verification_error(https_e)
+                logger.warning(
+                    f"[{domain}] https://への接続にも失敗したため判定不能: {https_e}"
+                )
+                ssl_error_seen = ssl_error_seen or self._is_ssl_verification_error(
+                    https_e
+                )
                 return (None, None), ssl_error_seen
 
         except Exception as e:
             logger.exception(f"[{domain}] SSLチェック中に予期せぬエラー: {e}")
             return (None, None), self._is_ssl_verification_error(e)
+        finally:
+            session.close()

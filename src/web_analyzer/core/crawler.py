@@ -5,7 +5,7 @@ import time
 import warnings
 from collections import deque
 from typing import cast
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup, Tag, XMLParsedAsHTMLWarning
@@ -438,18 +438,33 @@ class WebCrawler:
 
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch()
-                page = browser.new_page(user_agent=self.headers["User-Agent"])
-                # httpx用のpage_timeoutをそのまま流用すると短すぎる/ネットワーク未落ち着き
-                # のままcontent()を呼んでレース状態になりやすいため、レンダリング用には
-                # 長めのタイムアウトを別途確保し、networkidleまで待つ。
-                render_timeout_ms = max(self.page_timeout, 15.0) * 1000
-                page.goto(url, timeout=render_timeout_ms, wait_until="networkidle")
+                browser = p.chromium.launch(headless=True)
 
-                # goto完了直後でもクライアント側リダイレクト等でページが再ナビゲーション中の
-                # ことがあり、その瞬間にcontent()を呼ぶと
-                # "Unable to retrieve content because the page is navigating" で失敗するため、
-                # 少し待って数回リトライする。
+                # リアルなブラウザのヘッダー・画面設定を網羅してボット検知を回避
+                context = browser.new_context(
+                    user_agent=self.headers.get(
+                        "User-Agent",
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1280, "height": 800},
+                    extra_http_headers={
+                        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+                    },
+                    ignore_https_errors=True,
+                )
+                page = context.new_page()
+
+                render_timeout_ms = max(self.page_timeout, 15.0) * 1000
+
+                # networkidle ではなく domcontentloaded や commit で素早く受け取りを開始する
+                try:
+                    page.goto(url, timeout=render_timeout_ms, wait_until="domcontentloaded")
+                    # 接続直後に少しだけレンダリングを待つ
+                    page.wait_for_timeout(1500)
+                except Exception as goto_err:
+                    # 完全に切断される前に取れたデータがあれば続行を試みる
+                    logger.debug("goto完了前に例外が発生しましたが処理を継続します: %s", goto_err)
+
                 html = ""
                 last_error: Exception | None = None
                 for _attempt in range(3):
@@ -464,7 +479,7 @@ class WebCrawler:
                 final_url = page.url
                 browser.close()
 
-                if last_error is not None:
+                if last_error is not None and not html:
                     raise last_error
 
                 return html, final_url
@@ -930,6 +945,28 @@ class WebCrawler:
             "SSL証明書エラー（期限切れ等）によりセキュリティ機器がアクセスをブロックしたため、"
             "実際のサイト内容を取得できませんでした。別ネットワークからの再調査、または手動確認をお願いします。",
         ),
+        (
+            # office-hiro.co.jp のような「Web Page Blocked!」型のFortiGate標準ブロックページ用。
+            # カテゴリ名（フィッシング等）は _extract_fortinet_category() で別途抽出し、
+            # 検知できた場合はこのデフォルト文言より詳細な理由文で上書きする。
+            ["web page blocked"],
+            "ネットワーク側のセキュリティ機器（Fortinet等）によりアクセスがブロックされました。"
+            "実際のサイト内容を取得できませんでした。別ネットワークからの再調査、または手動確認をお願いします。",
+        ),
+    ]
+
+    # ネットワーク機器ではなく、アクセス先のサーバー自身がボット対策等で返してくる
+    # 汎用的なエラーページ（Apache/Nginxの標準403ページ等）の検知用シグネチャ。
+    # obs-pre.net の「Forbidden / You don't have permission to access this resource.」のように、
+    # Fortinet等のブロックページとは原因が異なる（＝別ネットワークから再調査しても無駄な）
+    # ケースを区別するために用意する。
+    _GENERIC_HTTP_ERROR_SIGNATURES: list[tuple[list[str], str]] = [
+        (
+            ["forbidden", "you don't have permission to access this resource"],
+            "アクセス先のサーバーから403 Forbidden（アクセス拒否）が返されたため、"
+            "実際のサイト内容を取得できませんでした。ネットワーク機器の問題ではなく、"
+            "サーバー側のボット対策等によるアクセス制限の可能性が高いため、手動確認をお願いします。",
+        ),
     ]
 
     def _detect_delayed_cross_domain_redirect(self, html: str, current_url: str, base_domain_clean: str) -> str:
@@ -1001,6 +1038,28 @@ class WebCrawler:
         if error is None:
             return ""
 
+        # obs-pre.net の「Forbidden / You don't have permission to access this resource.」のように、
+        # ネットワーク機器ではなくアクセス先のサーバー自身が拒否しているケースを区別する。
+        # raise_for_status() が投げる例外なので、response からHTTPステータスコードを直接判定できる。
+        if isinstance(error, httpx.HTTPStatusError):
+            status = error.response.status_code
+            if status == 403:
+                return (
+                    "アクセス先のサーバーから403 Forbidden（アクセス拒否）が返されたため、"
+                    "実際のサイト内容を取得できませんでした。ネットワーク機器の問題ではなく、"
+                    "サーバー側のボット対策等によるアクセス制限の可能性が高いため、手動確認をお願いします。"
+                )
+            if status == 429:
+                return (
+                    "アクセス先のサーバーから429 Too Many Requests（レート制限）が返されたため、"
+                    "実際のサイト内容を取得できませんでした。時間を置いての再調査、または手動確認をお願いします。"
+                )
+            if status >= 500:
+                return (
+                    f"アクセス先のサーバーでエラー（HTTPステータス {status}）が発生しているため、"
+                    "実際のサイト内容を取得できませんでした。手動確認をお願いします。"
+                )
+
         err_text = str(error).lower()
         ssl_error_keywords = [
             "certificate",
@@ -1022,6 +1081,46 @@ class WebCrawler:
             )
         return ""
 
+    def _extract_fortinet_category(self, html: str) -> str:
+        """FortiGate等のブロックページ内にある「カテゴリ: xxx」/「Category: xxx」表記を抽出する。
+
+        フィッシング（詐欺）・ギャンブル等、ブロック理由の分類名がページ内に
+        埋め込まれている場合、その値をそのままM列（不可の理由）に反映できるようにする。
+        見つからない場合は空文字を返す。
+        """
+        # 1. 同一行（同一テキストノード）に「ラベル: 値」が収まっている単純なケース
+        text_match = re.search(r"(?:カテゴリ|Category)\s*[:：]\s*([^\n<]{1,50})", html, re.I)
+        if text_match:
+            candidate = text_match.group(1).strip()
+            if candidate:
+                return candidate
+
+        # 2. FortiGateの警告ページによくあるテーブル形式（<td>カテゴリ</td><td>値</td>等）のように、
+        #    ラベルと値がタグを挟んで別要素になっているケースをBeautifulSoupで拾う
+        try:
+            soup = BeautifulSoup(html, HTML_PARSER)
+        except Exception:
+            return ""
+
+        label_node = soup.find(string=re.compile(r"(?:カテゴリ|Category)\s*[:：]?\s*$", re.I))
+        if not label_node or not isinstance(label_node.parent, Tag):
+            return ""
+
+        # ラベルを含む要素そのものの次の兄弟要素、または祖先要素の次の兄弟要素から値を探す
+        current: Tag | None = label_node.parent
+        for _ in range(3):
+            if current is None:
+                break
+            sibling = current.find_next_sibling()
+            if isinstance(sibling, Tag):
+                candidate = sibling.get_text(strip=True)
+                if candidate and len(candidate) < 50:
+                    return candidate
+                break
+            current = current.parent if isinstance(current.parent, Tag) else None
+
+        return ""
+
     def _detect_network_block_page(self, html: str) -> str:
         """取得したHTMLが、実際のサイトではなくFortinet等のネットワークセキュリティ機器が
         返す警告/ブロックページである可能性を検知する。
@@ -1030,6 +1129,9 @@ class WebCrawler:
         該当しない場合は空文字を返す。SSL証明書切れ等が原因でこの警告ページが返された場合、
         中身を見ずに「クロールできたページ数が極端に少ない」等の別の一般的な理由で
         要確認扱いになってしまい、原因が分かりにくくなることを防ぐのが目的。
+
+        ページ内に「カテゴリ: フィッシング（詐欺）」のような分類表記が見つかった場合は、
+        シグネチャの固定文言よりも詳細な理由文（カテゴリ名入り）を優先して返す。
         """
         if not html:
             return ""
@@ -1037,9 +1139,49 @@ class WebCrawler:
         html_lower = html.lower()
         for keywords, reason in self._NETWORK_BLOCK_SIGNATURES:
             if all(k in html_lower for k in keywords):
+                category = self._extract_fortinet_category(html)
+                if category:
+                    return (
+                        f"ネットワーク側のセキュリティ機器（Fortinet等）により「{category}」に該当するとして"
+                        "アクセスがブロックされました。実際のサイト内容を取得できませんでした。"
+                        "別ネットワークからの再調査、または手動確認をお願いします。"
+                    )
                 return reason
 
         return ""
+
+    def _detect_generic_error_page(self, html: str) -> str:
+        """取得したHTMLが、ネットワーク機器ではなくアクセス先のサーバー自身が返す
+        汎用的なエラーページ（Apache/Nginxの標準403ページ等）である可能性を検知する。
+
+        該当する場合は、M列（不可の理由）にそのまま出力できる理由文字列を返す。
+        該当しない場合は空文字を返す。_detect_network_block_page() とは異なり、
+        「別ネットワークから再調査しても無駄」なケース（サーバー側の拒否）を
+        Fortinet等のネットワーク機器によるブロックと区別するのが目的。
+        """
+        if not html:
+            return ""
+
+        html_lower = html.lower()
+        for keywords, reason in self._GENERIC_HTTP_ERROR_SIGNATURES:
+            if all(k in html_lower for k in keywords):
+                return reason
+
+        return ""
+
+    def _detect_access_blocked_page(self, html: str) -> str:
+        """取得したHTMLが、実際のサイト内容ではなく何らかのアクセス拒否ページ
+        （ネットワーク機器によるブロック、またはサーバー自身の汎用エラーページ）である
+        可能性を検知する。M列（不可の理由）にそのまま出力できる理由文字列、または
+        該当しない場合は空文字を返す。
+
+        Fortinet等のネットワーク機器によるブロックページを優先的にチェックし、
+        該当しない場合のみサーバー自身の汎用エラーページ（403 Forbidden等）を確認する。
+        """
+        network_block_reason = self._detect_network_block_page(html)
+        if network_block_reason:
+            return network_block_reason
+        return self._detect_generic_error_page(html)
 
     # ------------------------------------------------------------------
     # メインクロール処理
@@ -1062,11 +1204,18 @@ class WebCrawler:
         bool,
         str,
         str,
+        bool,
     ]:
         """ウェブサイトを巡回し、100ページに達した時点で打ち切る。
 
         戻り値の最後の要素 redirect_target_url は、meta refresh/JSタイマーによる
         別ドメインへの自動リダイレクト(移転案内ページ)を検知した場合のみ非空文字列となる。
+
+        queue_exhausted (最後から2番目、実質末尾に追加した要素) は、巡回対象の内部リンクを
+        すべて見つけ切った上で自然にキューが空になったか(True)、タイムアウト等で
+        まだ未訪問のリンクが残ったまま打ち切ったか(False)を示す。total_pages が
+        1〜2件程度の少数だった場合に、「本当にページ数が少ないサイトなのか」
+        「クロールが何らかの理由で途中で終わってしまっただけなのか」を区別するために使う。
         """
         if not start_url.startswith(("http://", "https://")):
             primary_url = f"https://{start_url}"
@@ -1104,6 +1253,13 @@ class WebCrawler:
             clean_path = re.sub(r"/index\.(html|php)$", "", clean_path)
             if clean_path.endswith("/") and clean_path != "/":
                 clean_path = clean_path.rstrip("/")
+            # HTML側でURLエンコードされずに href="/お知らせ/" のように日本語等の
+            # 非ASCII文字がそのまま書かれているサイトがある。ここで正規化せずに
+            # queue/visited/Refererヘッダー等へ流れ込むと、httpxがヘッダーや
+            # リクエストラインをASCIIとしてエンコードしようとして
+            # UnicodeEncodeError('ascii' codec can't encode characters...)になることがある。
+            # 既存の%XXエンコード済み部分を壊さないよう safe="/%" を指定してエンコードする。
+            clean_path = quote(clean_path, safe="/%")
             return parsed._replace(path=clean_path, query="", fragment="").geturl()
 
         def enqueue(url: str, path_depth: int, priority: bool) -> None:
@@ -1132,21 +1288,56 @@ class WebCrawler:
                     response = client.get(primary_url)
                     if response.status_code == 401:
                         has_basic_auth = True
+                    # raise_for_status()は4xx/5xxで例外を投げて本文を捨ててしまうため、
+                    # アクセス拒否ページ（Fortinet等のネットワーク機器のブロック、または
+                    # サーバー自身が返す403 Forbidden等の汎用エラーページ）の検知は
+                    # 必ず例外化する前に行う。
+                    # (Fortinet等のSSLインスペクションはHTTPS側だけ本文を差し替えることが多く、
+                    # 403等のステータスコードそのものにも実サイトかブロックページかの情報が
+                    # 本文に含まれているため、ステータスに関わらずまず中身を確認する)
+                    candidate_html = self._decode_response(response)
+                    detected_block_reason = self._detect_access_blocked_page(candidate_html)
+                    if detected_block_reason:
+                        blocked_reason = detected_block_reason
                     response.raise_for_status()
                     first_url = str(response.url)
-                    first_html = self._decode_response(response)
+                    first_html = candidate_html
                 except Exception as e:
                     primary_error = e
-                    if fallback_url:
+                    if not blocked_reason and fallback_url:
                         try:
                             response = client.get(fallback_url)
                             if response.status_code == 401:
                                 has_basic_auth = True
+                            candidate_html = self._decode_response(response)
+                            detected_block_reason = self._detect_access_blocked_page(candidate_html)
+                            if detected_block_reason:
+                                blocked_reason = detected_block_reason
                             response.raise_for_status()
                             first_url = str(response.url)
-                            first_html = self._decode_response(response)
+                            first_html = candidate_html
                         except Exception as e2:
                             fallback_error = e2
+
+                if blocked_reason:
+                    # httpxのレスポンス本文だけでネットワーク機器のブロックページと確定できたため、
+                    # 時間のかかるPlaywrightフォールバックを試すまでもなく、ここで打ち切る。
+                    return (
+                        0,
+                        0,
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        False,
+                        False,
+                        has_basic_auth,
+                        False,
+                        blocked_reason,
+                        "",
+                        True,
+                    )
 
                 if not first_url and self.render_js:
                     # httpxでの初回取得が両方(https/http)とも失敗した場合、WAF/ボット対策等で
@@ -1174,6 +1365,39 @@ class WebCrawler:
                         False,
                         conn_block_reason,
                         "",
+                        True,
+                    )
+
+                # httpxのfollow_redirects=Trueにより、301/302等のHTTPレベルのリダイレクトは
+                # ここまでの時点で既に自動的に追跡済みになっている(Playwright経由の場合も同様、
+                # 実ブラウザがリダイレクトを終えた後のURLがfirst_urlに入る)。
+                # meta refresh/JSタイマー型の「移転案内ページ」と違い、この場合は現在のHTMLには
+                # 移転の痕跡が残らず(既に移転先の実際のコンテンツを取得しているため)、
+                # _detect_delayed_cross_domain_redirect()では検知できない。そのため、
+                # 巡回開始時に要求したドメインと、実際に最終的に取得できたURLのドメインを
+                # 直接比較することで、この「即時リダイレクトによる移転」を検知する。
+                final_domain_clean = self._get_clean_domain(first_url)
+                if final_domain_clean and final_domain_clean != base_domain_clean:
+                    logger.info(
+                        "初回アクセス時点で別ドメインへリダイレクトされたことを検知しました: %s -> %s",
+                        start_url,
+                        first_url,
+                    )
+                    return (
+                        0,
+                        0,
+                        "",
+                        "",
+                        "",
+                        first_html,
+                        "",
+                        False,
+                        False,
+                        has_basic_auth,
+                        False,
+                        "",
+                        first_url,
+                        True,
                     )
 
                 queue.append((first_url, 0))
@@ -1216,7 +1440,17 @@ class WebCrawler:
                                 continue
                             current_html = self._decode_response(response)
 
-                        if self.render_js and len(visited) == 1 and not first_html_from_playwright:
+                        # httpxで取得済みのHTMLが静的（JSフレームワーク未使用）な場合、わざわざ
+                        # Playwrightで再レンダリングし直すと全体タイムアウト予算(self.timeout)の
+                        # 大半を1ページ目だけで使い果たし、2ページ目以降を巡回できず総ページ数が
+                        # 極端に少ない「要確認」判定に化けてしまう。JSフレームワークを検知した
+                        # ページ（＝静的HTMLだけでは内容が欠落する可能性が高いページ）のみに限定する。
+                        if (
+                            self.render_js
+                            and len(visited) == 1
+                            and not first_html_from_playwright
+                            and self._detect_js_framework(current_html)
+                        ):
                             rendered, _rendered_url = self._fetch_rendered_html(current_url)
                             if rendered:
                                 current_html = rendered
@@ -1261,14 +1495,16 @@ class WebCrawler:
                                     False,
                                     "",
                                     redirect_target_url,
+                                    True,
                                 )
 
-                            # Fortinet等のネットワーク機器によるSSL証明書エラー/ブロックページの検知
-                            detected_block_reason = self._detect_network_block_page(current_html)
+                            # Fortinet等のネットワーク機器によるブロックページ、または
+                            # サーバー自身が返す汎用エラーページ(403 Forbidden等)の検知
+                            detected_block_reason = self._detect_access_blocked_page(current_html)
                             if detected_block_reason:
                                 blocked_reason = detected_block_reason
                                 logger.warning(
-                                    "ネットワーク機器によるブロックページを検知したため巡回を打ち切りました: %s",
+                                    "アクセス拒否ページ（ネットワーク機器のブロック、またはサーバー自身の拒否）を検知したため巡回を打ち切りました: %s",
                                     start_url,
                                 )
                                 return (
@@ -1285,6 +1521,7 @@ class WebCrawler:
                                     False,
                                     blocked_reason,
                                     "",
+                                    True,
                                 )
 
                             site_purpose = self._extract_purpose_and_features(current_html)
@@ -1508,7 +1745,7 @@ class WebCrawler:
                         continue
 
         except Exception as e:
-            logger.warning("クローラー内で予期せぬエラーが発生しました: %s", e)
+            logger.warning("クローラー内で予期せぬエラーが発生しました: %s", e, exc_info=True)
 
         if blocked_reason:
             return (
@@ -1525,14 +1762,26 @@ class WebCrawler:
                 False,
                 blocked_reason,
                 "",
+                True,
             )
 
         site_structure = "\n".join(global_nav_menus[:10])
         final_page_count = "100ページ以上" if is_over_100 or len(visited) >= 100 else len(visited)
 
-        display_depth: int | str = max_depth
+        # 内部的にはトップページ=0階層目として深さを数えているが、これをそのまま
+        # 「階層数」として返すと、1ページだけの正常なサイトでも"0"と表示されてしまい、
+        # クロールが失敗したように見えて紛らわしい。「◯階層」という言い回しに合わせ、
+        # トップページ=1階層目として+1した値を、evaluator側の判定にも使う統一の値として返す。
+        # (evaluator.py側の「3階層以上でNG」というしきい値も、この1始まりの値を
+        # 前提に max_depth > 2 として判定するようになっている)
+        display_depth: int | str = max_depth + 1
         if max_depth > 10:
             display_depth = "要確認"
+
+        # キューが空 = 発見できた内部リンクはすべて訪問し終えて自然に終了したことを意味する。
+        # 逆にキューに未訪問のURLが残っている場合、タイムアウトや最大ページ数(100件)到達等の
+        # 理由で途中で打ち切っただけであり、「本当にページ数の少ないサイト」とは区別する必要がある。
+        queue_exhausted = not queue
 
         return (
             final_page_count,
@@ -1548,4 +1797,5 @@ class WebCrawler:
             has_multilang,
             blocked_reason,
             redirect_target_url,
+            queue_exhausted,
         )

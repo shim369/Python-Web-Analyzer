@@ -84,6 +84,10 @@ class SiteScraperService:
                 has_multilang_raw: bool = False
                 blocked_reason_raw: str = ""
                 redirect_target_url_raw: str = ""
+                # クロールが内部リンクを発見し尽くして自然に終了したか(True)、
+                # タイムアウト等で途中終了したか(False)。例外発生時は実際には不明なため、
+                # 保守的にFalse(＝クロール失敗とみなし「要確認」判定を維持)扱いにしておく。
+                queue_exhausted_raw: bool = False
 
                 # 1. SSL判定の実行
                 try:
@@ -102,7 +106,11 @@ class SiteScraperService:
                     is_always_ssl_val = ""
 
                 # 2. クローラー巡回
-                crawler = WebCrawler(render_js=True)
+                # render_js=True 時、トップページのJSフレームワーク検知でPlaywrightレンダリングが
+                # 走ると1回あたり15秒前後かかることがあるため、デフォルトのtimeout=30.0のままだと
+                # 2ページ目以降を巡回する前に全体タイムアウトへ到達してしまう。
+                # ここで明示的に余裕を持たせる。
+                crawler = WebCrawler(render_js=True, timeout=90.0, page_timeout=8.0)
                 try:
                     (
                         total_pages_fetched,
@@ -118,6 +126,7 @@ class SiteScraperService:
                         has_multilang_raw,
                         blocked_reason_raw,
                         redirect_target_url_raw,
+                        queue_exhausted_raw,
                     ) = crawler.crawl_and_analyze(item.domain_name)
                 except Exception as e:
                     logger.warning(f"[{item.domain_name}] クロール中に予期せぬエラーが発生しました: {e}")
@@ -128,6 +137,7 @@ class SiteScraperService:
                 has_multilang = bool(has_multilang_raw)
                 blocked_reason = str(blocked_reason_raw or "")
                 redirect_target_url = str(redirect_target_url_raw or "")
+                queue_exhausted = bool(queue_exhausted_raw)
 
                 # 文字列判定と数値へのクリーンアップ処理
                 if total_pages_fetched == "100ページ以上":
@@ -160,6 +170,7 @@ class SiteScraperService:
                         has_multilang=has_multilang,
                         html_src=html_src,
                         page_threshold=job.page_threshold,
+                        queue_exhausted=queue_exhausted,
                     )
 
                 # スレッドセーフに結果を書き込み
