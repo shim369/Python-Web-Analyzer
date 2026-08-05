@@ -21,7 +21,7 @@ def test_excel_export_and_import(tmp_path: Path) -> None:
             contact_fields="名前,メールアドレス",
             site_structure="Top -> Contact",
             cms_name="",
-            evaluation_result="◯",
+            evaluation_result="◎",
             rejection_reason="",
         )
     ]
