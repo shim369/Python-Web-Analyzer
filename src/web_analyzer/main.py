@@ -1,3 +1,4 @@
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -9,8 +10,12 @@ from web_analyzer.core.scraper_service import SiteScraperService
 from web_analyzer.models import ScrapingJob
 from web_analyzer.utils.logger import setup_logger
 
+# プロジェクトルートからの相対パスを指定
+ICON_PATH = os.path.join("docs", "images", "cursor_icon.ico")
+
 st.set_page_config(
     page_title="Web Site Analyzer",
+    page_icon=ICON_PATH,
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -22,7 +27,7 @@ st.iframe(
     document.addEventListener("visibilitychange", () => {
         if (document.visibilityState === "visible") {
             console.log("タブがアクティブになりました。3秒後に接続状態を確認します。");
-            
+
             setTimeout(() => {
                 if (!navigator.onLine) {
                     console.log("ネットワーク自体がオフラインです。");
@@ -32,7 +37,7 @@ st.iframe(
 
                 try {
                     const parentConnection = window.parent.__streamlit__?.connection;
-                    
+
                     if (parentConnection && (parentConnection._socket?.readyState === 3 || parentConnection._state === 'CLOSED')) {
                         console.log("StreamlitのWebSocketが復旧していないため、リロードします。");
                         window.parent.location.reload();
