@@ -1,3 +1,7 @@
+**English** | [日本語](README.md)
+
+---
+
 # Web Site Analyzer
 
 A GUI-based multi-domain website analysis and evaluation system, built for learning Python and as a portfolio project.

@@ -1,3 +1,7 @@
+[English](README.en.md) | **日本語**
+
+---
+
 # Web Site Analyzer
 
 Python学習およびポートフォリオ作成を目的として開発した、GUIベースのマルチドメインWebサイト解析・評価システムです。
