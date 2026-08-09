@@ -101,8 +101,17 @@ class RenewalEvaluator:
         return any(x in body_html for x in self.SEARCH_KEYWORDS)
 
     def _has_captcha(self, soup: BeautifulSoup) -> bool:
-        """<body>内に実際の画像認証要素が存在するか判定する。"""
+        """<body>内にCaptcha関連の実装が存在するか判定する。"""
         body = self._body(soup)
+
+        # reCAPTCHA / hCaptcha
+        if self._select_ui_elements(
+            soup,
+            ".g-recaptcha,.h-captcha,[class*='captcha' i],[id*='captcha' i]",
+        ):
+            return True
+
+        # CMS / プラグイン固有の画像認証
         body_html = str(body).lower()
 
         return any(keyword in body_html for keyword in self.CAPTCHA_KEYWORDS)
