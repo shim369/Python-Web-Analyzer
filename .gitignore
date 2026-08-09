@@ -17,3 +17,5 @@ wheels/
 logs/
 
 temp/
+
+data/
