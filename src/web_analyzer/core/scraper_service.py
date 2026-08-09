@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from web_analyzer.core.crawler import WebCrawler
 from web_analyzer.core.evaluator import RenewalEvaluator
+from web_analyzer.core.job_repository import JobRepository
 from web_analyzer.core.ssl_checker import SslChecker
 from web_analyzer.models import ScrapingJob, SiteAssessment
 
@@ -24,32 +25,55 @@ class SiteScraperService:
     # 5並列程度は一般的なマシンでも安定して動作する経験則値。
     DEFAULT_MAX_WORKERS = 5
 
-    def __init__(self, max_workers: int = DEFAULT_MAX_WORKERS) -> None:
+    def __init__(
+        self,
+        max_workers: int = DEFAULT_MAX_WORKERS,
+        repository: JobRepository | None = None,
+    ) -> None:
         self.ssl_checker = SslChecker()
         self._jobs_cache: dict[str, ScrapingJob] = {}
         self._results_cache: dict[str, list[SiteAssessment]] = {}
         self._lock = threading.Lock()
         self.max_workers = max_workers
+        # 永続化層。渡されなければ自前で1つ生成する(テスト等での差し替えを想定)。
+        self.repository = repository or JobRepository()
 
     def get_job_progress(self, job_id: str) -> tuple[ScrapingJob | None, list[SiteAssessment], int, int]:
-        """指定されたジョブの現在の進捗状況（進捗率、全件数、完了件数）を取得する。"""
+        """指定されたジョブの現在の進捗状況（進捗率、全件数、完了件数）を取得する。
+
+        メモリキャッシュに無い場合(プロセス再起動直後や、別セッションから
+        初めて参照された場合など)は、DBから復元してキャッシュに載せてから返す。
+        """
         with self._lock:
             job = self._jobs_cache.get(job_id)
             assessments = self._results_cache.get(job_id, [])
 
-            if not job or not assessments:
-                return None, [], 0, 0
+        if job is None:
+            job = self.repository.get_job(job_id)
+            if job is not None:
+                assessments = self.repository.get_assessments(job_id)
+                with self._lock:
+                    self._jobs_cache[job_id] = job
+                    self._results_cache[job_id] = assessments
 
-            completed_count = sum(1 for item in assessments if item.evaluation_result != "")
-            total_count = len(assessments)
+        if not job or not assessments:
+            return None, [], 0, 0
 
-            return job, assessments, total_count, completed_count
+        completed_count = sum(1 for item in assessments if item.evaluation_result != "")
+        total_count = len(assessments)
+
+        return job, assessments, total_count, completed_count
 
     def start_background_job(self, job: ScrapingJob, assessments: list[SiteAssessment]) -> None:
         """非同期スレッドを立ち上げて、バックグラウンドでのスクレイピングタスクを開始する。"""
         with self._lock:
             self._jobs_cache[job.id] = job
             self._results_cache[job.id] = assessments
+
+        # DBにも初期状態を書き込んでおく。ここで落ちてもUI側は「processing」の
+        # ままDBに残るだけなので、次回起動時のreconcile_interrupted_jobsで拾える。
+        self.repository.save_job(job)
+        self.repository.save_assessments(assessments)
 
         logger.info(f"ジョブを開始します: JOB_ID={job.id}, 対象件数={len(assessments)}件, 並列数={self.max_workers}")
         thread = threading.Thread(
@@ -246,6 +270,10 @@ class SiteScraperService:
             item.evaluation_result = eval_result
             item.rejection_reason = rejection_reason
 
+        # 1件処理し終えるたびにDBへ反映する。ジョブ全体が終わる前に
+        # プロセスが落ちても、ここまで完了した分の結果はディスクに残る。
+        self.repository.update_assessment(item)
+
         logger.info(f"[{job_id}] 解析完了: {item.domain_name} -> 判定: {eval_result}")
 
     def _update_job_status(self, job_id: str, status: str) -> None:
@@ -261,3 +289,6 @@ class SiteScraperService:
                     created_at=current_job.created_at,
                 )
                 self._jobs_cache[job_id] = updated_job
+
+        # メモリキャッシュと同様に、DB側のステータスも更新する。
+        self.repository.update_job_status(job_id, status)

@@ -19,7 +19,7 @@ def measure_time[F: Callable[..., Any]](func: F) -> F:
         result = func(*args, **kwargs)
         elapsed = timeit.default_timer() - start_time
 
-        logger.debug("Execution time for %s: %.3f seconds", func.__qualname__, elapsed)
+        logger.debug(f"Execution time for {func.__qualname__}: {elapsed:.3f} seconds")
         return result
 
     return wrapper  # type: ignore[return-value]
@@ -34,9 +34,9 @@ def log_action(action_name: str) -> Callable[[Any], Any]:
     def decorator[F: Callable[..., Any]](func: F) -> F:
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            logger.info("開始: %s", action_name)
+            logger.info(f"開始: {action_name}")
             result = func(*args, **kwargs)
-            logger.info("完了: %s", action_name)
+            logger.info(f"完了: {action_name}")
             return result
 
         return wrapper  # type: ignore[return-value]

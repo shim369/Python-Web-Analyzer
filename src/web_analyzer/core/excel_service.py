@@ -12,8 +12,39 @@ from web_analyzer.models import ScrapingJob, SiteAssessment
 from web_analyzer.utils.decorators import log_action
 
 
+def _estimate_wrapped_line_count(text: str, column_width: float) -> int:
+    """openpyxlの列幅(文字数相当)から、折り返し後のおおよその行数を見積もる。
+
+    Excel実機のフォントレンダリングと厳密には一致しない簡易近似だが、
+    「列幅に上限を設けたことで長文が縦方向に見切れる」のを防ぐため、
+    行の高さを決める目安として使う。
+    """
+    if not text:
+        return 1
+
+    # 列幅からセルの左右余白分を差し引いた、1行あたりのおおよその文字数
+    chars_per_line = max(int(column_width) - 2, 1)
+
+    total_lines = 0
+    for line in str(text).split("\n"):
+        # 全角文字を2文字として簡易計算(幅の自動調整ロジックと揃える)
+        char_len = sum(2 if ord(c) > 127 else 1 for c in line)
+        total_lines += max(1, -(-char_len // chars_per_line))  # 切り上げ除算
+
+    return total_lines
+
+
 class ExcelService:
     """Excelファイルのパースおよび生成を担当するサービス"""
+
+    # 中央揃えにする列番号(日付, 調査結果, SSL, 階層, ページ数, 担当)。
+    # それ以外は左揃え+折り返し(wrap_text)にする。
+    _CENTER_ALIGN_COLUMNS = {1, 3, 4, 5, 6, 9, 15}
+
+    # 折り返し対象列のうち、特に長文が入りうる列の幅に上限を設ける。
+    # 上限を超えた分は、後段の行高さ自動調整で縦方向に折り返して吸収する。
+    _WRAP_TEXT_COLUMNS = {2, 7, 8, 10, 11, 12, 13, 14}
+    _MAX_WRAP_COLUMN_WIDTH = 60
 
     @staticmethod
     def import_excel(
@@ -150,8 +181,9 @@ class ExcelService:
             ws.append(cleaned_row_data)
 
             # 追加したデータ行にデザインを適用（上揃え + 罫線 + フォント）
+            # 行の高さは、この後の自動調整パスで内容量に応じて設定するため、
+            # ここでは仮の値は入れない。
             current_row = ws.max_row
-            ws.row_dimensions[current_row].height = 20  # 各データ行の高さにも少し余裕を持たせる
 
             for col_idx in range(1, len(row_data) + 1):
                 cell = ws.cell(row=current_row, column=col_idx)
@@ -159,13 +191,15 @@ class ExcelService:
                 cell.border = thin_border
 
                 # 中央揃えにする列と、左揃え（上揃え）にする列を出し分ける
-                # 日付, 調査結果, SSL, 階層, ページ, 担当 などは中央揃えが美しい
-                if col_idx in [1, 3, 4, 5, 6, 9, 15]:
+                if col_idx in ExcelService._CENTER_ALIGN_COLUMNS:
                     cell.alignment = Alignment(horizontal="center", vertical="top")
                 else:
                     cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
 
         # --- 【自動調整】各列の幅をコンテンツの最大長に合わせて調整する ---
+        # (ただし長文が入りうる列は _MAX_WRAP_COLUMN_WIDTH で頭打ちにする)
+        column_widths: dict[int, float] = {}
+
         for col in ws.columns:
             max_len = 0
             # col[0].column が None の場合は処理をスキップ（型安全性の確保）
@@ -186,6 +220,38 @@ class ExcelService:
                             max_len = val_len
 
             # 少し余白（パディング）を足して、最低幅も保証する
-            ws.column_dimensions[col_letter].width = max(max_len + 4, 10)
+            width: float = float(max(max_len + 4, 10))
+
+            if col_num in ExcelService._WRAP_TEXT_COLUMNS:
+                # 1件でも極端に長い文章が入ると、その列だけ異常に幅広くなって
+                # シート全体が横長になってしまうため、上限を設ける。
+                # 上限を超えた分は縦方向の折り返しで表現する。
+                width = min(width, ExcelService._MAX_WRAP_COLUMN_WIDTH)
+
+            ws.column_dimensions[col_letter].width = width
+            column_widths[col_num] = width
+
+        # --- 【自動調整】折り返し列(wrap_text)の内容量に応じて、各データ行の高さを調整する ---
+        # 列幅に上限を設けたことで折り返し行数が増えている可能性があるため、
+        # 実際に使われた列幅をもとに折り返し後の行数を見積もり、行の高さに反映する。
+        for row_cells in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            max_lines_in_row = 1
+
+            for cell in row_cells:
+                if cell.column in ExcelService._WRAP_TEXT_COLUMNS and cell.value is not None:
+                    width = column_widths.get(cell.column, ExcelService._MAX_WRAP_COLUMN_WIDTH)
+                    max_lines_in_row = max(
+                        max_lines_in_row,
+                        _estimate_wrapped_line_count(str(cell.value), width),
+                    )
+
+            # 1行(pt)あたり15pt + 余白5pt を目安に、最低でも20ptは確保する。
+            row_index = row_cells[0].row
+            assert row_index is not None
+
+            ws.row_dimensions[row_index].height = max(
+                20,
+                max_lines_in_row * 15 + 5,
+            )
 
         wb.save(str(output_path))

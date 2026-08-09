@@ -1,11 +1,38 @@
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 
 class RenewalEvaluator:
-    """Webサイトのリニューアル可否を複数の判定基準から総合的に判定する。"""
+    """Improved RenewalEvaluator (excerpt). Replace your class with this version as needed."""
 
-    CAPTCHA_KEYWORDS = ["captcha", "g-recaptcha", "hcaptcha", "認証コード", "ccm-captcha-image"]
-    CHATBOT_KEYWORDS = ["sinclo", "chamo", "zendesk", "channel.io", "hubspot-messages", "chatbot", "intercom", "crisp", "tidio", "chatplus"]
+    # reCAPTCHA/hCaptcha自体はウィジェットが読み込まれているだけで、
+    # 実際にユーザーへ「画像内の文字を入力させる」認証があるとは限らないため
+    # (invisible/チェックボックス型のことも多い)、判定対象には含めない。
+    # ここでは、実際にそうした画像認証を実装していると確認できている
+    # プラグイン固有のクラス名/識別子のみを対象にする。
+    CAPTCHA_KEYWORDS = [
+        "image_auth_jp",  # WordPress: 画像認証(ひらがな)プラグイン (Contact Form 7用)
+        "ccm-captcha-image",  # Concrete CMS: 画像認証のimgタグ
+        "ccm-input-captcha",  # Concrete CMS: 画像認証の入力欄
+    ]
+    # ブランド名だけの単語は一般名詞や無関係な文脈と衝突しやすいため
+    # (例: "chatbot"はそれ自体が一般用語、"intercom"は「インターホン」の意味でも使われる)、
+    # 可能な限り各サービスのスクリプト読み込み元ドメインなど、実際に埋め込まれた
+    # ときにしか出現しない固有の文字列を使う。
+    CHATBOT_KEYWORDS = [
+        "ws1.sinclo.jp",  # sinclo
+        "chamo",  # Chamo
+        "zdassets.com",
+        "zopim.com",  # Zendesk Chat
+        "cdn.channel.io",  # channel.io
+        "hubspot-messages",  # HubSpot Conversations
+        "widget.intercom.io",  # Intercom
+        "client.crisp.chat",  # Crisp
+        "code.tidio.co",  # Tidio
+        "chatplus.jp",  # ChatPlus
+        "salesiq.zohopublic",  # Zoho SalesIQ
+        "dynameet.ai",  # Dynameet
+        "larubot.tokyo",  # Larubot
+    ]
     CALENDAR_KEYWORDS = ["wp-calendar", "xo-event-calendar"]
     SEARCH_KEYWORDS = ["絞り込み検索", "条件検索", "サイト内検索", "キーワード検索"]
     RICH_UI_KEYWORDS = ["lightbox", "fancybox", "data-lightbox"]
@@ -16,37 +43,131 @@ class RenewalEvaluator:
     def _soup(self, html: str) -> BeautifulSoup:
         return BeautifulSoup(html or "", "html.parser")
 
+    def _body(self, soup: BeautifulSoup) -> Tag | BeautifulSoup:
+        """判定対象を<body>内に限定する。bodyが無ければ従来通り全体を返す。"""
+        return soup.body or soup
+
+    def _select_ui_elements(self, soup: BeautifulSoup, selector: str) -> list[Tag]:
+        """<body>内のUI要素を検索し、<link>や<script>などのアセットタグを除外する"""
+        body = self._body(soup)
+        elements = body.select(selector)
+        return [el for el in elements if el.name not in ("link", "script", "style", "meta")]
+
     def _has_calendar(self, soup: BeautifulSoup) -> bool:
-        return bool(soup.select(".wp-calendar,.xo-event-calendar,iframe[src*='calendar.google' i],[class*='calendar' i],[id*='calendar' i]"))
+        return bool(self._select_ui_elements(soup, ".wp-calendar,.xo-event-calendar,iframe[src*='calendar.google' i],[class*='calendar' i],[id*='calendar' i]"))
 
     def _has_accordion(self, soup: BeautifulSoup) -> bool:
-        # クラス名の完全一致(.accordion)だけだと、WordPressテーマ等でよくある
-        # "js-accordion"・"elementor-accordion"のような接頭辞/接尾辞付きクラス名を
-        # 見逃してしまうため、calendarと同様に部分一致([class*=...])も併用する。
-        return bool(soup.select(".accordion,[data-bs-toggle='collapse'],details,[class*='accordion' i],[id*='accordion' i]"))
+        return bool(self._select_ui_elements(soup, ".accordion,[data-bs-toggle='collapse'],details,[class*='accordion' i],[id*='accordion' i]"))
 
     def _has_tabs(self, soup: BeautifulSoup) -> bool:
-        return bool(soup.select("[role='tab'],.nav-tabs,[data-bs-toggle='tab'],[class*='tabs' i],[class*='tab-content' i],[id*='tabs' i]"))
+        return bool(self._select_ui_elements(soup, "[role='tab'],.nav-tabs,[data-bs-toggle='tab'],[class*='tabs' i],[class*='tab-content' i],[id*='tabs' i]"))
 
     def _has_modal(self, soup: BeautifulSoup) -> bool:
-        return bool(soup.select(".modal,.modal-dialog,[data-bs-toggle='modal'],[class*='modal' i],[id*='modal' i]"))
+        return bool(self._select_ui_elements(soup, ".modal,.modal-dialog,[data-bs-toggle='modal'],[class*='modal' i],[id*='modal' i]"))
 
     def _has_floating(self, soup: BeautifulSoup) -> bool:
-        for tag in soup.find_all(True):
+        body = self._body(soup)
+
+        for tag in body.find_all(True):
+            # <link> や <script> などのアセットタグはアコーディオン等の属性ID誤検知を防ぐため除外
+            if tag.name in ("link", "script", "style", "meta"):
+                continue
+
             cls = " ".join(tag.get("class", [])).lower()
-            # "floating"を復活。外部CSS側でposition:fixedを指定する実装が多く、
-            # インラインスタイルのチェックだけでは見逃しやすいクラス名ベースの判定を主にする。
-            if any(x in cls for x in ("floating", "pagetop", "to-top", "fixed-btn", "follow-window")):
+
+            if any(
+                x in cls
+                for x in (
+                    "floating",
+                    "fixed-btn",
+                    "follow-window",
+                )
+            ):
                 return True
+
             style = (tag.get("style") or "").replace(" ", "").lower()
             if "position:fixed" in style:
                 return True
+
         return False
 
     def _has_search(self, soup: BeautifulSoup, html: str) -> bool:
-        if soup.find("input", {"type": "search"}):
+        body = self._body(soup)
+
+        if body.find("input", {"type": "search"}):
             return True
-        return any(x in html for x in self.SEARCH_KEYWORDS)
+
+        body_html = str(body).lower()
+        return any(x in body_html for x in self.SEARCH_KEYWORDS)
+
+    def _has_captcha(self, soup: BeautifulSoup) -> bool:
+        """<body>内に実際の画像認証要素が存在するか判定する。"""
+        body = self._body(soup)
+        body_html = str(body).lower()
+
+        return any(keyword in body_html for keyword in self.CAPTCHA_KEYWORDS)
+
+    def _has_chatbot(self, soup: BeautifulSoup) -> bool:
+        """<body>内にチャットボット本体が存在するか判定する。"""
+        body = self._body(soup)
+        body_html = str(body).lower()
+
+        return any(keyword in body_html for keyword in self.CHATBOT_KEYWORDS)
+
+    def _has_video(self, soup: BeautifulSoup) -> bool:
+        """<body>内に実際の動画要素・埋め込みが存在するか判定する。"""
+        body = self._body(soup)
+
+        # HTML要素としてのvideo
+        if body.find("video"):
+            return True
+
+        # YouTube / Vimeo等のiframe
+        for iframe in body.find_all("iframe"):
+            src = (iframe.get("src") or "").lower()
+
+            if any(
+                keyword in src
+                for keyword in (
+                    "youtube.com/embed",
+                    "youtu.be",
+                    "vimeo.com",
+                    "player.vimeo",
+                )
+            ):
+                return True
+
+        return False
+
+    def _has_rich_ui(self, soup: BeautifulSoup) -> bool:
+        """<body>内にLightbox等の実際のリッチUI要素が存在するか判定する。"""
+        return bool(
+            self._select_ui_elements(
+                soup,
+                ".lightbox,.fancybox,[data-lightbox],[class*='lightbox' i],[class*='fancybox' i],[id*='lightbox' i],[id*='fancybox' i]",
+            )
+        )
+
+    def _has_multilang(self, soup: BeautifulSoup) -> bool:
+        """<body>内に実際の多言語切り替えUIが存在するか判定する。"""
+        body = self._body(soup)
+        body_html = str(body).lower()
+
+        # 明確な言語切り替え用クラス・ID・属性
+        if self._select_ui_elements(
+            soup,
+            "[class*='language' i],[class*='lang-' i],[class*='lang_' i],[id*='language' i],[id*='lang-' i],[id*='lang_' i],[class*='言語' i],[id*='言語' i]",
+        ):
+            return True
+
+        return any(keyword in body_html for keyword in self.MULTILANG_KEYWORDS)
+
+    def _has_scroll_animation(self, soup: BeautifulSoup) -> bool:
+        """<body>内にスクロールアニメーション関連の実装が存在するか判定する。"""
+        body = self._body(soup)
+        body_html = str(body).lower()
+
+        return any(keyword in body_html for keyword in self.SCROLL_ANIMATION_KEYWORDS)
 
     def decide(
         self,
@@ -157,7 +278,7 @@ class RenewalEvaluator:
         soup = self._soup(html_src)
 
         # --- お問い合わせフォームの特殊仕様 ---
-        if any(k in html_lower for k in self.CAPTCHA_KEYWORDS):
+        if self._has_captcha(soup):
             reasons.append("お問い合わせフォームで画像認証（Captcha）を使用しているため")
 
         # --- 専用機能の検知 ---
@@ -167,11 +288,11 @@ class RenewalEvaluator:
         if self._has_search(soup, html_lower):
             reasons.append("サイト内検索・絞り込み検索機能があるため")
 
-        if any(k in html_lower for k in self.CHATBOT_KEYWORDS):
+        if self._has_chatbot(soup):
             reasons.append("チャットボットが導入されているため")
 
         # --- デザイン・ギミック面 ---
-        if any(k in html_lower for k in self.VIDEO_KEYWORDS):
+        if self._has_video(soup):
             reasons.append("トップイメージ等に動画が使用されているため")
 
         if self._has_floating(soup):
@@ -187,13 +308,13 @@ class RenewalEvaluator:
             reasons.append("モーダルウィンドウが使用されているため")
 
         # --- リッチコンテンツ ---
-        if any(k in html_lower for k in self.RICH_UI_KEYWORDS):
+        if self._has_rich_ui(soup):
             reasons.append("ギャラリーコンテンツ（Lightbox等）が導入されているため")
 
-        if not has_multilang and any(k in html_lower for k in self.MULTILANG_KEYWORDS):
+        if not has_multilang and self._has_multilang(soup):
             reasons.append("多言語対応（言語切り替え機能）があるため")
 
-        if any(k in html_lower for k in self.SCROLL_ANIMATION_KEYWORDS):
+        if self._has_scroll_animation(soup):
             reasons.append("スクロールアニメーション（GSAP等）が多用されているため")
 
         if reasons:

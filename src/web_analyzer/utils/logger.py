@@ -48,7 +48,7 @@ def setup_logger(level: int = logging.DEBUG) -> None:
     }
 
     logging.config.dictConfig(config)
-    logging.info("ロガーを初期化しました。新規ログファイル: %s", log_file)
+    logging.info(f"ロガーを初期化しました。新規ログファイル: {log_file}")
 
 
 def get_logger(name: str) -> logging.Logger:

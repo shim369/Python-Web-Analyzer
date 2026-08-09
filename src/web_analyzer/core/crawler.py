@@ -60,6 +60,26 @@ class WebCrawler:
         r"必須",
         r"[Rr]equired",
         r"[Rr]equire",
+    ]
+
+    # 「任意」（＝入力必須ではない）マークとして除去する表記のバリエーション。
+    # 必須マークと同様に、丸括弧等で囲まれた完全形を先に置き、単体の「任意」より
+    # 前に評価されるようにする（re.sub は各位置でリスト先頭から順に試すため、
+    # 順序を逆にすると括弧だけが残ってしまう）。
+    OPTIONAL_MARK_PATTERNS = [
+        r"【任意】",
+        r"（任意）",
+        r"\(任意\)",
+        r"※任意",
+        r"任意項目",
+        r"\(\s*[Oo]ptional\s*\)",
+        r"（\s*[Oo]ptional\s*）",
+        r"任意",
+        r"[Oo]ptional",
+    ]
+
+    # 必須・任意どちらのマークにも付随しがちな装飾記号
+    _DECORATION_SYMBOL_PATTERNS = [
         r"※",
         r"＊",
         r"\*",
@@ -67,7 +87,8 @@ class WebCrawler:
         r"●",
         r"◆",
     ]
-    _REQUIRED_MARK_RE = re.compile("|".join(REQUIRED_MARK_PATTERNS))
+
+    _LABEL_MARK_RE = re.compile("|".join(REQUIRED_MARK_PATTERNS + OPTIONAL_MARK_PATTERNS + _DECORATION_SYMBOL_PATTERNS))
     _EMPTY_PARENS_RE = re.compile(r"[\(（]\s*[\)）]")
 
     # お問い合わせページ判定用キーワード(日英混在)
@@ -110,6 +131,11 @@ class WebCrawler:
         "remix",
         "astro-island",
     ]
+
+    # CMSの自動生成抜粋(excerpt)が文の途中で切れているサインとなる省略記号。
+    # 例:「岡山建設は、あなたの住居に対する理想をカタチに...」のように、
+    # 意味の切れたテキストがそのまま「用途」列に入ってしまうのを防ぐために使う。
+    TRUNCATION_MARKERS = ("...", "…", "・・・")
 
     # フォームらしきコンテナ(form要素が無い場合の代替検出用)
     _FORM_LIKE_CLASS_RE = re.compile(r"form|contact|inquiry|entry", re.I)
@@ -315,15 +341,67 @@ class WebCrawler:
         return ""
 
     def _detect_js_framework(self, html: str) -> str:
-        """SPA/CSRフレームワークの利用有無を検知する(フォーム取得漏れの原因切り分け用)。"""
+        """SPA/CSRフレームワークの利用有無を検知する(フォーム取得漏れの原因切り分け用)。
+
+        既知フレームワークの目印文字列に加えて、<body>の可視テキストがほぼ空で
+        外部スクリプトの読み込みだけがある「空のシェルHTML」も検知対象にする。
+        Vue CLI等が生成する最小限のindex.html(<div id="app"></div>だけ)は、
+        vue.js/data-v-のような目印文字列を実際には一切含まないことがあり、
+        キーワード一致だけでは検知漏れ(=Playwright再レンダリングが発動しない)
+        になってしまうため。
+        """
         html_lower = html.lower()
         for marker in self.JS_FRAMEWORK_MARKERS:
             if marker in html_lower:
                 return marker
+
+        if self._looks_like_empty_js_shell(html):
+            return "empty-shell(推定SPA)"
+
         return ""
 
+    def _looks_like_empty_js_shell(self, html: str) -> bool:
+        """<body>の可視テキストがほぼ空で、外部スクリプトの読み込みだけがある
+        「空のシェルHTML」かどうかを判定する。
+
+        既知フレームワークの目印文字列を含まないSPAのindex.html(初期状態)を
+        補足的に検知するためのヒューリスティック。可視テキストが極端に短く
+        (目安80文字未満)、かつナビゲーションリンクもほとんど無く(3個以下)、
+        外部スクリプト(<script src>)が存在する場合にTrueを返す。
+        リンク数も条件に含めるのは、単に文章が短いだけの通常の静的ページ
+        (ナビゲーションメニューやフッターのリンクは持っている)を誤って
+        「空のシェル」と判定しないようにするため。
+        """
+        try:
+            soup = BeautifulSoup(html, HTML_PARSER)
+        except Exception:
+            return False
+
+        body = soup.body
+        if body is None:
+            return False
+
+        visible_text = body.get_text(strip=True)
+        has_external_script = bool(soup.select("script[src]"))
+        link_count = len(body.find_all("a"))
+
+        return len(visible_text) < 80 and link_count <= 3 and has_external_script
+
+    def _is_truncated_text(self, text: str) -> bool:
+        """CMSが自動生成した抜粋等が、省略記号で途中打ち切りになっているか判定する。
+
+        「...」や「…」が含まれるテキストは、文の途中でぶつ切りになっている
+        可能性が高く、そのまま「用途」列に出すには不適切なため、この判定に
+        引っかかった候補は使わず、次の優先順位の候補(title > h1)を見に行く。
+        """
+        return any(marker in text for marker in self.TRUNCATION_MARKERS)
+
     def _extract_purpose_and_features(self, html: str) -> str:
-        """HTMLから優先順位(description > title > h1)に従って文字列をそのまま抽出する"""
+        """HTMLから優先順位(description > title > h1)に従って文字列をそのまま抽出する。
+
+        ただし、省略記号(...や…)を含み文の途中で切れていると判断できる候補は
+        スキップし、次の優先順位の候補を見に行く。
+        """
         if not html:
             return ""
 
@@ -333,18 +411,18 @@ class WebCrawler:
         if desc_tag and isinstance(desc_tag, Tag):
             content_attr = desc_tag.get("content", "")
             desc_text = ("".join(content_attr) if isinstance(content_attr, list) else str(content_attr)).strip()
-            if desc_text:
+            if desc_text and not self._is_truncated_text(desc_text):
                 return desc_text
 
         if soup.title and soup.title.string:
             title_text = soup.title.string.strip()
-            if title_text:
+            if title_text and not self._is_truncated_text(title_text):
                 return title_text
 
         h1_tag = soup.find("h1")
         if h1_tag and isinstance(h1_tag, Tag):
             h1_text = h1_tag.get_text(strip=True)
-            if h1_text:
+            if h1_text and not self._is_truncated_text(h1_text):
                 return h1_text
 
         return ""
@@ -425,16 +503,27 @@ class WebCrawler:
             except Exception:
                 return response.content.decode("utf-8", errors="replace")
 
-    def _fetch_rendered_html(self, url: str) -> tuple[str, str]:
-        """Playwrightが利用可能ならレンダリング後のHTMLと最終URLを取得する。
+    def _fetch_rendered_html(self, url: str) -> tuple[str, str, int | None, str]:
+        """Playwrightが利用可能ならレンダリング後のHTML・最終URL・HTTPステータスコード・
+        (ナビゲーション自体が失敗した場合の)理由文を取得する。
 
-        未導入時/失敗時は ("", "") を返す。
+        未導入時/失敗時は ("", "", None, "") を返す。ステータスコードは、取得した
+        HTMLが403 Forbidden等のエラーページ本体でないかを呼び出し側で判定する
+        ために必要(httpxと違いPlaywrightのgoto()は4xx/5xxでも例外を投げず、
+        エラーページのHTMLをそのまま返してしまうため)。
+
+        また、DNS解決失敗や接続拒否などでナビゲーション自体が失敗した場合、
+        Chromeは内部の「chrome-error://chromewebdata/」という特殊URLに遷移し、
+        page.content()はChrome自身が生成した簡易エラーページのHTMLを返してしまう。
+        これを実サイトの内容として扱うと、このURLがそのまま「移転先」として
+        記録される等の誤動作につながるため、ここで検知して空文字を返し、
+        代わりに原因を分類した理由文を4番目の戻り値として返す。
         """
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
             logger.warning("Playwright未インストールのためJSレンダリングをスキップします: %s", url)
-            return "", ""
+            return "", "", None, ""
 
         try:
             with sync_playwright() as p:
@@ -452,14 +541,19 @@ class WebCrawler:
                 page = context.new_page()
 
                 render_timeout_ms = max(self.page_timeout, 15.0) * 1000
+                status_code: int | None = None
+                goto_error: Exception | None = None
 
-                # networkidle ではなく domcontentloaded や commit で素早く受け取りを開始する
+                # 改善ポイント: networkidle ではなく domcontentloaded や commit で素早く受け取りを開始する
                 try:
-                    page.goto(url, timeout=render_timeout_ms, wait_until="domcontentloaded")
+                    nav_response = page.goto(url, timeout=render_timeout_ms, wait_until="domcontentloaded")
+                    if nav_response is not None:
+                        status_code = nav_response.status
                     # 接続直後に少しだけレンダリングを待つ
                     page.wait_for_timeout(1500)
                 except Exception as goto_err:
                     # 完全に切断される前に取れたデータがあれば続行を試みる
+                    goto_error = goto_err
                     logger.debug("goto完了前に例外が発生しましたが処理を継続します: %s", goto_err)
 
                 html = ""
@@ -479,10 +573,42 @@ class WebCrawler:
                 if last_error is not None and not html:
                     raise last_error
 
-                return html, final_url
+                # ナビゲーション自体が失敗している場合(chrome-error://等のブラウザ内部URLに
+                # 遷移している場合)、page.content()で取れた中身はChrome自身が生成した簡易
+                # エラーページに過ぎず、実サイトの内容ではないため、取得成功として扱わない。
+                if final_url.startswith(("chrome-error://", "chrome://", "about:")):
+                    nav_reason = self._describe_playwright_navigation_error(goto_error, final_url)
+                    return "", "", None, nav_reason
+
+                return html, final_url, status_code, ""
         except Exception as e:
             logger.warning("Playwrightによる取得に失敗しました(%s): %s", url, e)
-            return "", ""
+            return "", "", None, ""
+
+    def _describe_playwright_navigation_error(self, error: Exception | None, final_url: str) -> str:
+        """Playwrightでのページ遷移そのものが失敗した場合に、例外メッセージから
+        原因を分類し、M列にそのまま出力できる理由文を生成する。
+
+        (例: DNS_PROBE_FINISHED_NXDOMAIN, ERR_CONNECTION_CLOSED, ERR_CONNECTION_REFUSED等)
+        原因を特定できない場合も、最低限「取得できなかった」ことは明示する。
+        """
+        message = str(error).lower() if error else ""
+
+        if "name_not_resolved" in message or "nxdomain" in message or "dns" in message:
+            return "ドメイン名を解決できませんでした（DNSエラー）。ドメインが失効している、または既に閉鎖されている可能性が高いため、手動確認をお願いします。"
+        if "connection_refused" in message:
+            return "接続が拒否されました。サーバーが停止している、または閉鎖されている可能性が高いため、手動確認をお願いします。"
+        if "connection_closed" in message or "connection_reset" in message:
+            return "接続が途中で切断されました。サーバーが停止している、または閉鎖されている可能性が高いため、手動確認をお願いします。"
+        if "timed_out" in message or "timeout" in message:
+            return "接続がタイムアウトしました。サーバーが応答していない可能性が高いため、手動確認をお願いします。"
+        if "cert" in message or "ssl" in message:
+            return "SSL証明書関連のエラーにより接続できませんでした。手動確認をお願いします。"
+
+        if final_url.startswith("chrome-error://"):
+            return "ブラウザでのページ表示に失敗したため、実際のサイト内容を取得できませんでした。手動確認をお願いします。"
+
+        return ""
 
     # ------------------------------------------------------------------
     # JS遷移リンクの検知
@@ -719,8 +845,8 @@ class WebCrawler:
     # フォーム項目抽出
     # ------------------------------------------------------------------
 
-    def _remove_required_marks(self, text: str) -> str:
-        text = self._REQUIRED_MARK_RE.sub("", text)
+    def _clean_label_text(self, text: str) -> str:
+        text = self._LABEL_MARK_RE.sub("", text)
         text = self._EMPTY_PARENS_RE.sub("", text)
         return re.sub(r"^[\s\xa0\n\r]+|[\s\xa0\n\r]+$", "", text)
 
@@ -868,7 +994,7 @@ class WebCrawler:
 
                 # 1. 厳格な仕様に基づくラベル（id/for, aria）
                 txt_a = self._get_label_for_input(inp, form, soup)
-                txt_a = self._remove_required_marks(txt_a)
+                txt_a = self._clean_label_text(txt_a)
                 if txt_a and len(txt_a) < 50 and any(c for c in txt_a if ord(c) > 0x7F):
                     resolved_text = txt_a
 
@@ -882,14 +1008,14 @@ class WebCrawler:
                         if parent.name == "dd":
                             prev_dts = parent.find_previous_siblings("dt")
                             if prev_dts:
-                                resolved_text = self._remove_required_marks(prev_dts[0].get_text(strip=True))
+                                resolved_text = self._clean_label_text(prev_dts[0].get_text(strip=True))
                                 break
 
                         # table/tr/th 構造
                         if parent.name == "td":
                             prev_ths = parent.find_previous_siblings("th")
                             if prev_ths:
-                                resolved_text = self._remove_required_marks(prev_ths[0].get_text(strip=True))
+                                resolved_text = self._clean_label_text(prev_ths[0].get_text(strip=True))
                                 break
 
                         # 直前の兄弟要素
@@ -898,17 +1024,48 @@ class WebCrawler:
                         if siblings and isinstance(siblings[0], Tag):
                             # 2. Tag 型であることが保証されたため、安全に .find() が呼べる
                             if not siblings[0].find(["input", "textarea", "select"]):
-                                t = self._remove_required_marks(siblings[0].get_text(strip=True))
+                                t = self._clean_label_text(siblings[0].get_text(strip=True))
                                 if t and len(t) < 50 and any(c for c in t if ord(c) > 0x7F):
                                     resolved_text = t
                                     break
 
-                # 3. 最終フォールバック（属性値）
+                # 3. 入力欄を直接くるむ最小ブロックのテキストを拾う（タグなしラベル対策）
+                #    Contact Form 7 の標準テンプレートは
+                #      <p>お名前<br /><span class="wpcf7-form-control-wrap ..."><input ...></span></p>
+                #    のように、ラベル文字列がどのタグにも囲まれない「生のテキストノード」に
+                #    なっていることが多い。dl/dt・table/th・タグの兄弟要素を探す上記2.の方法は
+                #    タグ名でしか探索しないため、この生テキストは一切ヒットせず、結果として
+                #    ③の属性フォールバック（name属性等）まで落ちて "your-name" や "tel-397" の
+                #    ようなCF7内部の生スラッグがそのまま出力されてしまう。
+                #    ここでは、入力欄を含む最小のブロック要素まで遡り、「有効な入力欄がその1つ
+                #    だけ」であることを条件に、そのブロックのテキストを丸ごとラベル候補として使う。
+                #    他の入力欄が同居するブロックまで遡ってしまうと複数フィールド分のテキストが
+                #    混ざるため、そこで探索を打ち切る（親に行くほど入力欄の数は減らないため、
+                #    2個以上になった時点で以降の祖先を見ても意味がない）。
+                if not resolved_text:
+                    for parent in inp.parents:
+                        if parent is form or not isinstance(parent, Tag):
+                            break
+
+                        block_inputs = [
+                            el
+                            for el in parent.find_all(["input", "textarea", "select"])
+                            if isinstance(el, Tag) and str(el.get("type", "text")).lower().strip() not in ["hidden", "submit", "button", "image", "reset"]
+                        ]
+                        if len(block_inputs) != 1:
+                            break
+
+                        block_text = self._clean_label_text(parent.get_text(strip=True))
+                        if block_text and len(block_text) < 50 and any(c for c in block_text if ord(c) > 0x7F):
+                            resolved_text = block_text
+                            break
+
+                # 4. 最終フォールバック（属性値）
                 if not resolved_text:
                     for attr in ("placeholder", "aria-label", "title", "name"):
                         val = inp.get(attr)
                         if val:
-                            t = self._remove_required_marks(str(val).strip())
+                            t = self._clean_label_text(str(val).strip())
                             if t and len(t) < 50:
                                 resolved_text = t
                                 break
@@ -1008,6 +1165,12 @@ class WebCrawler:
         if not target_url:
             return ""
 
+        # ブラウザ内部の特殊スキーム(chrome-error://等)が誤って抽出された場合の保険。
+        # 通常は_fetch_rendered_html側で弾かれるため、ここに来ることは無いはずだが、
+        # 万一に備えて多重に防御しておく。
+        if target_url.startswith(("chrome-error://", "chrome://", "about:")):
+            return ""
+
         # 相対URLの場合は絶対URLに変換したうえで、ドメインが実際に異なる場合のみ「移転」とみなす
         # (同一ドメイン内でのhttps化・パス変更等は対象外)
         absolute_target = urljoin(current_url, target_url)
@@ -1016,6 +1179,27 @@ class WebCrawler:
         if target_domain_clean and target_domain_clean != base_domain_clean:
             return absolute_target
 
+        return ""
+
+    def _reason_for_status_code(self, status_code: int) -> str:
+        """4xx/5xxのHTTPステータスコードから、M列にそのまま出力できる理由文を生成する。
+
+        httpxの例外(HTTPStatusError)経由・Playwrightのレスポンス経由のどちらから
+        呼ばれても同じ文言を返せるように共通化したもの。200番台等、正常系の
+        ステータスコードを渡した場合は空文字を返す。
+        """
+        if status_code == 403:
+            return (
+                "アクセス先のサーバーから403 Forbidden（アクセス拒否）が返されたため、"
+                "実際のサイト内容を取得できませんでした。ネットワーク機器の問題ではなく、"
+                "サーバー側のボット対策等によるアクセス制限の可能性が高いため、手動確認をお願いします。"
+            )
+        if status_code == 429:
+            return "アクセス先のサーバーから429 Too Many Requests（レート制限）が返されたため、実際のサイト内容を取得できませんでした。時間を置いての再調査、または手動確認をお願いします。"
+        if status_code >= 500:
+            return f"アクセス先のサーバーでエラー（HTTPステータス {status_code}）が発生しているため、実際のサイト内容を取得できませんでした。手動確認をお願いします。"
+        if status_code >= 400:
+            return f"アクセス先のサーバーからHTTPステータス{status_code}が返されたため、実際のサイト内容を取得できませんでした。手動確認をお願いします。"
         return ""
 
     def _classify_connection_error(self, error: Exception | None) -> str:
@@ -1039,19 +1223,9 @@ class WebCrawler:
         # ネットワーク機器ではなくアクセス先のサーバー自身が拒否しているケースを区別する。
         # raise_for_status() が投げる例外なので、response からHTTPステータスコードを直接判定できる。
         if isinstance(error, httpx.HTTPStatusError):
-            status = error.response.status_code
-            if status == 403:
-                return (
-                    "アクセス先のサーバーから403 Forbidden（アクセス拒否）が返されたため、"
-                    "実際のサイト内容を取得できませんでした。ネットワーク機器の問題ではなく、"
-                    "サーバー側のボット対策等によるアクセス制限の可能性が高いため、手動確認をお願いします。"
-                )
-            if status == 429:
-                return (
-                    "アクセス先のサーバーから429 Too Many Requests（レート制限）が返されたため、実際のサイト内容を取得できませんでした。時間を置いての再調査、または手動確認をお願いします。"
-                )
-            if status >= 500:
-                return f"アクセス先のサーバーでエラー（HTTPステータス {status}）が発生しているため、実際のサイト内容を取得できませんでした。手動確認をお願いします。"
+            reason = self._reason_for_status_code(error.response.status_code)
+            if reason:
+                return reason
 
         err_text = str(error).lower()
         ssl_error_keywords = [
@@ -1293,11 +1467,13 @@ class WebCrawler:
                     if detected_block_reason:
                         blocked_reason = detected_block_reason
                     response.raise_for_status()
-                    first_url = str(response.url)
-                    first_html = candidate_html
+                    if not detected_block_reason:
+                        first_url = str(response.url)
+                        first_html = candidate_html
+                        blocked_reason = ""
                 except Exception as e:
                     primary_error = e
-                    if not blocked_reason and fallback_url:
+                    if fallback_url:
                         try:
                             response = client.get(fallback_url)
                             if response.status_code == 401:
@@ -1307,43 +1483,70 @@ class WebCrawler:
                             if detected_block_reason:
                                 blocked_reason = detected_block_reason
                             response.raise_for_status()
-                            first_url = str(response.url)
-                            first_html = candidate_html
+                            if not detected_block_reason:
+                                first_url = str(response.url)
+                                first_html = candidate_html
+                                blocked_reason = ""
                         except Exception as e2:
                             fallback_error = e2
 
-                if blocked_reason:
-                    # httpxのレスポンス本文だけでネットワーク機器のブロックページと確定できたため、
-                    # 時間のかかるPlaywrightフォールバックを試すまでもなく、ここで打ち切る。
-                    return (
-                        0,
-                        0,
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                        False,
-                        False,
-                        has_basic_auth,
-                        False,
-                        blocked_reason,
-                        "",
-                        True,
-                    )
-
+                # httpx側でブロックページらしきものを検知していても(blocked_reasonが
+                # 非空でも)、ここでは即断せずPlaywright(実ブラウザ)での再確認を試みる。
+                # Fortinet Webfilter等のセキュリティ機器が、ブラウザからの通常アクセス
+                # ではなく本ツールのような自動化ツールのアクセスだけを狙い撃ちで
+                # ブロックするケースが実際にあり(ono-and.comで確認)、httpx側の検知
+                # だけで確定させると、人間なら普通に見られるサイトを誤って
+                # 「アクセス不可」扱いにしてしまう。
                 if not first_url and self.render_js:
-                    # httpxでの初回取得が両方(https/http)とも失敗した場合、WAF/ボット対策等で
-                    # httpxクライアントのみブロックされている可能性があるため、
-                    # 最後の手段として実ブラウザ(Playwright)での取得を試みる。
-                    rendered_html, rendered_url = self._fetch_rendered_html(primary_url)
+                    rendered_html, rendered_url, rendered_status, nav_error_reason = self._fetch_rendered_html(primary_url)
                     if rendered_html:
+                        # Playwrightのgoto()はhttpxのraise_for_status()と違い、4xx/5xxでも
+                        # 例外を投げずにエラーページのHTML本体をそのまま返してしまうため、
+                        # ここでも同様にブロックページ検知を行う。
+                        detected_block_reason = self._detect_access_blocked_page(rendered_html)
+                        if not detected_block_reason and rendered_status is not None:
+                            detected_block_reason = self._reason_for_status_code(rendered_status)
+
+                        if detected_block_reason:
+                            # 実ブラウザ(Playwright)でもブロックされた場合のみ、
+                            # 最終的に「アクセス不可」と確定する。
+                            return (
+                                0,
+                                0,
+                                "",
+                                "",
+                                "",
+                                "",
+                                "",
+                                False,
+                                False,
+                                has_basic_auth,
+                                False,
+                                detected_block_reason,
+                                "",
+                                True,
+                            )
+
+                        # 実ブラウザでは正常に取得できた(=httpx側の検知は
+                        # 自動化ツール狙い撃ちの誤検知だった)ため、ブロック扱いを解除する。
+                        blocked_reason = ""
                         first_url = rendered_url or primary_url
                         first_html = rendered_html
                         first_html_from_playwright = True
+                    elif nav_error_reason:
+                        # ナビゲーション自体が失敗した(DNS失敗・接続拒否等で
+                        # chrome-error://chromewebdata/に遷移した)ケース。
+                        # このURLを移転先やfirst_urlとして絶対に使わないよう、
+                        # ここでは何も採用せず、理由だけをblocked_reasonに残す。
+                        # (以前はこれを「移転案内ページへのリダイレクト」と誤認し、
+                        #  「すでにリニューアル済のため / 移転先：chrome-error://chromewebdata/」
+                        #  という誤った結果になっていた)
+                        blocked_reason = nav_error_reason
 
                 if not first_url:
-                    conn_block_reason = self._classify_connection_error(primary_error) or self._classify_connection_error(fallback_error)
+                    # httpxで検知していたブロック理由があればそれを優先し、
+                    # なければ接続エラー自体の分類結果を使う。
+                    conn_block_reason = blocked_reason or self._classify_connection_error(primary_error) or self._classify_connection_error(fallback_error)
                     return (
                         0,
                         0,
@@ -1439,7 +1642,7 @@ class WebCrawler:
                         # 極端に少ない「要確認」判定に化けてしまう。JSフレームワークを検知した
                         # ページ（＝静的HTMLだけでは内容が欠落する可能性が高いページ）のみに限定する。
                         if self.render_js and len(visited) == 1 and not first_html_from_playwright and self._detect_js_framework(current_html):
-                            rendered, _rendered_url = self._fetch_rendered_html(current_url)
+                            rendered, _rendered_url, _rendered_status, _nav_error = self._fetch_rendered_html(current_url)
                             if rendered:
                                 current_html = rendered
 
