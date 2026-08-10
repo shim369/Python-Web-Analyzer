@@ -60,26 +60,6 @@ class WebCrawler:
         r"必須",
         r"[Rr]equired",
         r"[Rr]equire",
-    ]
-
-    # 「任意」（＝入力必須ではない）マークとして除去する表記のバリエーション。
-    # 必須マークと同様に、丸括弧等で囲まれた完全形を先に置き、単体の「任意」より
-    # 前に評価されるようにする（re.sub は各位置でリスト先頭から順に試すため、
-    # 順序を逆にすると括弧だけが残ってしまう）。
-    OPTIONAL_MARK_PATTERNS = [
-        r"【任意】",
-        r"（任意）",
-        r"\(任意\)",
-        r"※任意",
-        r"任意項目",
-        r"\(\s*[Oo]ptional\s*\)",
-        r"（\s*[Oo]ptional\s*）",
-        r"任意",
-        r"[Oo]ptional",
-    ]
-
-    # 必須・任意どちらのマークにも付随しがちな装飾記号
-    _DECORATION_SYMBOL_PATTERNS = [
         r"※",
         r"＊",
         r"\*",
@@ -87,8 +67,7 @@ class WebCrawler:
         r"●",
         r"◆",
     ]
-
-    _LABEL_MARK_RE = re.compile("|".join(REQUIRED_MARK_PATTERNS + OPTIONAL_MARK_PATTERNS + _DECORATION_SYMBOL_PATTERNS))
+    _REQUIRED_MARK_RE = re.compile("|".join(REQUIRED_MARK_PATTERNS))
     _EMPTY_PARENS_RE = re.compile(r"[\(（]\s*[\)）]")
 
     # お問い合わせページ判定用キーワード(日英混在)
@@ -239,6 +218,9 @@ class WebCrawler:
         if path_lower.endswith((".xml", ".rss", ".atom")) or path_lower.rstrip("/").endswith("/feed"):
             return False
         if re.search(r"[?&]feed=", abs_url.lower()):
+            return False
+
+        if not self._is_depth_worthy_path(parsed_abs.path):
             return False
 
         return abs_domain == base_domain
@@ -462,6 +444,27 @@ class WebCrawler:
                     return True
 
         return False
+
+    def _is_depth_worthy_path(self, path: str) -> bool:
+        """「階層数」のカウント・巡回対象とするに値するURLパスかどうかを判定する。
+
+        カレンダーウィジェットの日付ドリルダウン(例: /calendar/2024/08/09/10/11/12/)
+        のように、短い数値セグメントが3つ以上連続するパスは、実際のサイト構成とは
+        無関係に機械的に深くなっていくURLパターン(無限に近いバリエーションを持つ
+        カレンダーの日送りリンク等)である可能性が高い。これをそのまま巡回・階層数
+        カウントの対象にすると、無駄にクロール予算を消費するうえ、「階層数」が
+        サイトの実態とかけ離れて高く表示されてしまう。
+        """
+        segments = [p for p in path.split("/") if p]
+        numeric_run = 0
+        for seg in segments:
+            if seg.isdigit() and len(seg) <= 4:
+                numeric_run += 1
+                if numeric_run >= 3:
+                    return False
+            else:
+                numeric_run = 0
+        return True
 
     # ------------------------------------------------------------------
     # HTML取得・デコード
@@ -845,8 +848,8 @@ class WebCrawler:
     # フォーム項目抽出
     # ------------------------------------------------------------------
 
-    def _clean_label_text(self, text: str) -> str:
-        text = self._LABEL_MARK_RE.sub("", text)
+    def _remove_required_marks(self, text: str) -> str:
+        text = self._REQUIRED_MARK_RE.sub("", text)
         text = self._EMPTY_PARENS_RE.sub("", text)
         return re.sub(r"^[\s\xa0\n\r]+|[\s\xa0\n\r]+$", "", text)
 
@@ -994,7 +997,7 @@ class WebCrawler:
 
                 # 1. 厳格な仕様に基づくラベル（id/for, aria）
                 txt_a = self._get_label_for_input(inp, form, soup)
-                txt_a = self._clean_label_text(txt_a)
+                txt_a = self._remove_required_marks(txt_a)
                 if txt_a and len(txt_a) < 50 and any(c for c in txt_a if ord(c) > 0x7F):
                     resolved_text = txt_a
 
@@ -1008,14 +1011,14 @@ class WebCrawler:
                         if parent.name == "dd":
                             prev_dts = parent.find_previous_siblings("dt")
                             if prev_dts:
-                                resolved_text = self._clean_label_text(prev_dts[0].get_text(strip=True))
+                                resolved_text = self._remove_required_marks(prev_dts[0].get_text(strip=True))
                                 break
 
                         # table/tr/th 構造
                         if parent.name == "td":
                             prev_ths = parent.find_previous_siblings("th")
                             if prev_ths:
-                                resolved_text = self._clean_label_text(prev_ths[0].get_text(strip=True))
+                                resolved_text = self._remove_required_marks(prev_ths[0].get_text(strip=True))
                                 break
 
                         # 直前の兄弟要素
@@ -1024,48 +1027,17 @@ class WebCrawler:
                         if siblings and isinstance(siblings[0], Tag):
                             # 2. Tag 型であることが保証されたため、安全に .find() が呼べる
                             if not siblings[0].find(["input", "textarea", "select"]):
-                                t = self._clean_label_text(siblings[0].get_text(strip=True))
+                                t = self._remove_required_marks(siblings[0].get_text(strip=True))
                                 if t and len(t) < 50 and any(c for c in t if ord(c) > 0x7F):
                                     resolved_text = t
                                     break
 
-                # 3. 入力欄を直接くるむ最小ブロックのテキストを拾う（タグなしラベル対策）
-                #    Contact Form 7 の標準テンプレートは
-                #      <p>お名前<br /><span class="wpcf7-form-control-wrap ..."><input ...></span></p>
-                #    のように、ラベル文字列がどのタグにも囲まれない「生のテキストノード」に
-                #    なっていることが多い。dl/dt・table/th・タグの兄弟要素を探す上記2.の方法は
-                #    タグ名でしか探索しないため、この生テキストは一切ヒットせず、結果として
-                #    ③の属性フォールバック（name属性等）まで落ちて "your-name" や "tel-397" の
-                #    ようなCF7内部の生スラッグがそのまま出力されてしまう。
-                #    ここでは、入力欄を含む最小のブロック要素まで遡り、「有効な入力欄がその1つ
-                #    だけ」であることを条件に、そのブロックのテキストを丸ごとラベル候補として使う。
-                #    他の入力欄が同居するブロックまで遡ってしまうと複数フィールド分のテキストが
-                #    混ざるため、そこで探索を打ち切る（親に行くほど入力欄の数は減らないため、
-                #    2個以上になった時点で以降の祖先を見ても意味がない）。
-                if not resolved_text:
-                    for parent in inp.parents:
-                        if parent is form or not isinstance(parent, Tag):
-                            break
-
-                        block_inputs = [
-                            el
-                            for el in parent.find_all(["input", "textarea", "select"])
-                            if isinstance(el, Tag) and str(el.get("type", "text")).lower().strip() not in ["hidden", "submit", "button", "image", "reset"]
-                        ]
-                        if len(block_inputs) != 1:
-                            break
-
-                        block_text = self._clean_label_text(parent.get_text(strip=True))
-                        if block_text and len(block_text) < 50 and any(c for c in block_text if ord(c) > 0x7F):
-                            resolved_text = block_text
-                            break
-
-                # 4. 最終フォールバック（属性値）
+                # 3. 最終フォールバック（属性値）
                 if not resolved_text:
                     for attr in ("placeholder", "aria-label", "title", "name"):
                         val = inp.get(attr)
                         if val:
-                            t = self._clean_label_text(str(val).strip())
+                            t = self._remove_required_marks(str(val).strip())
                             if t and len(t) < 50:
                                 resolved_text = t
                                 break
@@ -1910,6 +1882,11 @@ class WebCrawler:
 
                         # 内部リンク巡回
                         candidate_hrefs = [link["href"] for link in soup.find_all("a", href=True)]
+                        # フレームセットベースの古いサイト(<frameset><frame src="menu.html">等)は
+                        # トップページ自体に<a href>が1つも無く、ナビゲーションが別のフレーム文書の
+                        # 中にあることがある。frame/framesetを辿らないと1ページ目で巡回が完全に
+                        # 行き詰まってしまうため、<frame src>も内部リンク候補として扱う。
+                        candidate_hrefs.extend([f.get("src") for f in soup.find_all("frame") if f.get("src")])
                         # JS遷移(onclick="location.href='...'"等)によるリンクも対象に含める
                         candidate_hrefs.extend(self._extract_js_links(current_html))
 
@@ -1919,6 +1896,17 @@ class WebCrawler:
                                 norm_abs = normalize_url(abs_href)
                                 parsed_abs = urlparse(norm_abs)
                                 path_depth = len([p for p in parsed_abs.path.split("/") if p])
+
+                                # 「階層数」は実際に訪問できたページだけでなく、サイト内で発見できた
+                                # (リンクとして存在する)URLの深さも反映する。100ページ上限や
+                                # クロール予算により、実在する深い階層のページに実際には訪問できない
+                                # まま終わるケースがあるが、その場合でも「サイト構成としての深さ」は
+                                # 実態として計上されるべきため。
+                                # (_is_valid_internal_linkで_is_depth_worthy_pathのチェック済みなので、
+                                #  カレンダーの日付ドリルダウン等で不当に深くなる心配はない)
+                                if path_depth > max_depth:
+                                    max_depth = path_depth
+
                                 is_priority = any(
                                     k.lower() in norm_abs.lower()
                                     for k in (
