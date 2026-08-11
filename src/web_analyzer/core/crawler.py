@@ -569,7 +569,10 @@ class WebCrawler:
 
                 # リアルなブラウザのヘッダー・画面設定を網羅してボット検知を回避
                 context = browser.new_context(
-                    user_agent=self.headers.get("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
+                    user_agent=self.headers.get(
+                        "User-Agent",
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                    ),
                     viewport={"width": 1280, "height": 800},
                     extra_http_headers={
                         "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
@@ -633,11 +636,20 @@ class WebCrawler:
         message = str(error).lower() if error else ""
 
         if "name_not_resolved" in message or "nxdomain" in message or "dns" in message:
-            return "ドメイン名を解決できませんでした（DNSエラー）。ドメインが失効している、または既に閉鎖されている可能性が高いため、手動確認をお願いします。"
+            return (
+                "ドメイン名を解決できませんでした（DNSエラー）。"
+                "ドメインが失効している、または既に閉鎖されている可能性が高いため、手動確認をお願いします。"
+            )
         if "connection_refused" in message:
-            return "接続が拒否されました。サーバーが停止している、または閉鎖されている可能性が高いため、手動確認をお願いします。"
+            return (
+                "接続が拒否されました。サーバーが停止している、または閉鎖されている可能性が高いため、"
+                "手動確認をお願いします。"
+            )
         if "connection_closed" in message or "connection_reset" in message:
-            return "接続が途中で切断されました。サーバーが停止している、または閉鎖されている可能性が高いため、手動確認をお願いします。"
+            return (
+                "接続が途中で切断されました。サーバーが停止している、または閉鎖されている可能性が高いため、"
+                "手動確認をお願いします。"
+            )
         if "timed_out" in message or "timeout" in message:
             return "接続がタイムアウトしました。サーバーが応答していない可能性が高いため、手動確認をお願いします。"
         if "cert" in message or "ssl" in message:
@@ -1143,7 +1155,9 @@ class WebCrawler:
                                 legend = parent.find("legend", recursive=False)
                                 if isinstance(legend, Tag):
                                     legend_text = "".join(
-                                        str(c) if isinstance(c, NavigableString) else c.get_text() for c in legend.children if not (isinstance(c, Tag) and c.name == "i")
+                                        str(c) if isinstance(c, NavigableString) else c.get_text()
+                                        for c in legend.children
+                                        if not (isinstance(c, Tag) and c.name == "i")
                                     ).strip()
                                     legend_text = self._remove_required_marks(legend_text)
                                     if legend_text and len(legend_text) < 50 and any(c for c in legend_text if ord(c) > 0x7F):
@@ -1294,11 +1308,20 @@ class WebCrawler:
                 "サーバー側のボット対策等によるアクセス制限の可能性が高いため、手動確認をお願いします。"
             )
         if status_code == 429:
-            return "アクセス先のサーバーから429 Too Many Requests（レート制限）が返されたため、実際のサイト内容を取得できませんでした。時間を置いての再調査、または手動確認をお願いします。"
+            return (
+                "アクセス先のサーバーから429 Too Many Requests（レート制限）が返されたため、"
+                "実際のサイト内容を取得できませんでした。時間を置いての再調査、または手動確認をお願いします。"
+            )
         if status_code >= 500:
-            return f"アクセス先のサーバーでエラー（HTTPステータス {status_code}）が発生しているため、実際のサイト内容を取得できませんでした。手動確認をお願いします。"
+            return (
+                f"アクセス先のサーバーでエラー（HTTPステータス {status_code}）が発生しているため、"
+                "実際のサイト内容を取得できませんでした。手動確認をお願いします。"
+            )
         if status_code >= 400:
-            return f"アクセス先のサーバーからHTTPステータス{status_code}が返されたため、実際のサイト内容を取得できませんでした。手動確認をお願いします。"
+            return (
+                f"アクセス先のサーバーからHTTPステータス{status_code}が返されたため、"
+                "実際のサイト内容を取得できませんでした。手動確認をお願いします。"
+            )
         return ""
 
     def _classify_connection_error(self, error: Exception | None) -> str:
@@ -1645,7 +1668,11 @@ class WebCrawler:
                 if not first_url:
                     # httpxで検知していたブロック理由があればそれを優先し、
                     # なければ接続エラー自体の分類結果を使う。
-                    conn_block_reason = blocked_reason or self._classify_connection_error(primary_error) or self._classify_connection_error(fallback_error)
+                    conn_block_reason = (
+                        blocked_reason
+                        or self._classify_connection_error(primary_error)
+                        or self._classify_connection_error(fallback_error)
+                    )
                     return (
                         0,
                         0,
@@ -1740,7 +1767,12 @@ class WebCrawler:
                         # 大半を1ページ目だけで使い果たし、2ページ目以降を巡回できず総ページ数が
                         # 極端に少ない「要確認」判定に化けてしまう。JSフレームワークを検知した
                         # ページ（＝静的HTMLだけでは内容が欠落する可能性が高いページ）のみに限定する。
-                        if self.render_js and len(visited) == 1 and not first_html_from_playwright and self._detect_js_framework(current_html):
+                        if (
+                            self.render_js
+                            and len(visited) == 1
+                            and not first_html_from_playwright
+                            and self._detect_js_framework(current_html)
+                        ):
                             rendered, _rendered_url, _rendered_status, _nav_error = self._fetch_rendered_html(current_url)
                             if rendered:
                                 current_html = rendered
