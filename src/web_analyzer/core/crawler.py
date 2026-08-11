@@ -8,7 +8,7 @@ from typing import cast
 from urllib.parse import quote, urljoin, urlparse
 
 import httpx
-from bs4 import BeautifulSoup, Tag, XMLParsedAsHTMLWarning
+from bs4 import BeautifulSoup, NavigableString, Tag, XMLParsedAsHTMLWarning
 
 from web_analyzer.models import LOGIN_KEYWORDS
 from web_analyzer.utils.decorators import measure_time
@@ -471,40 +471,75 @@ class WebCrawler:
     # ------------------------------------------------------------------
 
     def _decode_response(self, response: httpx.Response) -> str:
-        """レスポンスの文字コードを判定してデコードする(Shift_JIS系はcp932に正規化し、文字化けを防ぐ)"""
+        """レスポンスの文字コードを判定してデコードする(Shift_JIS系はcp932に正規化し、文字化けを防ぐ)。
+
+        <meta charset>やHTTPヘッダーに文字コードの指定が無い古いサイト
+        (cgi-bin形式のフォーム処理等でよく見られる)では、httpxの推測にも頼れず
+        「utf-8」に決め打ちしてしまい、実際はcp932(Shift_JIS)やeuc-jpのページが
+        文字化けすることがある。これを防ぐため、明示的な文字コード指定が
+        見つからない場合は、複数の候補でデコードを試し、置換文字(U+FFFD、
+        デコード失敗箇所の目印)の出現率が最も低いものを採用するヒューリスティックを行う。
+        """
         # 1. まずHTMLの先頭部分から meta charset を安全に探す
         # asciiの代わりに latin-1 を使うと、バイト値を壊さずに文字列化して正規表現にかけられます
         raw_content_head = response.content[:2048].decode("latin-1", errors="ignore")
         meta_charset = re.search(r'charset=["\']?([a-zA-Z0-9_-]+)', raw_content_head, re.IGNORECASE)
 
+        def _normalize_encoding(enc: str) -> str:
+            enc_lower = enc.lower()
+            if enc_lower in ["shift_jis", "shift-jis", "sjis", "x-sjis", "cp932"]:
+                return "cp932"
+            if enc_lower in ["euc-jp", "eucjp", "x-euc-jp"]:
+                return "euc-jp"
+            return enc
+
         if meta_charset:
-            encoding = meta_charset.group(1)
-        else:
-            # 2. metaタグにない場合は、httpxがヘッダー等から推測したエンコーディングを使用
-            # (※ None や 'X-USER-DEFINED' などの無効な値への対策)
-            guessed = response.encoding or response.charset_encoding
-            encoding = guessed if (guessed and len(guessed) > 1) else "utf-8"
-
-        # 3. Shift_JIS系のエンコーディングをWindows拡張の cp932 に統一
-        # 「〜」や「①」、特殊な漢字（藏 など）の化け・欠損を防ぎます
-        enc_lower = encoding.lower()
-        if enc_lower in ["shift_jis", "shift-jis", "sjis", "x-sjis", "cp932"]:
-            encoding = "cp932"
-        elif enc_lower in ["euc-jp", "eucjp", "x-euc-jp"]:
-            encoding = "euc-jp"
-        else:
-            # 念のため utf-8 と明示されていても、実際は別コードのケースへのフォールバック用
-            pass
-
-        # 4. 決定したエンコーディングでデコードを試みる
-        try:
-            return response.content.decode(encoding, errors="replace")
-        except Exception:
-            # 失敗した場合は、httpx標準の自動デコードに頼る
+            # metaタグで明示されている場合は、素直にそれを信頼する
+            encoding = _normalize_encoding(meta_charset.group(1))
             try:
-                return response.text
+                return response.content.decode(encoding, errors="replace")
             except Exception:
-                return response.content.decode("utf-8", errors="replace")
+                pass  # デコード自体に失敗した場合は、下の推測ロジックにフォールスルーする
+
+        # 2. metaタグに文字コードの指定が無い(または指定されたエンコーディングで
+        # デコードできなかった)場合。httpxの推測を第一候補にしつつ、日本語サイトで
+        # よくあるcp932・euc-jp・utf-8も候補に含め、最も文字化けが少ないものを採用する。
+        guessed = response.encoding or response.charset_encoding
+        candidates: list[str] = []
+        if guessed and len(guessed) > 1:
+            candidates.append(_normalize_encoding(guessed))
+        for enc in ("utf-8", "cp932", "euc-jp"):
+            if enc not in candidates:
+                candidates.append(enc)
+
+        best_text = ""
+        best_error_ratio = 1.0
+        for enc in candidates:
+            try:
+                decoded = response.content.decode(enc, errors="replace")
+            except Exception:
+                continue
+
+            if not decoded:
+                continue
+
+            error_ratio = decoded.count("\ufffd") / len(decoded)
+            if error_ratio < best_error_ratio:
+                best_error_ratio = error_ratio
+                best_text = decoded
+
+            # 置換文字が全く無ければ、それ以上候補を試す必要はない
+            if error_ratio == 0:
+                break
+
+        if best_text:
+            return best_text
+
+        # 3. 最終手段: httpx標準の自動デコードに頼る
+        try:
+            return response.text
+        except Exception:
+            return response.content.decode("utf-8", errors="replace")
 
     def _fetch_rendered_html(self, url: str) -> tuple[str, str, int | None, str]:
         """Playwrightが利用可能ならレンダリング後のHTML・最終URL・HTTPステータスコード・
@@ -853,6 +888,30 @@ class WebCrawler:
         text = self._EMPTY_PARENS_RE.sub("", text)
         return re.sub(r"^[\s\xa0\n\r]+|[\s\xa0\n\r]+$", "", text)
 
+    _HINT_ELEMENT_CLASS_RE = re.compile(r"exam|example|hint|note|annotation|caption|desc(?:ription)?", re.I)
+
+    def _looks_like_hint_element(self, el: Tag) -> bool:
+        """「入力例」「注釈」等のヒントテキストを表す要素かどうかを判定する。
+
+        例: <span class="exam">【全角】例：〇〇株式会社</span>のような要素。
+        class名にヒントらしきキーワードを含む場合、たとえテキストが非ASCII文字を
+        含んでいても、本来のラベル(dt等)より優先してラベル候補にしてはいけない。
+        """
+        classes = " ".join(el.get("class", [])).lower()
+        return bool(self._HINT_ELEMENT_CLASS_RE.search(classes))
+
+    def _direct_child_text(self, el: Tag) -> str:
+        """要素の「直接の」子テキストノードだけを連結して返す(入れ子タグの中の文字は含めない)。
+
+        例: <p>お問い合わせ内容 <span>(必須)<br>...<textarea>...</textarea>...</span></p>
+        のように、ラベル文言が兄弟要素としてではなく、入力欄と同じブロック内に
+        直接のテキストとして同居しているCF7テンプレートのパターンに対応するため。
+        get_text()だと入れ子のtextarea内の値まで拾ってしまう可能性があるが、
+        直接の子のNavigableStringだけを見るのでその心配がない。
+        """
+        parts = [str(c) for c in el.contents if isinstance(c, NavigableString)]
+        return "".join(parts).strip()
+
     def _get_label_for_input(self, inp: Tag, form: Tag, soup: BeautifulSoup) -> str:
         """input要素に対応する厳格なラベル（W3C標準仕様）を解決する。"""
         # 1. aria-labelledby
@@ -895,10 +954,27 @@ class WebCrawler:
         raw_containers.extend(soup.find_all(attrs={"role": "form"}))
         raw_containers.extend(soup.find_all(attrs={"data-form": True}))
 
-        if not raw_containers:
-            for candidate in soup.find_all("div", class_=self._FORM_LIKE_CLASS_RE):
-                if candidate.find(["input", "textarea", "select"]):
-                    raw_containers.append(candidate)
+        # <form>タグを使わず、JSでAJAX送信するカスタム実装(class名に
+        # contact/form/inquiry等を含むdiv)の疑似フォームは、以前は
+        # 「ページ内に<form>タグが1つも無い場合」にしか探していなかった。
+        # そのため、ページ内に検索窓や無関係な小さな<form>が1つでもあると、
+        # 肝心のお問い合わせ用の疑似フォームが完全に見逃されてしまっていた。
+        # <form>の有無に関わらず常に探索する(ただし、既に見つかった<form>を
+        # 内包するdivは、同じフォームを二重に処理しないよう除外する)。
+        # また、class名に"form"を含むdivは入れ子になりやすい
+        # (例: div.p-contact-form > div.l-form > div.l-form__inputs は
+        # いずれも正規表現にマッチする)ため、最も外側の候補だけを採用し、
+        # 内側の候補は二重処理を避けるためスキップする。
+        added_divs: list[Tag] = []
+        for candidate in soup.find_all("div", class_=self._FORM_LIKE_CLASS_RE):
+            if not candidate.find(["input", "textarea", "select"]):
+                continue
+            if candidate.find("form") is not None:
+                continue
+            if any(candidate in already.descendants for already in added_divs):
+                continue
+            added_divs.append(candidate)
+        raw_containers.extend(added_divs)
 
         seen_ids = set()
         unique_containers = []
@@ -994,53 +1070,104 @@ class WebCrawler:
                     has_attachment = True
 
                 resolved_text = ""
+                inp_type_val = inp.get("type", "text")
+                inp_type = "".join([str(x) for x in inp_type_val]).lower().strip() if isinstance(inp_type_val, list) else str(inp_type_val).lower().strip()
+                is_choice_input = inp_type in ("radio", "checkbox")
 
                 # 1. 厳格な仕様に基づくラベル（id/for, aria）
-                txt_a = self._get_label_for_input(inp, form, soup)
-                txt_a = self._remove_required_marks(txt_a)
-                if txt_a and len(txt_a) < 50 and any(c for c in txt_a if ord(c) > 0x7F):
-                    resolved_text = txt_a
+                # ただしradio/checkboxは、個々の選択肢に<label for>が正しく付与されている
+                # ことが多く、そのまま使うと「はい」「いいえ」のような選択肢の文言そのものが
+                # 項目名として抽出されてしまう。知りたいのは選択肢ではなく質問文(th/legend等の
+                # 見出し)なので、radio/checkboxでは厳格ラベルの解決をスキップし、
+                # 下のステップ2(構造探索)でグループ全体の見出しを拾わせる。
+                if not is_choice_input:
+                    txt_a = self._get_label_for_input(inp, form, soup)
+                    txt_a = self._remove_required_marks(txt_a)
+                    if txt_a and len(txt_a) < 50 and any(c for c in txt_a if ord(c) > 0x7F):
+                        resolved_text = txt_a
 
-                # 2. 周辺のHTML構造から探索（dl/dt/dd, table/tr/th, 兄弟要素）
+                # 2. 周辺のHTML構造から探索（dl/dt/dd, table/tr/th, 兄弟要素, fieldset/legend）
+                # 優先順位を3段階に分けて祖先チェーン全体を走査する:
+                #   (a) dt/dd, th/td … 1項目に対して1対1で対応することが多く、最も信頼できる
+                #   (b) 直接テキスト・直前の兄弟要素 … dt/dd等が無い場合の、局所的で具体的な手がかり
+                #   (c) fieldset/legend … 1つのfieldsetに複数項目(住所のfieldset等)が
+                #       含まれることがあり、(a)(b)より優先すると「郵便番号」等の具体的な
+                #       ラベルを「住所」という大枠の見出しで上書きしてしまうため、最後の手段とする
+                # (単純な1パスにまとめると、本来のラベルより手前の階層で
+                #  <span class="exam">【全角】例：〇〇株式会社</span>のような
+                #  「入力例のヒント」が先にマッチしてbreakしてしまう問題があったため、
+                #  この優先順位ごとに祖先チェーンを繰り返し走査する構成にしている)
                 if not resolved_text:
-                    for parent in inp.parents:
-                        if parent is form or not isinstance(parent, Tag):
+                    parent_chain = []
+                    for p in inp.parents:
+                        if p is form or not isinstance(p, Tag):
                             break
+                        parent_chain.append(p)
 
-                        # dl/dt/dd 構造
+                    # (a) dt/dd, th/td
+                    for parent in parent_chain:
                         if parent.name == "dd":
                             prev_dts = parent.find_previous_siblings("dt")
                             if prev_dts:
                                 resolved_text = self._remove_required_marks(prev_dts[0].get_text(strip=True))
                                 break
 
-                        # table/tr/th 構造
                         if parent.name == "td":
                             prev_ths = parent.find_previous_siblings("th")
                             if prev_ths:
                                 resolved_text = self._remove_required_marks(prev_ths[0].get_text(strip=True))
                                 break
 
-                        # 直前の兄弟要素
-                        siblings = parent.find_previous_siblings(["div", "span", "label", "dt", "th"])
-                        # 1. siblings[0] が存在し、かつ Tag インスタンスであることを確認
-                        if siblings and isinstance(siblings[0], Tag):
-                            # 2. Tag 型であることが保証されたため、安全に .find() が呼べる
-                            if not siblings[0].find(["input", "textarea", "select"]):
-                                t = self._remove_required_marks(siblings[0].get_text(strip=True))
-                                if t and len(t) < 50 and any(c for c in t if ord(c) > 0x7F):
-                                    resolved_text = t
-                                    break
+                    # (b) 直接テキスト・直前の兄弟要素(入力例のヒントらしき要素は除外)
+                    if not resolved_text:
+                        for parent in parent_chain:
+                            own_text = self._remove_required_marks(self._direct_child_text(parent))
+                            if own_text and len(own_text) < 50 and any(c for c in own_text if ord(c) > 0x7F):
+                                resolved_text = own_text
+                                break
+
+                            siblings = parent.find_previous_siblings(["div", "span", "label", "dt", "th", "p"])
+                            if siblings and isinstance(siblings[0], Tag):
+                                candidate = siblings[0]
+                                if not candidate.find(["input", "textarea", "select"]) and not self._looks_like_hint_element(candidate):
+                                    t = self._remove_required_marks(candidate.get_text(strip=True))
+                                    if t and len(t) < 50 and any(c for c in t if ord(c) > 0x7F):
+                                        resolved_text = t
+                                        break
+
+                    # (c) fieldset/legend(<legend>に「必須」「任意」等のマーカー要素<i>が
+                    # 混ざっている実装が多いため、<i>タグは除外してテキストを取得する)
+                    if not resolved_text:
+                        for parent in parent_chain:
+                            if parent.name == "fieldset":
+                                legend = parent.find("legend", recursive=False)
+                                if isinstance(legend, Tag):
+                                    legend_text = "".join(
+                                        str(c) if isinstance(c, NavigableString) else c.get_text() for c in legend.children if not (isinstance(c, Tag) and c.name == "i")
+                                    ).strip()
+                                    legend_text = self._remove_required_marks(legend_text)
+                                    if legend_text and len(legend_text) < 50 and any(c for c in legend_text if ord(c) > 0x7F):
+                                        resolved_text = legend_text
+                                        break
 
                 # 3. 最終フォールバック（属性値）
+                # 優先順位: aria-label/title（正しいラベルであることが多い）を
+                # placeholderより先に見る。placeholderは「例：株式会社ABC商事」のような
+                # 入力例(サンプル)であることが多く、ラベルとして使うと紛らわしいため、
+                # 明らかに「例」を示す接頭辞を持つ場合はスキップしてnameに委ねる。
+                _EXAMPLE_PLACEHOLDER_PREFIXES = ("例：", "例:", "例)", "e.g.", "ex.", "例えば")
                 if not resolved_text:
-                    for attr in ("placeholder", "aria-label", "title", "name"):
+                    for attr in ("aria-label", "title", "placeholder", "name"):
                         val = inp.get(attr)
-                        if val:
-                            t = self._remove_required_marks(str(val).strip())
-                            if t and len(t) < 50:
-                                resolved_text = t
-                                break
+                        if not val:
+                            continue
+                        t = self._remove_required_marks(str(val).strip())
+                        if not t or len(t) >= 50:
+                            continue
+                        if attr == "placeholder" and t.startswith(_EXAMPLE_PLACEHOLDER_PREFIXES):
+                            continue
+                        resolved_text = t
+                        break
 
                 # ここなら resolved_text の抽出が終わっているので安全に出力できます
                 logger.debug("    入力欄 [name=%s] -> 抽出結果: '%s'", inp.get("name"), resolved_text)
