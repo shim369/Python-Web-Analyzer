@@ -68,6 +68,7 @@ class WebCrawler:
         r"◆",
     ]
     _REQUIRED_MARK_RE = re.compile("|".join(REQUIRED_MARK_PATTERNS))
+    _TEMPLATE_VAR_RE = re.compile(r"\{\{.*?\}\}")
     _EMPTY_PARENS_RE = re.compile(r"[\(（]\s*[\)）]")
 
     # お問い合わせページ判定用キーワード(日英混在)
@@ -75,6 +76,7 @@ class WebCrawler:
         "contact",
         "inquiry",
         "otoiawase",
+        "toiawase",
         "entry",
         "support",
         "form",
@@ -885,8 +887,24 @@ class WebCrawler:
 
     def _remove_required_marks(self, text: str) -> str:
         text = self._REQUIRED_MARK_RE.sub("", text)
+        text = self._TEMPLATE_VAR_RE.sub("", text)
         text = self._EMPTY_PARENS_RE.sub("", text)
         return re.sub(r"^[\s\xa0\n\r]+|[\s\xa0\n\r]+$", "", text)
+
+    def _get_clean_element_text(self, el: Tag) -> str:
+        """エラー表示領域や余計なタグを除去して純粋なラベル文言のみを取得する"""
+        if not isinstance(el, Tag):
+            return ""
+
+        # 元のDOMを破壊しないよう複製
+        el_copy = BeautifulSoup(str(el), HTML_PARSER)
+
+        # class名に error / note / hint などが含まれる要素を取り除いて無効化（decompose）
+        for junk in el_copy.find_all(class_=re.compile(r"error-text|error|help-block|note|hint", re.I)):
+            junk.decompose()
+
+        text = el_copy.get_text(strip=True)
+        return self._remove_required_marks(text)
 
     _HINT_ELEMENT_CLASS_RE = re.compile(r"exam|example|hint|note|annotation|caption|desc(?:ription)?", re.I)
 
@@ -919,7 +937,8 @@ class WebCrawler:
         if labelledby:
             target = soup.find(id=str(labelledby))
             if target and isinstance(target, Tag):
-                txt = target.get_text(strip=True)
+                # txt = target.get_text(strip=True)
+                txt = self._get_clean_element_text(target)
                 if txt:
                     return txt
 
@@ -935,18 +954,100 @@ class WebCrawler:
         if input_id:
             label_tag = form.find("label", attrs={"for": str(input_id)})
             if label_tag and isinstance(label_tag, Tag):
-                txt = label_tag.get_text(strip=True)
+                # txt = label_tag.get_text(strip=True)
+                txt = self._get_clean_element_text(label_tag)
                 if txt:
                     return txt
 
         # 4. <label>入力欄</label> のように、labelタグ自身に内包されている場合
         parent_label = inp.find_parent("label")
         if parent_label and isinstance(parent_label, Tag):
-            txt = parent_label.get_text(strip=True)
+            # txt = parent_label.get_text(strip=True)
+            txt = self._get_clean_element_text(parent_label)
             if txt:
                 return txt
 
         return ""
+
+    def _looks_like_genuine_contact_form(
+        self,
+        soup: BeautifulSoup,
+        fields_text: str,
+    ) -> bool:
+        """抽出結果をお問い合わせフォームとして確定してよいか判定する。
+
+        URL自体がお問い合わせページの場合は比較的緩く判定する。
+        一方、トップページ等の「お問い合わせリンクがあるだけ」のページでは、
+        フォームコンテナ自身にお問い合わせらしい特徴がある場合のみ採用する。
+        """
+        if not fields_text:
+            return False
+
+        contact_words = (
+            "お問い合わせ",
+            "お問合せ",
+            "問合せ",
+            "お問い合わせ内容",
+            "ご相談",
+            "相談内容",
+            "メールアドレス",
+            "メール",
+            "お名前",
+            "氏名",
+            "電話番号",
+            "連絡先",
+            "contact",
+            "inquiry",
+            "otoiawase",
+            "toiawase",
+        )
+
+        # ページ内のフォーム候補を取得
+        containers = self._find_form_containers(soup)
+
+        for container in containers:
+            container_text = container.get_text(" ", strip=True).lower()
+
+            # フォーム内の入力項目を確認
+            inputs = container.find_all(["input", "textarea", "select"])
+
+            if not inputs:
+                continue
+
+            has_email = bool(container.find("input", {"type": "email"}))
+
+            has_textarea = bool(container.find("textarea"))
+
+            # name / id / placeholder も問い合わせ判定材料にする
+            input_text_parts: list[str] = []
+
+            for inp in inputs:
+                for attr in ("name", "id", "placeholder", "aria-label"):
+                    value = inp.get(attr)
+                    if value:
+                        input_text_parts.append(str(value).lower())
+
+            input_metadata = " ".join(input_text_parts)
+
+            contact_word_count = sum(1 for word in contact_words if word.lower() in container_text or word.lower() in input_metadata)
+
+            # メール + textarea はかなり強い問い合わせフォームの特徴
+            if has_email and has_textarea:
+                return True
+
+            # 問い合わせ関連語がフォーム自身に複数存在する場合
+            if contact_word_count >= 2 and (has_email or has_textarea):
+                return True
+
+            # 問い合わせフォームではメール欄がなくても、
+            # 「氏名 + 電話番号 + 内容」等の構成になっている場合がある。
+            has_name = any(word in container_text or word in input_metadata for word in ("お名前", "氏名", "name"))
+            has_phone = any(word in container_text or word in input_metadata for word in ("電話番号", "電話", "tel", "phone"))
+
+            if has_textarea and has_name and has_phone:
+                return True
+
+        return False
 
     def _find_form_containers(self, soup: BeautifulSoup) -> list[Tag]:
         """<form>タグや疑似フォームを探すが、検索窓（Search）関連は最初から完全に除外する。"""
@@ -975,6 +1076,16 @@ class WebCrawler:
                 continue
             added_divs.append(candidate)
         raw_containers.extend(added_divs)
+
+        # 最後の手段: <form>タグも、それらしいclass名を持つdivも一切無いページ
+        # (例: 見た目上はただの<table>にinputが並んでいるだけで、実際の送信は
+        # 別途JSで隠しフォームに値をコピーして行う、古い自前実装のフォーム)。
+        # メールアドレス欄またはメッセージ本文欄(textarea)が実在する場合に限り、
+        # <body>全体を1つのコンテナとして扱う。
+        if not raw_containers and (soup.find("input", {"type": "email"}) or soup.find("textarea")):
+            body = soup.body
+            if isinstance(body, Tag):
+                raw_containers.append(body)
 
         seen_ids = set()
         unique_containers = []
@@ -1107,16 +1218,31 @@ class WebCrawler:
                     # (a) dt/dd, th/td
                     for parent in parent_chain:
                         if parent.name == "dd":
-                            prev_dts = parent.find_previous_siblings("dt")
+                            prev_dts = [t for t in parent.find_previous_siblings("dt") if isinstance(t, Tag)]
                             if prev_dts:
-                                resolved_text = self._remove_required_marks(prev_dts[0].get_text(strip=True))
+                                # resolved_text = self._remove_required_marks(prev_dts[0].get_text(strip=True))
+                                resolved_text = self._get_clean_element_text(prev_dts[0])
                                 break
 
                         if parent.name == "td":
-                            prev_ths = parent.find_previous_siblings("th")
+                            prev_ths = [t for t in parent.find_previous_siblings("th") if isinstance(t, Tag)]
                             if prev_ths:
-                                resolved_text = self._remove_required_marks(prev_ths[0].get_text(strip=True))
+                                # resolved_text = self._remove_required_marks(prev_ths[0].get_text(strip=True))
+                                resolved_text = self._get_clean_element_text(prev_ths[0])
                                 break
+
+                            # <th>を使わず、同じ行内の手前の<td>をラベルとして使う
+                            # 古い表組みパターンに対応する
+                            # (例: <tr><td class="label">氏名</td><td><input ...></td></tr>)。
+                            # ラベル用の<td>は入力欄を含まないはずなので、それを条件に
+                            # 別の項目の入力セルを誤って拾わないようにする。
+                            prev_tds = [t for t in parent.find_previous_siblings("td") if isinstance(t, Tag)]
+                            if prev_tds and not prev_tds[0].find(["input", "textarea", "select"]) and not self._looks_like_hint_element(prev_tds[0]):
+                                # t = self._remove_required_marks(prev_tds[0].get_text(strip=True))
+                                t = self._get_clean_element_text(prev_tds[0])
+                                if t and len(t) < 50 and any(c for c in t if ord(c) > 0x7F):
+                                    resolved_text = t
+                                    break
 
                     # (b) 直接テキスト・直前の兄弟要素(入力例のヒントらしき要素は除外)
                     if not resolved_text:
@@ -1126,11 +1252,12 @@ class WebCrawler:
                                 resolved_text = own_text
                                 break
 
-                            siblings = parent.find_previous_siblings(["div", "span", "label", "dt", "th", "p"])
+                            siblings = parent.find_previous_siblings(["div", "span", "label", "dt", "th", "p", "table"])
                             if siblings and isinstance(siblings[0], Tag):
                                 candidate = siblings[0]
                                 if not candidate.find(["input", "textarea", "select"]) and not self._looks_like_hint_element(candidate):
-                                    t = self._remove_required_marks(candidate.get_text(strip=True))
+                                    # t = self._remove_required_marks(candidate.get_text(strip=True))
+                                    t = self._get_clean_element_text(candidate)
                                     if t and len(t) < 50 and any(c for c in t if ord(c) > 0x7F):
                                         resolved_text = t
                                         break
@@ -1181,6 +1308,9 @@ class WebCrawler:
             for f in form_fields:
                 if f not in fields:
                     fields.append(f)
+
+        # 明らかにフォーム属性値と思われる英数字だけの値を除外
+        fields = [field for field in fields if any(ord(c) > 0x7F for c in field)]
 
         return "\n".join(fields), has_attachment
 
@@ -2000,12 +2130,18 @@ class WebCrawler:
                         has_contact_text = contact_link_tag is not None
 
                         if (is_contact_url or has_contact_text) and not contact_fields:
-                            contact_fields, has_attachment = self._extract_form_fields(
+                            candidate_fields, candidate_attachment = self._extract_form_fields(
                                 current_html,
                                 current_url,
                                 client,
                                 depth=0,
                             )
+                            # 「本当にお問い合わせフォームらしいか」を検証してから採用する。
+                            # (このページ自体が持つ無関係なフォーム(サイト内検索等)を、
+                            #  単に「お問い合わせへのリンクがあるページ」というだけの理由で
+                            #  誤って確定させないようにするため)
+                            if self._looks_like_genuine_contact_form(soup, candidate_fields):
+                                contact_fields, has_attachment = candidate_fields, candidate_attachment
 
                         # 内部リンク巡回
                         candidate_hrefs = [link["href"] for link in soup.find_all("a", href=True)]
