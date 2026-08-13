@@ -1194,7 +1194,7 @@ class WebCrawler:
                 if not is_choice_input:
                     txt_a = self._get_label_for_input(inp, form, soup)
                     txt_a = self._remove_required_marks(txt_a)
-                    if txt_a and len(txt_a) < 50 and any(c for c in txt_a if ord(c) > 0x7F):
+                    if txt_a and len(txt_a) < 50 and re.search(r"[A-Za-zぁ-んァ-ヶー一-龠々]", txt_a):
                         resolved_text = txt_a
 
                 # 2. 周辺のHTML構造から探索（dl/dt/dd, table/tr/th, 兄弟要素, fieldset/legend）
@@ -1240,9 +1240,36 @@ class WebCrawler:
                             if prev_tds and not prev_tds[0].find(["input", "textarea", "select"]) and not self._looks_like_hint_element(prev_tds[0]):
                                 # t = self._remove_required_marks(prev_tds[0].get_text(strip=True))
                                 t = self._get_clean_element_text(prev_tds[0])
-                                if t and len(t) < 50 and any(c for c in t if ord(c) > 0x7F):
+                                if t and len(t) < 50 and re.search(r"[A-Za-zぁ-んァ-ヶー一-龠々]", t):
                                     resolved_text = t
                                     break
+
+                    # Contact Form 7 のように、入力欄を含む <p> の
+                    # 直接テキストとしてラベルが記述されている形式に対応する。
+                    # 例:
+                    # <p>Message <span class="required">(required)</span><br>
+                    #     <span class="wpcf7-form-control-wrap ...">
+                    #         <textarea ...>
+                    #     </span>
+                    # </p>
+                    if not resolved_text:
+                        for parent in parent_chain:
+                            if parent.name != "p":
+                                continue
+
+                            label_text = self._direct_child_text(parent)
+                            label_text = self._remove_required_marks(label_text)
+
+                            if not label_text:
+                                continue
+
+                            # 英語・日本語どちらも許可する。
+                            if len(label_text) < 50 and re.search(
+                                r"[A-Za-zぁ-んァ-ヶー一-龠々]",
+                                label_text,
+                            ):
+                                resolved_text = label_text
+                                break
 
                     # (b) 直接テキスト・直前の兄弟要素(入力例のヒントらしき要素は除外)
                     if not resolved_text:
@@ -1258,7 +1285,7 @@ class WebCrawler:
                                 if not candidate.find(["input", "textarea", "select"]) and not self._looks_like_hint_element(candidate):
                                     # t = self._remove_required_marks(candidate.get_text(strip=True))
                                     t = self._get_clean_element_text(candidate)
-                                    if t and len(t) < 50 and any(c for c in t if ord(c) > 0x7F):
+                                    if t and len(t) < 50 and re.search(r"[A-Za-zぁ-んァ-ヶー一-龠々]", t):
                                         resolved_text = t
                                         break
 
@@ -1273,7 +1300,14 @@ class WebCrawler:
                                         str(c) if isinstance(c, NavigableString) else c.get_text() for c in legend.children if not (isinstance(c, Tag) and c.name == "i")
                                     ).strip()
                                     legend_text = self._remove_required_marks(legend_text)
-                                    if legend_text and len(legend_text) < 50 and any(c for c in legend_text if ord(c) > 0x7F):
+                                    if (
+                                        legend_text
+                                        and len(legend_text) < 50
+                                        and re.search(
+                                            r"[A-Za-zぁ-んァ-ヶー一-龠々]",
+                                            legend_text,
+                                        )
+                                    ):
                                         resolved_text = legend_text
                                         break
 
@@ -1284,7 +1318,7 @@ class WebCrawler:
                 # 明らかに「例」を示す接頭辞を持つ場合はスキップしてnameに委ねる。
                 _EXAMPLE_PLACEHOLDER_PREFIXES = ("例：", "例:", "例)", "e.g.", "ex.", "例えば")
                 if not resolved_text:
-                    for attr in ("aria-label", "title", "placeholder", "name"):
+                    for attr in ("aria-label", "title", "placeholder"):
                         val = inp.get(attr)
                         if not val:
                             continue
@@ -1308,9 +1342,6 @@ class WebCrawler:
             for f in form_fields:
                 if f not in fields:
                     fields.append(f)
-
-        # 明らかにフォーム属性値と思われる英数字だけの値を除外
-        fields = [field for field in fields if any(ord(c) > 0x7F for c in field)]
 
         return "\n".join(fields), has_attachment
 
