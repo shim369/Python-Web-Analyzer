@@ -10,7 +10,6 @@ from urllib.parse import quote, urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup, NavigableString, Tag, XMLParsedAsHTMLWarning
 
-from web_analyzer.models import LOGIN_KEYWORDS
 from web_analyzer.utils.decorators import measure_time
 
 logger = logging.getLogger(__name__)
@@ -45,8 +44,6 @@ class WebCrawler:
     優先度キューのdeque化、logging化などを反映。
     v3: crawl_and_analyzeをtuple(9要素)返却に変更、繰り返しパストラップ検知を強化。
     """
-
-    LOGIN_KEYWORDS = LOGIN_KEYWORDS
 
     # 必須マーク・記号として除去する表記のバリエーション
     REQUIRED_MARK_PATTERNS = [
@@ -226,6 +223,31 @@ class WebCrawler:
             return False
 
         return abs_domain == base_domain
+
+    def _has_password_login_form(self, html: str) -> bool:
+        """パスワード入力欄を持つ、訪問者向けのログインフォームが存在するか判定する。
+
+        CMSの管理者用ログイン画面(wp-login.php等)を個別に列挙して除外する方式は、
+        対象CMSが増えるたびにメンテナンスが必要になり、かつ列挙し漏れたCMSでは
+        効果が出ないため採用しない。代わりに、大半のCMS管理者ログイン画面が
+        「サイト共通のヘッダー/グローバルナビを持たない単独ページ」として
+        表示されるという構造的な特徴を利用し、CMSの種類を問わず判定する。
+
+        訪問者向けの会員ログイン・マイページは通常のページテンプレート内に
+        組み込まれているため、サイト共通のヘッダー/グローバルナビを伴って
+        表示される点で区別できる。
+        """
+        soup = BeautifulSoup(html or "", HTML_PARSER)
+        body = soup.body or soup
+
+        has_password_field = bool(
+            body.find("input", attrs={"type": re.compile(r"^password$", re.I)}) or body.find(attrs={"autocomplete": re.compile(r"current-password|new-password", re.I)})
+        )
+        if not has_password_field:
+            return False
+
+        has_site_chrome = bool(body.find("header") or body.find(class_=self._HEADER_LIKE_RE) or body.find(id=self._HEADER_LIKE_RE))
+        return has_site_chrome
 
     def _detect_cms(self, html: str) -> str:
         html = html.lower()
@@ -2174,14 +2196,15 @@ class WebCrawler:
                             if self._looks_like_genuine_contact_form(soup, candidate_fields):
                                 contact_fields, has_attachment = candidate_fields, candidate_attachment
 
+                        # ログイン・マイページ機能の検知
+                        # (パスワード欄の有無 + サイト共通ヘッダーの有無という構造的シグナルで判定)
+                        if not has_login and self._has_password_login_form(current_html):
+                            has_login = True
+
                         # 内部リンク巡回
-                        candidate_hrefs = [link["href"] for link in soup.find_all("a", href=True)]
-                        # フレームセットベースの古いサイト(<frameset><frame src="menu.html">等)は
-                        # トップページ自体に<a href>が1つも無く、ナビゲーションが別のフレーム文書の
-                        # 中にあることがある。frame/framesetを辿らないと1ページ目で巡回が完全に
-                        # 行き詰まってしまうため、<frame src>も内部リンク候補として扱う。
+                        anchor_tags = soup.find_all("a", href=True)
+                        candidate_hrefs = [link["href"] for link in anchor_tags]
                         candidate_hrefs.extend([f.get("src") for f in soup.find_all("frame") if f.get("src")])
-                        # JS遷移(onclick="location.href='...'"等)によるリンクも対象に含める
                         candidate_hrefs.extend(self._extract_js_links(current_html))
 
                         for href in candidate_hrefs:
@@ -2191,13 +2214,6 @@ class WebCrawler:
                                 parsed_abs = urlparse(norm_abs)
                                 path_depth = len([p for p in parsed_abs.path.split("/") if p])
 
-                                # 「階層数」は実際に訪問できたページだけでなく、サイト内で発見できた
-                                # (リンクとして存在する)URLの深さも反映する。100ページ上限や
-                                # クロール予算により、実在する深い階層のページに実際には訪問できない
-                                # まま終わるケースがあるが、その場合でも「サイト構成としての深さ」は
-                                # 実態として計上されるべきため。
-                                # (_is_valid_internal_linkで_is_depth_worthy_pathのチェック済みなので、
-                                #  カレンダーの日付ドリルダウン等で不当に深くなる心配はない)
                                 if path_depth > max_depth:
                                     max_depth = path_depth
 
@@ -2208,6 +2224,10 @@ class WebCrawler:
                                         "inquiry",
                                         "otoiawase",
                                         "form",
+                                        "login",
+                                        "mypage",
+                                        "member",
+                                        "account",
                                     )
                                 )
                                 enqueue(norm_abs, path_depth, is_priority)

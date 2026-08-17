@@ -37,16 +37,3 @@ class SiteAssessment:
     rejection_reason: str = ""  # M列
     remarks: str = ""  # N列
     operator_name: str = ""  # O列
-
-
-# プロジェクト共通の定数として定義
-LOGIN_KEYWORDS: list[str] = [
-    "login",
-    "signin",
-    "mypage",
-    "member",
-    "account",
-    "ログイン",
-    "マイページ",
-    "会員",
-]
