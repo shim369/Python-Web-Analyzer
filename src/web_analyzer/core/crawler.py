@@ -2005,29 +2005,50 @@ class WebCrawler:
                             # --- 1. メインナビ領域の候補をスコア判定で特定 ---
                             def find_main_nav_element(soup: BeautifulSoup) -> Tag | None:
                                 nav_pattern = re.compile(
-                                    r"gnav|rglnav|gmenu|global|main-?menu|navbar-?nav|header-?menu|header__nav|navigation",
+                                    r"gnav|rglnav|gmenu|global|main-?menu|navbar-?nav|"
+                                    r"header-?menu|header__nav|navigation|menu",
                                     re.I,
                                 )
 
-                                candidates = soup.find_all(
-                                    ["nav", "header", "ul", "div"],
-                                    class_=nav_pattern,
+                                candidates: list[Tag] = []
+
+                                # nav / header はクラス名に関係なく候補にする
+                                candidates.extend(soup.find_all(["nav", "header"]))
+
+                                # ul / div はナビらしい class / id を持つものだけ候補にする
+                                candidates.extend(
+                                    soup.find_all(
+                                        ["ul", "div"],
+                                        class_=nav_pattern,
+                                    )
                                 )
                                 candidates.extend(
                                     soup.find_all(
-                                        ["ul", "div", "nav"],
-                                        id=re.compile(r"nav|menu|glnav|gnav|gmenu|lh|header", re.I),
+                                        ["ul", "div"],
+                                        id=re.compile(
+                                            r"nav|menu|glnav|gnav|gmenu|lh|header",
+                                            re.I,
+                                        ),
                                     )
                                 )
 
-                                if not candidates:
-                                    candidates = soup.find_all("nav")
+                                # 重複除去
+                                unique_candidates = []
+                                seen_ids = set()
+
+                                for tag in candidates:
+                                    tag_id = id(tag)
+                                    if tag_id not in seen_ids:
+                                        seen_ids.add(tag_id)
+                                        unique_candidates.append(tag)
+
+                                candidates = unique_candidates
 
                                 best_el = None
                                 max_score = -100
 
                                 for cand in candidates:
-                                    attr_str = f"{cand.get('id', '')} {' '.join(cand.get('class', []))}".lower()
+                                    attr_str = (f"{cand.get('id', '')} {' '.join(cand.get('class', []))}").lower()
 
                                     if any(
                                         k in attr_str
@@ -2039,7 +2060,6 @@ class WebCrawler:
                                             "drawer",
                                             "modal",
                                             "news",
-                                            "main",
                                             "page",
                                             "content",
                                         ]
@@ -2047,17 +2067,22 @@ class WebCrawler:
                                         continue
 
                                     score = 0
+
+                                    # nav は強く優先
                                     if cand.name == "nav":
                                         score += 30
                                     elif cand.name == "header":
                                         score += 5
 
+                                    # class / id にナビ関連語があれば加点
                                     if nav_pattern.search(attr_str):
                                         score += 50
                                     elif re.search(r"menu|nav|lh", attr_str):
                                         score += 20
 
+                                    # リンク数
                                     a_count = len(cand.find_all("a"))
+
                                     if 3 <= a_count <= 25:
                                         score += 30
                                     elif a_count > 30:
@@ -2079,9 +2104,8 @@ class WebCrawler:
                                 ):
                                     sub.decompose()
 
-                                raw_text = a_copy.get_text("\n", strip=True)
-                                if "\n" in raw_text:
-                                    raw_text = raw_text.split("\n")[0]
+                                # aタグ内の子要素を含めてリンク文字列を取得
+                                raw_text = a_copy.get_text(" ", strip=True)
 
                                 if not raw_text:
                                     img = a_tag.find("img")
@@ -2173,12 +2197,17 @@ class WebCrawler:
 
                         # お問い合わせ判定
                         is_contact_url = any(k.lower() in current_url.lower() for k in self.CONTACT_KEYWORDS)
-                        contact_link_tag = soup.find(
-                            "a",
-                            string=re.compile(
-                                r"問い合わせ|問合せ|相談|コンタクト|送信",
-                                re.I,
+                        contact_link_tag = next(
+                            (
+                                a
+                                for a in soup.find_all("a")
+                                if re.search(
+                                    r"問い合わせ|問合せ|相談|コンタクト|送信",
+                                    a.get_text(" ", strip=True),
+                                    re.I,
+                                )
                             ),
+                            None,
                         )
                         has_contact_text = contact_link_tag is not None
 
