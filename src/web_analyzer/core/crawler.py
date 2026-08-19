@@ -346,6 +346,48 @@ class WebCrawler:
 
         return ""
 
+    def _extract_wix_global_nav(self, soup: BeautifulSoup) -> list[str]:
+        """Wix製サイト専用のグローバルナビ抽出。
+        Wixはビルドごとにclass名がハッシュ化されるため、class名ではなく
+        Wixが内部的に付与する安定した属性(data-testid, id="SITE_HEADER..." 等)
+        を手がかりにする。
+        """
+        menus: list[str] = []
+        seen: set[str] = set()
+
+        def add(text: str) -> None:
+            cleaned = self._clean_menu_text(text)
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                menus.append(cleaned)
+
+        # --- パターンA: <wix-dropdown-menu>(ドロップダウン式) ---
+        for dropdown in soup.find_all("wix-dropdown-menu"):
+            items_ul = dropdown.find("ul", id=re.compile(r"itemsContainer$")) or dropdown.find("ul")
+            if not isinstance(items_ul, Tag):
+                continue
+            for li in items_ul.find_all("li", recursive=False):
+                if li.get("data-index") == "__more__":
+                    continue
+                a_tags = li.find_all("a", attrs={"data-testid": "linkElement"})
+                if a_tags:
+                    add(a_tags[0].get_text(" ", strip=True))
+
+        if menus:
+            return menus
+
+        # --- パターンB: ul/liを使わないボタン羅列型ヘッダー(mesh-container) ---
+        header_area = soup.find(id=re.compile(r"^SITE_HEADER")) or soup.find(attrs={"data-testid": "mesh-container-content"})
+        if isinstance(header_area, Tag):
+            for a in header_area.find_all("a", attrs={"data-testid": "linkElement"}):
+                if a.find_parent(attrs={"data-testid": re.compile(r"search-box|language-selector")}):
+                    continue
+                if a.find_parent("h1"):  # サイトロゴ/タイトルは除外
+                    continue
+                add(a.get_text(" ", strip=True))
+
+        return menus
+
     def _detect_js_framework(self, html: str) -> str:
         """SPA/CSRフレームワークの利用有無を検知する(フォーム取得漏れの原因切り分け用)。
 
@@ -1266,6 +1308,17 @@ class WebCrawler:
                                     resolved_text = t
                                     break
 
+                        # (a-2) 入力欄自身の直前の兄弟要素がラベルらしい要素の場合
+                        # 例: <div class="contact__item"><p class="contact__label">お名前</p><input ...></div>
+                        if not resolved_text:
+                            own_siblings = inp.find_previous_siblings(["p", "label", "span", "div", "dt", "th"])
+                            if own_siblings and isinstance(own_siblings[0], Tag):
+                                candidate = own_siblings[0]
+                                if not candidate.find(["input", "textarea", "select"]) and not self._looks_like_hint_element(candidate):
+                                    t = self._get_clean_element_text(candidate)
+                                    if t and len(t) < 50 and re.search(r"[A-Za-zぁ-んァ-ヶー一-龠々]", t):
+                                        resolved_text = t
+
                     # Contact Form 7 のように、入力欄を含む <p> の
                     # 直接テキストとしてラベルが記述されている形式に対応する。
                     # 例:
@@ -1333,21 +1386,13 @@ class WebCrawler:
                                         resolved_text = legend_text
                                         break
 
-                # 3. 最終フォールバック（属性値）
-                # 優先順位: aria-label/title（正しいラベルであることが多い）を
-                # placeholderより先に見る。placeholderは「例：株式会社ABC商事」のような
-                # 入力例(サンプル)であることが多く、ラベルとして使うと紛らわしいため、
-                # 明らかに「例」を示す接頭辞を持つ場合はスキップしてnameに委ねる。
-                _EXAMPLE_PLACEHOLDER_PREFIXES = ("例：", "例:", "例)", "e.g.", "ex.", "例えば")
                 if not resolved_text:
-                    for attr in ("aria-label", "title", "placeholder"):
+                    for attr in ("aria-label", "title"):
                         val = inp.get(attr)
                         if not val:
                             continue
                         t = self._remove_required_marks(str(val).strip())
                         if not t or len(t) >= 50:
-                            continue
-                        if attr == "placeholder" and t.startswith(_EXAMPLE_PLACEHOLDER_PREFIXES):
                             continue
                         resolved_text = t
                         break
@@ -2124,8 +2169,9 @@ class WebCrawler:
 
                             # --- 3. メインナビ領域の確定 ---
                             target_area = find_main_nav_element(soup)
+                            wix_menus = self._extract_wix_global_nav(soup) if cms_name == "Wix" else []
 
-                            if not target_area:
+                            if not target_area and not wix_menus:
                                 header_el = soup.find("header") or soup.find("div", id=re.compile(r"header|lh", re.I))
                                 if isinstance(header_el, Tag):
                                     candidate_nav = header_el.find(
@@ -2134,7 +2180,13 @@ class WebCrawler:
                                     ) or header_el.find("nav")
                                     target_area = candidate_nav if isinstance(candidate_nav, Tag) else header_el
 
-                            if target_area:
+                            if wix_menus:
+                                for menu_text in wix_menus:
+                                    if menu_text in ["×", "閉じる", "MENU", "メニュー", "標準", "拡大", "検索", "メニューを飛ばす"]:
+                                        continue
+                                    if menu_text not in global_nav_menus:
+                                        global_nav_menus.append(menu_text)
+                            elif target_area:
                                 target_links: list[Tag] = []
 
                                 if target_area.name == "ul":
