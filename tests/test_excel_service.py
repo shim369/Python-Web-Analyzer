@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 
 from openpyxl import load_workbook
 
@@ -6,8 +7,8 @@ from web_analyzer.core.excel_service import ExcelService
 from web_analyzer.models import SiteAssessment
 
 
-def _make_assessment(**overrides) -> SiteAssessment:
-    base = dict(
+def _make_assessment(**overrides: Any) -> SiteAssessment:
+    base: dict[str, Any] = dict(
         id="1",
         job_id="job_test_123",
         date_str="8/9",
@@ -50,6 +51,9 @@ def test_excel_export_writes_expected_cell_values(tmp_path: Path) -> None:
     wb = load_workbook(str(test_file))
     ws = wb.active
 
+    # wsがNoneでないことをmypyに明示
+    assert ws is not None
+
     # ヘッダー行
     assert ws.cell(row=1, column=2).value == "サイト名"
     assert ws.cell(row=1, column=3).value == "調査結果"
@@ -60,13 +64,13 @@ def test_excel_export_writes_expected_cell_values(tmp_path: Path) -> None:
 
     assert ws.cell(row=3, column=2).value == "ng-example.com"
     assert ws.cell(row=3, column=3).value == "×"
-    assert "ログイン" in ws.cell(row=3, column=13).value  # M列: 不可の理由
+    assert "ログイン" in str(ws.cell(row=3, column=13).value)  # M列: 不可の理由 (strキャストでoperator型エラー回避)
 
     assert ws.cell(row=4, column=2).value == "pending-example.com"
     assert ws.cell(row=4, column=3).value == "要確認"
-    # total_pages/max_depthがNoneの場合は空文字になる
-    assert ws.cell(row=4, column=6).value in (None, "")
-    assert ws.cell(row=4, column=9).value in (None, "")
+    # total_pages/max_depthがNoneの場合は空文字になる (strキャストでoperator型エラー回避)
+    assert str(ws.cell(row=4, column=6).value or "") == ""
+    assert str(ws.cell(row=4, column=9).value or "") == ""
 
 
 def test_excel_export_strips_illegal_control_characters(tmp_path: Path) -> None:
@@ -78,7 +82,9 @@ def test_excel_export_strips_illegal_control_characters(tmp_path: Path) -> None:
 
     wb = load_workbook(str(test_file))
     ws = wb.active
-    value = ws.cell(row=2, column=11).value  # K列: 用途
+    assert ws is not None
+
+    value = str(ws.cell(row=2, column=11).value or "")  # K列: 用途
     assert "\x0b" not in value
     assert "\x1f" not in value
     assert "混入テスト" in value

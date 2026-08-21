@@ -2,6 +2,7 @@ from collections.abc import Callable
 
 import pytest
 import requests
+from _pytest.monkeypatch import MonkeyPatch
 
 from web_analyzer.core.ssl_checker import SslChecker
 
@@ -23,7 +24,13 @@ class FakeSession:
         self.routes = routes
         self.calls: list[str] = []
 
-    def get(self, url: str, headers=None, timeout=None, allow_redirects=True):
+    def get(
+        self,
+        url: str,
+        headers: object = None,
+        timeout: object = None,
+        allow_redirects: bool = True,
+    ) -> object:
         self.calls.append(url)
         result = self.routes.get(url)
         if result is None:
@@ -37,7 +44,9 @@ class FakeSession:
 
 
 @pytest.fixture
-def patch_session(monkeypatch) -> Callable[[SslChecker, dict[str, object]], None]:
+def patch_session(
+    monkeypatch: MonkeyPatch,
+) -> Callable[[SslChecker, dict[str, object]], FakeSession]:
     def _patch(checker: SslChecker, routes: dict[str, object]) -> FakeSession:
         fake = FakeSession(routes)
         monkeypatch.setattr(checker, "_get_session", lambda: fake)
@@ -51,7 +60,9 @@ def test_ssl_checker_init() -> None:
     assert checker.timeout == 10.0
 
 
-def test_always_ssl_when_http_redirects_to_https(patch_session) -> None:
+def test_always_ssl_when_http_redirects_to_https(
+    patch_session: Callable[[SslChecker, dict[str, object]], FakeSession],
+) -> None:
     checker = SslChecker()
     patch_session(
         checker,
@@ -65,7 +76,9 @@ def test_always_ssl_when_http_redirects_to_https(patch_session) -> None:
     assert is_always_ssl is True
 
 
-def test_ssl_available_but_not_forced(patch_session) -> None:
+def test_ssl_available_but_not_forced(
+    patch_session: Callable[[SslChecker, dict[str, object]], FakeSession],
+) -> None:
     checker = SslChecker()
     patch_session(
         checker,
@@ -81,7 +94,9 @@ def test_ssl_available_but_not_forced(patch_session) -> None:
     assert is_always_ssl is False
 
 
-def test_no_ssl_support_at_all(patch_session) -> None:
+def test_no_ssl_support_at_all(
+    patch_session: Callable[[SslChecker, dict[str, object]], FakeSession],
+) -> None:
     checker = SslChecker()
     patch_session(
         checker,
@@ -96,7 +111,9 @@ def test_no_ssl_support_at_all(patch_session) -> None:
     assert is_always_ssl is False
 
 
-def test_connection_failure_on_both_schemes_returns_unknown(patch_session) -> None:
+def test_connection_failure_on_both_schemes_returns_unknown(
+    patch_session: Callable[[SslChecker, dict[str, object]], FakeSession],
+) -> None:
     checker = SslChecker()
     patch_session(
         checker,
@@ -111,7 +128,7 @@ def test_connection_failure_on_both_schemes_returns_unknown(patch_session) -> No
     assert is_always_ssl is None
 
 
-def test_cert_mismatch_retries_with_www_domain(monkeypatch) -> None:
+def test_cert_mismatch_retries_with_www_domain(monkeypatch: MonkeyPatch) -> None:
     """証明書のホスト名不一致(SSLError)の場合のみ、www付きドメインで自動的に再試行することを確認する。"""
     checker = SslChecker()
 
@@ -132,7 +149,9 @@ def test_cert_mismatch_retries_with_www_domain(monkeypatch) -> None:
     assert "http://www.cert-mismatch.example.com" in fake.calls
 
 
-def test_generic_connection_error_does_not_retry_with_www(patch_session) -> None:
+def test_generic_connection_error_does_not_retry_with_www(
+    patch_session: Callable[[SslChecker, dict[str, object]], FakeSession],
+) -> None:
     """証明書エラーではない単純な接続失敗では、www付きへの再試行は行わないことを確認する。"""
     checker = SslChecker()
     fake = patch_session(
@@ -150,7 +169,9 @@ def test_generic_connection_error_does_not_retry_with_www(patch_session) -> None
     assert not any("www." in url for url in fake.calls)
 
 
-def test_www_domain_input_does_not_trigger_further_retry(patch_session) -> None:
+def test_www_domain_input_does_not_trigger_further_retry(
+    patch_session: Callable[[SslChecker, dict[str, object]], FakeSession],
+) -> None:
     """入力が既にwww付きの場合、さらにwww.www...と再試行しないことを確認する。"""
     checker = SslChecker()
     fake = patch_session(

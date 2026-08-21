@@ -1,3 +1,5 @@
+from typing import Any
+
 from web_analyzer.core.evaluator import RenewalEvaluator
 
 
@@ -61,7 +63,7 @@ def test_evaluate_respects_custom_page_threshold() -> None:
 
 def test_evaluate_html_based_detectors() -> None:
     evaluator = RenewalEvaluator()
-    base_kwargs = dict(total_pages=5, max_depth=1, has_login=False, has_attachment=False)
+    base_kwargs: dict[str, Any] = dict(total_pages=5, max_depth=1, has_login=False, has_attachment=False)
 
     cases = {
         "captcha": ('<div class="g-recaptcha"></div>', "画像認証"),
