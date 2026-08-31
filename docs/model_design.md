@@ -2,7 +2,7 @@
 
 ## 0. モジュール配置
 
-`ScrapingJob` / `SiteAssessment` / `LOGIN_KEYWORDS` を定義する `models.py` は `src/web_analyzer/models.py` に配置されている（`src/web_analyzer/core/models.py` ではない点に注意）。`core/`配下の各モジュール（`crawler.py`, `scraper_service.py`, `job_repository.py`等）はいずれも `from web_analyzer.models import ...` の形でインポートする。
+`ScrapingJob` / `SiteAssessment` を定義する `models.py` は `src/web_analyzer/models.py` に配置されている（`src/web_analyzer/core/models.py` ではない点に注意）。`core/`配下の各モジュール（`crawler.py`, `scraper_service.py`, `job_repository.py`等）はいずれも `from web_analyzer.models import ...` の形でインポートする。
 
 ## 1. モデル設計 (Domain Models)
 
@@ -67,6 +67,7 @@ Excelの1行分の解析・調査結果を保持するミュータブル（可�
 
 呼び出し元（`SiteScraperService`）はこの順序でtupleアンパックを行う。順序や要素数を変更する場合は、呼び出し元・関数の戻り値型ヒント（`tuple[...]`）の両方を同時に修正する必要がある（型ヒントだけ更新が漏れると、実際に返す要素数と宣言が食い違い、mypyの`Incompatible return value type`エラーになる）。
 
+* `has_login`は、`_has_password_login_form`によって検知される。パスワード入力欄（`type="password"`、または`autocomplete="current-password"/"new-password"`）を持つフォームが、サイト共通のヘッダー/グローバルナビ（`<header>`要素、または`_HEADER_LIKE_RE`＝`header|gnav|globalnav|utility|top-?bar|topnav|l-header`にマッチするclass/id）を伴って表示されている場合にTrueとなる。CMS管理画面のログインページ（`wp-login.php`等）を個別列挙して除外する方式は対象CMSが増えるたびにメンテナンスが必要になるため採用せず、「訪問者向けの会員ログイン・マイページは通常のページテンプレートに組み込まれるためサイト共通ヘッダーを伴うが、管理者ログイン画面は単独ページとして表示されヘッダーを伴わない」という構造的な違いで区別している。`login`/`mypage`/`member`/`account`等の文字列はログイン判定そのものには使われておらず、クロールキューの巡回優先度付けにのみ使用される。
 * `has_basic_auth`は、初回アクセス（`primary_url`/`fallback_url`）およびクロールループ内の各ページ取得時、`response.status_code == 401`を`raise_for_status()`呼び出し前に確認することで検知する。サイト全体がベーシック認証で保護されている場合だけでなく、一部の下層ページのみが保護されている場合も検知できる。
 * `blocked_reason`は、取得したHTMLがFortinet Webfilter等のネットワークセキュリティ機器によるブロックページ（実サイトの内容ではない）であるかどうかを判定して設定される。SSL証明書エラーが引き金でこの警告ページが返されているケースを区別して分類する処理（`_extract_fortinet_category`等）を含む。`blocked_reason`が設定された時点で、通常の巡回・判定ロジックには進まず即座に結果を返す。
 * `redirect_target_url`は、取得したHTMLがmeta refreshやJSの`location.href`書き換え等によって数秒後に別ドメインへ自動遷移する「移転案内ページ」かどうかを検知して設定される（`_detect_delayed_cross_domain_redirect`）。設定された時点で即座に結果を返す。
@@ -132,7 +133,7 @@ Google Map埋め込みは、ほぼすべてのコーポレートサイトのア�
 `_process_single_assessment`が1ドメイン分の処理単位であり、以下の順で実行される。
 
 1. `SslChecker.check_ssl_status()`でSSL/常時SSL判定
-2. `WebCrawler(render_js=True, timeout=90.0, page_timeout=8.0).crawl_and_analyze()`でクロール（JSフレームワーク検知でPlaywrightレンダリングが走ると1回あたり15秒前後かかることがあるため、デフォルトより長いタイムアウトを明示している）
+2. `WebCrawler(render_js=True, timeout=300.0, page_timeout=8.0).crawl_and_analyze()`でクロール（JSフレームワーク検知でPlaywrightレンダリングが走ると1回あたり15秒前後かかることに加え、記事系ページを大量に持つサイトで90秒では実ページ数を大きく下回ってしまう事例があったため、visited件数100件到達での早期打ち切りを前提に300秒まで引き上げている）
 3. クロール結果に`redirect_target_url`（移転案内ページ）があれば、`RenewalEvaluator.decide()`を呼ばずに`"×"`（すでにリニューアル済のため）を確定し、備考欄に移転先を記録
 4. そうでなく`blocked_reason`（ネットワーク機器ブロック）があれば、同様に`decide()`を呼ばずに`"要確認"`＋検知した理由を確定
 5. どちらでもなければ`RenewalEvaluator.decide()`を呼び出し、通常の判定フローに委ねる
