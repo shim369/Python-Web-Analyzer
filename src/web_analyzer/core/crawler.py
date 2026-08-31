@@ -5,7 +5,7 @@ import time
 import warnings
 from collections import deque
 from typing import cast
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup, NavigableString, Tag, XMLParsedAsHTMLWarning
@@ -135,6 +135,50 @@ class WebCrawler:
     # location遷移をJSで行うパターン(onclick / インラインscript両対応)
     _JS_LOCATION_RE = re.compile(r"(?:location\.href|window\.location(?:\.href)?)\s*=\s*['\"]([^'\"]+)['\"]")
 
+    # WordPress等のページネーション用パスセグメント。
+    # テーマ/プラグインが「次へ」リンクを "page/3/" のような絶対パスでない
+    # 素の相対パスで出力していると、urljoin()による相対解決の結果、
+    # "/page/2/page/3/page/4/..." のように本来同階層であるべきページネーションが
+    # 無限に入れ子になっていくURLが生成されてしまう(daito-com.co.jpで確認)。
+    # 数字部分が毎回変わるため _has_repeating_path_pattern の隣接同一チェックを
+    # すり抜けるが、同じキーワードが2回以上パス内に出現すること自体が
+    # 明確に異常な兆候であるため、専用にチェックする。
+    _PAGINATION_SEGMENT_KEYWORDS = {"page", "paged"}
+
+    # normalize_url()でクエリ文字列を丸ごと除去すると、"detail.php?id=1"や
+    # "detail.php?id=2"のような、クエリパラメータで実際に異なるコンテンツを
+    # 出し分ける旧来型PHPサイト(daitokasei.com等)で、全ての記事が同一URLとして
+    # 重複排除されてしまい、最初の1件しか巡回されなくなる不具合があった。
+    # 一方でSNS流入計測用のutm_*等のトラッキングパラメータは、同じページを
+    # 指しているのに値だけ違う無数のバリエーションを生み、放置すると逆に
+    # 無限に近いURLバリエーションを生成してしまう。そのため、既知の
+    # トラッキング系パラメータのみを除去し、それ以外のクエリパラメータ
+    # (id, p, page_id等、コンテンツ識別に使われている可能性があるもの)は
+    # 保持する方針にする。
+    _TRACKING_QUERY_KEYS = {
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_term",
+        "utm_content",
+        "utm_id",
+        "utm_name",
+        "utm_reader",
+        "fbclid",
+        "gclid",
+        "gclsrc",
+        "dclid",
+        "msclkid",
+        "mc_cid",
+        "mc_eid",
+        "yclid",
+        "twclid",
+        "igshid",
+        "_ga",
+        "_gl",
+        "spm",
+    }
+
     def __init__(
         self,
         timeout: float = 30.0,
@@ -207,6 +251,13 @@ class WebCrawler:
                 ".7z",  # 圧縮・ドキュメント
                 ".mp3",
                 ".wav",  # 音声
+                ".xlsx",
+                ".xls",
+                ".docx",
+                ".doc",
+                ".pptx",
+                ".ppt",
+                ".csv",  # Office文書(添付資料等。HTMLページではなくダウンロード対象のため対象外)
             ]
         ):
             return False
@@ -220,6 +271,9 @@ class WebCrawler:
             return False
 
         if not self._is_depth_worthy_path(parsed_abs.path):
+            return False
+
+        if self._has_nested_pagination_trap(parsed_abs.path):
             return False
 
         return abs_domain == base_domain
@@ -249,10 +303,37 @@ class WebCrawler:
         has_site_chrome = bool(body.find("header") or body.find(class_=self._HEADER_LIKE_RE) or body.find(id=self._HEADER_LIKE_RE))
         return has_site_chrome
 
-    def _detect_cms(self, html: str) -> str:
+    def _detect_cms(self, html: str, url: str = "") -> str:
         html = html.lower()
 
+        # "assets_c" はMovable Type固有の自動生成アセット格納ディレクトリ(記事内画像・
+        # サムネイル等)であり、HTML本文にmt-content/mt-static等の目印が出ない
+        # テンプレートでも、URLパスにこのディレクトリ名が含まれていればMovable Type製
+        # サイトだと判定できる(danshinen.orgで確認)。
+        if url and "/assets_c/" in url.lower():
+            return "Movable Type"
+
+        # DNN(DotNetNuke)製サイト(dohkenkyo.or.jp等)で"WP"に誤判定される事例があった。
+        # DNNサイトは<base>タグでルート相対パスを解決させる作りが多く、
+        # "Portals/0/images/..."のように先頭のスラッシュを省略したHTMLに
+        # なっていることがある。先頭スラッシュを必須にした正規表現では
+        # このパターンを拾えず判定が効かなかったため、スラッシュの有無に
+        # 依存しない形に緩める。また埋め込みウィジェットや外部スクリプト
+        # 経由でHTML中に偶然"wp-content"/"wp-includes"という文字列を含む
+        # ことがあり、下の緩いキーワード判定(cms_patterns)がそれを拾って
+        # WordPressだと誤検知してしまうため、これらのDNN特有の強いシグナル
+        # は緩い判定より先に確認する。
+        if re.search(r"(?:^|[\"'/])desktopmodules/", html) or re.search(r"(?:^|[\"'/])portals/\d+/", html):
+            return "DNN (DotNetNuke)"
+
         cms_patterns = {
+            # WP等の緩いキーワード判定より前に、DNN特有のシグナルが無くても
+            # 拾えるようDNNを最優先でチェックする(念のための二重対策)。
+            "DNN (DotNetNuke)": [
+                "dotnetnuke",
+                "dnn.js",
+                "dnn_ctr",
+            ],
             "WP": [
                 "wp-content",
                 "wp-includes",
@@ -511,22 +592,58 @@ class WebCrawler:
 
         return False
 
+    def _clean_query(self, query: str) -> str:
+        """クエリ文字列から既知のトラッキングパラメータのみを除去する。
+
+        id/p/page_id等のコンテンツ識別に使われうるパラメータは保持し、
+        残ったパラメータはキー名でソートして再構成する(同じコンテンツを
+        指す"?id=1&ref=twitter"と"?ref=twitter&id=1"のような、
+        並び順違いだけのURLが別ページとして重複カウントされるのを防ぐため)。
+        """
+        if not query:
+            return ""
+        pairs = parse_qsl(query, keep_blank_values=True)
+        filtered = [(k, v) for k, v in pairs if k.lower() not in self._TRACKING_QUERY_KEYS]
+        filtered.sort()
+        return urlencode(filtered)
+
+    def _has_nested_pagination_trap(self, path: str) -> bool:
+        """ページネーション用セグメント(page/paged等)が同一パス内に2回以上出現するかを判定する。
+
+        正常なページネーションURLは "/blog/page/3/" のように該当キーワードが
+        1回しか登場しない。"/page/2/page/3/" のように2回以上登場している場合は、
+        相対パス解決ミス等によって生まれた疑似的な入れ子URLである可能性が高いため、
+        巡回対象・階層数カウントの対象から除外する。
+        """
+        segments = [p.lower() for p in path.split("/") if p]
+        keyword_hits = sum(1 for seg in segments if seg in self._PAGINATION_SEGMENT_KEYWORDS)
+        return keyword_hits >= 2
+
     def _is_depth_worthy_path(self, path: str) -> bool:
         """「階層数」のカウント・巡回対象とするに値するURLパスかどうかを判定する。
 
         カレンダーウィジェットの日付ドリルダウン(例: /calendar/2024/08/09/10/11/12/)
-        のように、短い数値セグメントが3つ以上連続するパスは、実際のサイト構成とは
+        のように、短い数値セグメントが4つ以上連続するパスは、実際のサイト構成とは
         無関係に機械的に深くなっていくURLパターン(無限に近いバリエーションを持つ
         カレンダーの日送りリンク等)である可能性が高い。これをそのまま巡回・階層数
         カウントの対象にすると、無駄にクロール予算を消費するうえ、「階層数」が
         サイトの実態とかけ離れて高く表示されてしまう。
+
+        しきい値は意図的に「3以上」ではなく「4以上」にしている。WordPress等の
+        日付ベースのパーマリンク(例: /blog/2019/07/49/ = 年/月/連番の3セグメント、
+        /blog/2019/07/09/ = 年/月/日の3セグメント)はごく一般的な正規の投稿URLだが、
+        数値セグメントがちょうど3つ連続するため、しきい値が3のままだと巡回対象から
+        誤って除外され、ページ数・階層数が過小に判定される原因になっていた
+        (daisyokousan.co.jpで確認)。実際に問題となるカレンダードリルダウン
+        (年/月/日/時など)は4セグメント以上に及ぶことがほとんどのため、
+        しきい値を4に引き上げても本来の目的(無限トラップの回避)は損なわれない。
         """
         segments = [p for p in path.split("/") if p]
         numeric_run = 0
         for seg in segments:
             if seg.isdigit() and len(seg) <= 4:
                 numeric_run += 1
-                if numeric_run >= 3:
+                if numeric_run >= 4:
                     return False
             else:
                 numeric_run = 0
@@ -1745,6 +1862,13 @@ class WebCrawler:
             if clean_path == ".":
                 clean_path = "/"
             clean_path = re.sub(r"/index\.(html|php)$", "", clean_path)
+            # 上のindex.html除去で、ルート直下の"/index.html"は丸ごと""(空文字)に
+            # なってしまう。一方トップページ"/"はここでは既に"/"のまま変化しないため、
+            # 本来同じページである"/"と"/index.html"が""と"/"という別々の文字列に
+            # 正規化され、別ページとして二重カウントされてしまっていた(ddesi.co.jpで確認)。
+            # 除去した結果パスが空になった場合はルートの"/"に補正する。
+            if clean_path == "":
+                clean_path = "/"
             if clean_path.endswith("/") and clean_path != "/":
                 clean_path = clean_path.rstrip("/")
             # HTML側でURLエンコードされずに href="/お知らせ/" のように日本語等の
@@ -1754,7 +1878,15 @@ class WebCrawler:
             # UnicodeEncodeError('ascii' codec can't encode characters...)になることがある。
             # 既存の%XXエンコード済み部分を壊さないよう safe="/%" を指定してエンコードする。
             clean_path = quote(clean_path, safe="/%")
-            return parsed._replace(path=clean_path, query="", fragment="").geturl()
+            # _is_valid_internal_link()のドメイン一致判定は netloc.replace("www.", "") で
+            # www有無を無視して「同一サイト」として扱っているのに対し、
+            # normalize_url()側ではnetlocをそのまま保持していたため、内部リンクが
+            # www有りと無しの両方の絶対URLで書かれているサイト(danshinen.org等)で、
+            # 実質同じページが別URL扱いされ二重に訪問・カウントされてしまっていた。
+            # visited/queueの重複排除キーとしてもwww有無を同一視するよう揃える。
+            clean_netloc = re.sub(r"^www\.", "", parsed.netloc, flags=re.IGNORECASE)
+            clean_query = self._clean_query(parsed.query)
+            return parsed._replace(netloc=clean_netloc, path=clean_path, query=clean_query, fragment="").geturl()
 
         def enqueue(url: str, path_depth: int, priority: bool) -> None:
             if url in visited or url in queued_urls or len(visited) >= 100:
@@ -1955,6 +2087,8 @@ class WebCrawler:
 
                         if current_url == first_url and first_html:
                             current_html = first_html
+                            # first_url は既にリダイレクト追従後の最終URL(str(response.url))
+                            resolved_url = first_url
                         else:
                             response = client.get(current_url, headers=req_headers)
                             if response.status_code == 401:
@@ -1962,6 +2096,14 @@ class WebCrawler:
                             if response.status_code != 200:
                                 continue
                             current_html = self._decode_response(response)
+                            # normalize_url()でキュー投入時に末尾スラッシュを削っているため、
+                            # current_url(例: ".../sdgs")のままリンク解決の基準にすると、
+                            # follow_redirects=Trueで実際に内容を取得した先(".../sdgs/")と
+                            # 食い違い、ページ内の相対リンク(例: href="factory/")が
+                            # urljoin()で誤って1階層上(".../factory/")に解決されてしまう。
+                            # そのため、以降のリンク解決には必ずリダイレクト追従後の
+                            # 実URL(response.url)を使う。
+                            resolved_url = str(response.url)
 
                         # httpxで取得済みのHTMLが静的（JSフレームワーク未使用）な場合、わざわざ
                         # Playwrightで再レンダリングし直すと全体タイムアウト予算(self.timeout)の
@@ -1973,7 +2115,7 @@ class WebCrawler:
                             if rendered:
                                 current_html = rendered
 
-                        previous_url = current_url
+                        previous_url = resolved_url
                         soup = BeautifulSoup(current_html, HTML_PARSER)
                         combined_html_src += f"\n{current_html}"
 
@@ -1983,7 +2125,7 @@ class WebCrawler:
                         # CMS判定(ページによって検知しやすさが違うため、複数ページに渡って試みる。
                         # 一度検知できれば以降のページでは上書きしない)
                         if not cms_name:
-                            detected_cms = self._detect_cms(current_html)
+                            detected_cms = self._detect_cms(current_html, resolved_url)
                             if detected_cms:
                                 cms_name = detected_cms
 
@@ -2248,7 +2390,7 @@ class WebCrawler:
                                         global_nav_menus.append(menu_text)
 
                         # お問い合わせ判定
-                        is_contact_url = any(k.lower() in current_url.lower() for k in self.CONTACT_KEYWORDS)
+                        is_contact_url = any(k.lower() in resolved_url.lower() for k in self.CONTACT_KEYWORDS)
                         contact_link_tag = next(
                             (
                                 a
@@ -2266,7 +2408,7 @@ class WebCrawler:
                         if (is_contact_url or has_contact_text) and not contact_fields:
                             candidate_fields, candidate_attachment = self._extract_form_fields(
                                 current_html,
-                                current_url,
+                                resolved_url,
                                 client,
                                 depth=0,
                             )
@@ -2289,14 +2431,23 @@ class WebCrawler:
                         candidate_hrefs.extend(self._extract_js_links(current_html))
 
                         for href in candidate_hrefs:
-                            if self._is_valid_internal_link(current_url, href, base_domain_clean):
-                                abs_href = urljoin(current_url, href)
+                            if self._is_valid_internal_link(resolved_url, href, base_domain_clean):
+                                abs_href = urljoin(resolved_url, href)
                                 norm_abs = normalize_url(abs_href)
                                 parsed_abs = urlparse(norm_abs)
                                 path_depth = len([p for p in parsed_abs.path.split("/") if p])
 
-                                if path_depth > max_depth:
-                                    max_depth = path_depth
+                                # ここで発見しただけのリンク(まだ一度も訪問していない候補URL)の
+                                # 深さをmax_depthに反映してしまうと、実際には二度と訪問されない
+                                # URL(既訪問との重複排除で捨てられるもの、JS内のlocation.href
+                                # 代入から拾ったダミー文字列等のノイズ)によって「階層数」が
+                                # 実態より過大に表示される不具合があった(dohkenkyo.or.jpで確認:
+                                # 実際に訪問した最深ページは5セグメントしかないのに、階層数が
+                                # 10と表示されていた)。max_depthは、実際にキューから取り出して
+                                # 処理した(=本当に訪問した)ページの深さのみを根拠にする
+                                # (visited時点の更新は本ループの先頭付近、
+                                # `if depth > max_depth: max_depth = depth` を参照)。
+                                # ここではenqueue()の優先度判定に使うpath_depthの算出のみ行う。
 
                                 is_priority = any(
                                     k.lower() in norm_abs.lower()
