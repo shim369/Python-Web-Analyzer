@@ -193,11 +193,14 @@ class SiteScraperService:
         # カウントされず、実際のページ数を大きく下回ってしまっていた。
         # クローラー側には「visited件数が100件に達したら即座に打ち切る」という
         # 上限が既に実装されており、この上限がある限りページ数自体の暴走(無限に
-        # 増え続けること)は起きない。そのため全体タイムアウトは「100ページに
-        # 到達するまで十分な時間」を目安に300秒へ引き上げ、記事系ページが
-        # 多いサイトでも実態に近い件数(上限に達した場合は「100ページ以上」表示)
-        # まで巡回できるようにする。
-        crawler = WebCrawler(render_js=True, timeout=300.0, page_timeout=8.0)
+        # 増え続けること)は起きない。
+        #
+        # 当初300秒まで引き上げたが、ThreadPoolExecutor(DEFAULT_MAX_WORKERS=5)で
+        # 並列実行している都合上、記事系の重いサイトが1つワーカー枠を長時間
+        # 占有し続けると、待機中の他ドメインの処理が押し出されて全体の
+        # スループットが体感できるレベルで低下した。100ページに到達するまでの
+        # 余裕は残しつつ、全体への影響を抑えるバランス値として150秒に調整する。
+        crawler = WebCrawler(render_js=True, timeout=150.0, page_timeout=8.0)
         try:
             (
                 total_pages_fetched,
@@ -214,6 +217,7 @@ class SiteScraperService:
                 blocked_reason_raw,
                 redirect_target_url_raw,
                 queue_exhausted_raw,
+                subsystem_note_raw,
             ) = crawler.crawl_and_analyze(item.domain_name)
         except Exception as e:
             logger.warning(f"[{item.domain_name}] クロール中に予期せぬエラーが発生しました: {e}")
@@ -225,6 +229,7 @@ class SiteScraperService:
         blocked_reason = str(blocked_reason_raw or "")
         redirect_target_url = str(redirect_target_url_raw or "")
         queue_exhausted = bool(queue_exhausted_raw)
+        subsystem_note = str(subsystem_note_raw or "")
 
         # 文字列判定と数値へのクリーンアップ処理
         if total_pages_fetched == "100ページ以上":
@@ -259,6 +264,11 @@ class SiteScraperService:
                 page_threshold=page_threshold,
                 queue_exhausted=queue_exhausted,
             )
+            # ページ数・階層数の集計や◯/×判定そのものは変えず、あくまで人間が
+            # 最終確認する際の参考情報として備考欄に注記するに留める
+            # (別システムを機械的に除外しようとすると、正規のサブディレクトリを
+            # 誤って除外するリスクを負うため)。
+            remarks_value = subsystem_note
 
         # スレッドセーフに結果を書き込み
         with self._lock:

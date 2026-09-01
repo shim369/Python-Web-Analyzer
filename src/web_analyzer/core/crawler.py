@@ -108,6 +108,13 @@ class WebCrawler:
         "vite/client",
         "remix",
         "astro-island",
+        # Canva/Webflow/Framer等のノーコードサイトビルダーも、静的HTML(httpx取得分)
+        # にはほぼ実質的なコンテンツ・内部リンクが含まれず、JavaScriptによる
+        # クライアントサイド描画に依存している。既知のJSフレームワークと同様、
+        # Playwrightでの再レンダリングが必要な対象として扱う(estercorp.co.jpで確認)。
+        "canva",
+        "webflow",
+        "framer",
     ]
 
     # CMSの自動生成抜粋(excerpt)が文の途中で切れているサインとなる省略記号。
@@ -177,6 +184,19 @@ class WebCrawler:
         "_ga",
         "_gl",
         "spm",
+        # 以下はEC-CUBE等のカタログ系システムで、"category_id=bag"と
+        # "category_id=bag&sort=datetime_desc&word="のように、実質は同じ
+        # 一覧ページの並び替え・絞り込みキーワードの初期値(空文字/デフォルト値)
+        # にすぎないパラメータが付与された「見た目だけ別のURL」を生み、
+        # ページ数が水増しされる原因になっていた(earth-inc.co.jpで確認)。
+        # これらは値によってコンテンツが変わりうる(例: sort=price_ascで
+        # 表示順が変わる、word=xxxで絞り込み結果が変わる)ため、本来は
+        # 除去すべきでないケースもあるが、空値やデフォルト値での重複発生の
+        # 実害の方が大きいと判断し、除去対象に含める。
+        "sort",
+        "order",
+        "orderby",
+        "word",
     }
 
     def __init__(
@@ -220,12 +240,178 @@ class WebCrawler:
         domain = netloc.split(":")[0]
         return domain.replace("www.", "")
 
+    # ファイル名の拡張子としてよく使われる文字列。ドメインらしき文字列の
+    # 誤検知(例: "index.php"や"page.html"をドメインと誤判定すること)を
+    # 避けるため、末尾がこれらに一致する場合はドメイン判定の対象外とする。
+    _COMMON_FILE_EXTENSIONS = {
+        "html",
+        "htm",
+        "php",
+        "asp",
+        "aspx",
+        "jsp",
+        "xml",
+        "json",
+        "js",
+        "css",
+        "jpg",
+        "jpeg",
+        "png",
+        "gif",
+        "pdf",
+        "txt",
+        "xhtml",
+        "webp",
+        "svg",
+        "ico",
+        "zip",
+        "tar",
+        "gz",
+        "rar",
+        "7z",
+        "mp3",
+        "mp4",
+        "avi",
+        "mov",
+        "wmv",
+        "flv",
+        "webm",
+        "wav",
+        "xlsx",
+        "xls",
+        "docx",
+        "doc",
+        "pptx",
+        "ppt",
+        "csv",
+    }
+
+    def _looks_like_bare_domain_segment(self, segment: str) -> bool:
+        """パスの1セグメントが、スキーム抜けの絶対URL誤爆によるドメイン名らしいかを判定する。
+
+        HTML側に"easnet.sakura.ne.jp/wp/hh"のように、本来別ドメインへの絶対URL
+        であるべきリンクがスキーム(https://等)を欠いたまま書かれていることがある。
+        この場合urljoin()は仕様通り「相対パス」として解決してしまい、
+        "https://eas-c.jp/am/easnet.sakura.ne.jp/wp/hh"のような、本来存在しない
+        URLがパスの途中にホスト名を含む形で生成されてしまう(eas-c.jpで確認)。
+        こうしたセグメントは「ドット区切りが2つ以上あり、末尾が既知のファイル
+        拡張子でも純粋な数字でもない、ラベルらしい文字列で終わる」という
+        ドメイン名らしい形をしているため、これを検知して内部リンクとしての
+        巡回対象から除外する。
+        """
+        if segment.count(".") < 2:
+            return False
+        last_label = segment.rsplit(".", 1)[-1].lower()
+        if last_label in self._COMMON_FILE_EXTENSIONS:
+            return False
+        return bool(re.fullmatch(r"[a-z]{2,24}", last_label))
+
+    # "blog"や"topics"のような、CMSで一般的に使われる正当なコンテンツ
+    # ディレクトリ名。記事数が多いサイトではこれらのディレクトリだけで
+    # 全体の70〜90%に達することも珍しくなく(eigyokaigi.comの"/blog/"で72%、
+    # ebuno.comの"/topics/"で87%を確認)、比率のしきい値をどれだけ上げても
+    # "/monster/"のような本物の別システムと安定して区別できない。
+    # ディレクトリ名自体が明確に「記事・お知らせの置き場」だと分かる場合は、
+    # 比率に関わらず注記の対象外とする。
+    _LIKELY_CONTENT_DIR_NAMES = {
+        "blog",
+        "blogs",
+        "topics",
+        "news",
+        "info",
+        "information",
+        "column",
+        "columns",
+        "article",
+        "articles",
+        "diary",
+        "posts",
+        "press",
+        "release",
+        "releases",
+        "notice",
+        "notices",
+        # 個別記事・固定ページをまとめて格納する、CMSでよく使われる汎用フォルダ名。
+        # "pages"(固定ページ一覧)、"archives"(年月別記事アーカイブ)、
+        # "contents"(コンテンツ一覧)も、"blog"/"topics"と同様に単に記事・
+        # ページ数が多いだけの正当なディレクトリであるケースが大半なので対象外とする
+        # (eikoh-eng.co.jp等で確認)。
+        "pages",
+        "archives",
+        "contents",
+    }
+
+    def _detect_subsystem_note(self, canonical_visited: set[str]) -> str:
+        """サイト全体のごく一部のディレクトリ配下に、別システムらしきものが
+        同居していて、そこだけでページ数の大半を占めていないかを調べる。
+
+        "/monster/"配下のEC-CUBEショップのように、コーポレートサイト本体とは
+        毛色の違う別システムが同じドメインの1ディレクトリに間借りしている
+        ケースでは、そこの商品ページ・カテゴリページを律儀に数えてしまうと、
+        「実際には数年前に作られたまま放置された旧システム」の分量に
+        ページ数・階層数が引きずられ、本体サイトの実態を見誤らせる
+        (earth-inc.co.jpで確認)。ただし「どのディレクトリが別システムか」を
+        機械的に断定するのはCMSやサイト構成の多様性を考えると危険なので、
+        ここでは判定・除外はせず、「先頭ディレクトリの1つに全体の大半の
+        ページが集中している」という偏りだけを検知して、人間が確認する
+        きっかけとなる注記文字列を返すに留める。該当しない場合は空文字。
+        """
+        total = len(canonical_visited)
+        # サイト全体のページ数が少ない場合、たまたま1ディレクトリに複数ページ
+        # あるだけでも比率が高くなりやすく、注記を出す意味が薄いため対象外とする。
+        if total < 10:
+            return ""
+
+        top_dir_counts: dict[str, int] = {}
+        for url in canonical_visited:
+            segments = [s for s in urlparse(url).path.split("/") if s]
+            if not segments:
+                continue
+            top_dir = segments[0]
+            top_dir_counts[top_dir] = top_dir_counts.get(top_dir, 0) + 1
+
+        if not top_dir_counts:
+            return ""
+
+        top_dir, count = max(top_dir_counts.items(), key=lambda item: item[1])
+        if top_dir.lower() in self._LIKELY_CONTENT_DIR_NAMES:
+            return ""
+        ratio = count / total
+        # 件数・比率のどちらも一定以上の場合のみ注記する。
+        if count >= 10 and ratio >= 0.8:
+            # "旧オンラインショップ等"のように具体例を決め打ちすると、実際には
+            # 施設検索・会員機能等のCURRENTな機能であるケース(ebr-med.or.jpの
+            # "/institutes/"施設検索機能等)にそぐわない。ページ数・階層数の
+            # 判定に影響しうる、という事実だけを伝える中立的な表現にする。
+            return (
+                f"「/{top_dir}/」配下に{count}件({ratio:.0%})のページが集中しています。"
+                "コーポレートサイト本体とは技術的に異なる機能やシステム"
+                "(検索・会員機能、旧サイトの残存等)が同居している可能性があります。"
+                "ページ数・階層数の判定に影響している場合があるため、"
+                "内容を確認することをおすすめします。"
+            )
+        return ""
+
     def _is_valid_internal_link(self, current_url: str, href: str, base_domain: str) -> bool:
         if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
             return False
         abs_url = urljoin(current_url, href)
         parsed_abs = urlparse(abs_url)
         abs_domain = parsed_abs.netloc.replace("www.", "").split(":")[0]
+
+        # ここまでの"ドットが2つ以上"という判定は、easnet.sakura.ne.jpのような
+        # 他ドメインの誤埋め込みは捕捉できるが、eas-c.jpのように調査対象サイト
+        # 自身のドメイン名(ドットが1つしかない一般的な2ラベル構成)が
+        # "eas-c.jp/team"のようにスキーム抜けで自己参照的に埋め込まれるケースを
+        # 見逃していた(eas-c.jpで"https://eas-c.jp/eas-c.jp/team"のような
+        # パターンが多数発生し、依然としてページ数100件到達の主因になっていた)。
+        # パスセグメントが調査対象ドメイン自身と完全一致する場合は、ドット数に
+        # 関わらず確実にスキーム抜けの自己参照リンクとみなせるため、直接比較する。
+        if any(seg.lower() == base_domain.lower() for seg in parsed_abs.path.split("/") if seg):
+            return False
+
+        if any(self._looks_like_bare_domain_segment(seg) for seg in parsed_abs.path.split("/") if seg):
+            return False
 
         if any(
             parsed_abs.path.lower().endswith(ext)
@@ -260,6 +446,16 @@ class WebCrawler:
                 ".csv",  # Office文書(添付資料等。HTMLページではなくダウンロード対象のため対象外)
             ]
         ):
+            return False
+
+        # wp-login.php(WordPressのログイン画面)は一般訪問者にも200 OKを返すため、
+        # 通常のコンテンツページと見分けがつかず、そのまま巡回対象に含めると
+        # サイトの実コンテンツではない管理用UIがページ数にカウントされてしまう
+        # (eigyokaigi.comで確認)。xmlrpc.php・wp-admin配下も同様の理由で除外する。
+        # (これはページ数カウントの話であり、ログインフォームの有無自体の検知は
+        # 別途 _has_password_login_form() が担っている)
+        path_lower_for_admin_check = parsed_abs.path.lower()
+        if any(marker in path_lower_for_admin_check for marker in ("/wp-login.php", "/xmlrpc.php", "/wp-admin/")):
             return False
 
         # RSS/Atomフィード等のXMLリソースはHTMLページではなく、通常のサイト構成・調査結果としては
@@ -1567,18 +1763,11 @@ class WebCrawler:
         ),
     ]
 
-    def _detect_delayed_cross_domain_redirect(self, html: str, current_url: str, base_domain_clean: str) -> str:
-        """meta refreshやJavaScriptのsetTimeoutによる「数秒後に自動的に別ドメインへ
-        リダイレクトする」形式の移転案内ページを検知する。
+    def _extract_delayed_redirect_target(self, html: str, current_url: str) -> str:
+        """meta refreshやJavaScriptのsetTimeoutによる遷移先の絶対URLを抽出する。
 
-        静的HTML取得(httpx)だけではmeta refreshやJavaScriptによる遷移は実行されず、
-        このページの内容がそのまま(トップページとして)解析されてしまう。しかし実際には
-        既に別ドメインへ移転済みであることが多いため、その場合はリダイレクト先の絶対URLを
-        返し、呼び出し側で「調査結果:×」「不可の理由:すでにリニューアル済のため」
-        「備考:移転先URL」として扱えるようにする。
-
-        検知できない場合や、リダイレクト先が同一ドメイン内(https化・パス変更等)の
-        場合は空文字を返す。
+        ドメインが同一か別かに関わらず、検知できた遷移先の絶対URLをそのまま返す
+        (ドメインの異同判定は呼び出し側の責務とする)。検知できない場合は空文字。
         """
         if not html:
             return ""
@@ -1615,9 +1804,30 @@ class WebCrawler:
         if target_url.startswith(("chrome-error://", "chrome://", "about:")):
             return ""
 
-        # 相対URLの場合は絶対URLに変換したうえで、ドメインが実際に異なる場合のみ「移転」とみなす
-        # (同一ドメイン内でのhttps化・パス変更等は対象外)
-        absolute_target = urljoin(current_url, target_url)
+        return urljoin(current_url, target_url)
+
+    def _detect_delayed_cross_domain_redirect(self, html: str, current_url: str, base_domain_clean: str) -> str:
+        """meta refreshやJavaScriptのsetTimeoutによる「数秒後に自動的に別ドメインへ
+        リダイレクトする」形式の移転案内ページを検知する。
+
+        静的HTML取得(httpx)だけではmeta refreshやJavaScriptによる遷移は実行されず、
+        このページの内容がそのまま(トップページとして)解析されてしまう。しかし実際には
+        既に別ドメインへ移転済みであることが多いため、その場合はリダイレクト先の絶対URLを
+        返し、呼び出し側で「調査結果:×」「不可の理由:すでにリニューアル済のため」
+        「備考:移転先URL」として扱えるようにする。
+
+        検知できない場合や、リダイレクト先が同一ドメイン内(https化・パス変更等)の
+        場合は空文字を返す。同一ドメイン内リダイレクト自体の扱いは
+        _extract_delayed_redirect_target()の戻り値を呼び出し側で直接使うこと
+        (edena.jpのように、トップページが同一ドメイン内の実コンテンツURLへ
+        meta refreshするだけの薄いページになっており、ここで単に情報を
+        捨ててしまうと巡回対象のリンクが1件も見つからず、1階層1ページの
+        誤った結果になっていた)。
+        """
+        absolute_target = self._extract_delayed_redirect_target(html, current_url)
+        if not absolute_target:
+            return ""
+
         target_domain_clean = self._get_clean_domain(absolute_target)
 
         if target_domain_clean and target_domain_clean != base_domain_clean:
@@ -1816,6 +2026,7 @@ class WebCrawler:
         str,
         str,
         bool,
+        str,
     ]:
         """ウェブサイトを巡回し、100ページに達した時点で打ち切る。
 
@@ -1827,6 +2038,15 @@ class WebCrawler:
         まだ未訪問のリンクが残ったまま打ち切ったか(False)を示す。total_pages が
         1〜2件程度の少数だった場合に、「本当にページ数が少ないサイトなのか」
         「クロールが何らかの理由で途中で終わってしまっただけなのか」を区別するために使う。
+
+        subsystem_note (末尾に追加した要素) は、"/monster/"配下のEC-CUBEショップの
+        ように、サイト全体のごく一部のディレクトリ配下に、明らかに毛色の違う
+        別システムらしきものが同居していて、そこだけでページ数の大半を占めている
+        場合に、その旨を知らせる注記文字列。該当しない場合は空文字。あくまで
+        人間が最終判断する際の参考情報であり、これによってページ数・階層数の
+        集計や◯/×判定そのものを変えることはしない(除外ロジックを機械的に
+        作ろうとすると、今度は正規のサブディレクトリを誤って除外するリスクを
+        負うため、あえて注記に留める方針: earth-inc.co.jpで検討)。
         """
         if not start_url.startswith(("http://", "https://")):
             primary_url = f"https://{start_url}"
@@ -1839,6 +2059,17 @@ class WebCrawler:
         start_time = time.time()
 
         visited: set[str] = set()
+        # 「訪問した(リダイレクト前の)URL」とは別に、「リダイレクト後の実際のコンテンツURL」を
+        # 正規化した形で記録する集合。href="ur"のようなルート相対のつもりで書かれた素の
+        # 相対リンクが、ページごとに異なる基準(/nt/, /am/, /se/等)で解決されて
+        # "/nt/ur", "/am/ur"...という別々の(実在しない)URLを生み、WordPress側の
+        # 「近いスラッグへの自動リダイレクト」機能で結局同じ実ページ(/ur/)に
+        # 302/301で着地する、というケースがあった(eas-c.jpで確認)。この場合
+        # visitedはリダイレクト前のURL単位でユニークになってしまい、内容が
+        # 完全に同じページが何件も別ページとしてカウントされてしまう。
+        # リダイレクト後の正規化URLが既にこの集合にある場合は、今回の訪問を
+        # 「新しいページ」としてカウントしない。
+        canonical_visited: set[str] = set()
         queued_urls: set[str] = set()
         queue: deque[tuple[str, int]] = deque()
         is_over_100 = False
@@ -1886,12 +2117,38 @@ class WebCrawler:
             # visited/queueの重複排除キーとしてもwww有無を同一視するよう揃える。
             clean_netloc = re.sub(r"^www\.", "", parsed.netloc, flags=re.IGNORECASE)
             clean_query = self._clean_query(parsed.query)
+            # 注意: ここではスキーム(http/https)は元のまま保持する。
+            # この関数の戻り値はそのままキューに積まれ、実際にclient.get()で
+            # リクエストされるURLになる。以前ここでスキームを常にhttpsへ
+            # 強制していたところ、内部リンクがhttps非対応のサイト
+            # (elastec.co.jp等、トップページ自体がhttpでしか200を返さない)で、
+            # 発見した内部リンクが軒並みhttpsに書き換えられて接続できなくなり、
+            # 全てhttpx.RequestErrorで失敗して(except節でログも残らず握りつぶされる
+            # ため気づきにくい)トップページ1件しか巡回できなくなる重大な回帰を
+            # 起こしていた。http/https両方が有効なサイトでの二重カウント対策
+            # (ebi-ken.co.jpで確認)は、実URLではなく重複判定専用のキーである
+            # _dedup_key() 側でのみ行う。
             return parsed._replace(netloc=clean_netloc, path=clean_path, query=clean_query, fragment="").geturl()
 
+        def _dedup_key(u: str) -> str:
+            """visited/queued_urls/canonical_visitedの重複判定にのみ使うキーを作る。
+
+            normalize_url()の戻り値(実際にリクエストするURL)とは別に、
+            スキーム(http/https)を常にhttpsへ統一した文字列を返す。
+            http://とhttps://の両方が有効なサイト(ebi-ken.co.jp等)で、
+            同じページが2つの生URLとして発見されても、この関数を通した
+            比較・登録では同一ページとして扱われ、二重カウントされない。
+            実際のリクエストにはこの関数の戻り値を使ってはならない。
+            """
+            p = urlparse(u)
+            scheme = "https" if p.scheme in ("http", "https") else p.scheme
+            return p._replace(scheme=scheme).geturl()
+
         def enqueue(url: str, path_depth: int, priority: bool) -> None:
-            if url in visited or url in queued_urls or len(visited) >= 100:
+            key = _dedup_key(url)
+            if key in visited or key in queued_urls or len(canonical_visited) >= 100:
                 return
-            queued_urls.add(url)
+            queued_urls.add(key)
             if priority:
                 queue.appendleft((url, path_depth))
             else:
@@ -1984,6 +2241,7 @@ class WebCrawler:
                                 detected_block_reason,
                                 "",
                                 True,
+                                "",
                             )
 
                         # 実ブラウザでは正常に取得できた(=httpx側の検知は
@@ -2021,6 +2279,7 @@ class WebCrawler:
                         conn_block_reason,
                         "",
                         True,
+                        "",
                     )
 
                 # httpxのfollow_redirects=Trueにより、301/302等のHTTPレベルのリダイレクトは
@@ -2053,29 +2312,30 @@ class WebCrawler:
                         "",
                         first_url,
                         True,
+                        "",
                     )
 
                 queue.append((first_url, 0))
-                queued_urls.add(first_url)
+                queued_urls.add(_dedup_key(first_url))
 
                 previous_url = ""
 
                 while queue:
-                    if len(visited) >= 100:
+                    if len(canonical_visited) >= 100:
                         is_over_100 = True
                         break
                     if time.time() - start_time > self.timeout:
                         break
 
                     current_url, depth = queue.popleft()
-                    queued_urls.discard(current_url)
+                    queued_urls.discard(_dedup_key(current_url))
                     norm_current = normalize_url(current_url)
 
-                    if norm_current in visited:
+                    if _dedup_key(norm_current) in visited:
                         continue
 
                     try:
-                        visited.add(norm_current)
+                        visited.add(_dedup_key(norm_current))
                         parsed_current = urlparse(norm_current)
 
                         if self._has_repeating_path_pattern(parsed_current.path):
@@ -2104,6 +2364,23 @@ class WebCrawler:
                             # そのため、以降のリンク解決には必ずリダイレクト追従後の
                             # 実URL(response.url)を使う。
                             resolved_url = str(response.url)
+
+                        # リダイレクト後の実URLが既に別の(リダイレクト前のURLが異なる)
+                        # 訪問で処理済みだった場合、中身は同じページなので以降の
+                        # リンク抽出等の処理はスキップする。ページ数の集計には
+                        # canonical_visited(正規化済みの実URLの集合、スキームは
+                        # _dedup_key()でhttpsに統一)だけを使い、visited(生URLの
+                        # 重複リクエスト防止用)からは意図的に取り消さない。
+                        # normalize_url()自体はhttp/httpsのスキームを統一しない
+                        # (実際のリクエストに使うURLのスキームを勝手に書き換えると、
+                        # https非対応のサイトで接続が軒並み失敗する重大な回帰に
+                        # なることがあったため: elastec.co.jp等で確認)。
+                        # そのため重複判定専用の_dedup_key()でのみスキームを揃える。
+                        norm_resolved = normalize_url(resolved_url)
+                        resolved_key = _dedup_key(norm_resolved)
+                        if resolved_key in canonical_visited and resolved_key != _dedup_key(norm_current):
+                            continue
+                        canonical_visited.add(resolved_key)
 
                         # httpxで取得済みのHTMLが静的（JSフレームワーク未使用）な場合、わざわざ
                         # Playwrightで再レンダリングし直すと全体タイムアウト予算(self.timeout)の
@@ -2156,6 +2433,7 @@ class WebCrawler:
                                     "",
                                     redirect_target_url,
                                     True,
+                                    "",
                                 )
 
                             # Fortinet等のネットワーク機器によるブロックページ、または
@@ -2182,6 +2460,7 @@ class WebCrawler:
                                     blocked_reason,
                                     "",
                                     True,
+                                    "",
                                 )
 
                             site_purpose = self._extract_purpose_and_features(current_html)
@@ -2430,6 +2709,18 @@ class WebCrawler:
                         candidate_hrefs.extend([f.get("src") for f in soup.find_all("frame") if f.get("src")])
                         candidate_hrefs.extend(self._extract_js_links(current_html))
 
+                        # meta refresh/JSタイマーによる遷移先が同一ドメイン内の場合、
+                        # 通常のリンクと同様に巡回対象へ加える。
+                        # (edena.jpのように、トップページがPC/モバイル振り分け等の
+                        # 目的で同一ドメイン内の実コンテンツURLへ即座にmeta refresh
+                        # するだけの薄いページになっていることがあり、この遷移先を
+                        # 無視すると<a href>が1件も無いページとして扱われ、
+                        # 実際には多数のページを持つサイトが「1階層1ページ」という
+                        # 誤った結果になっていた)
+                        delayed_redirect_target = self._extract_delayed_redirect_target(current_html, resolved_url)
+                        if delayed_redirect_target:
+                            candidate_hrefs.append(delayed_redirect_target)
+
                         for href in candidate_hrefs:
                             if self._is_valid_internal_link(resolved_url, href, base_domain_clean):
                                 abs_href = urljoin(resolved_url, href)
@@ -2488,10 +2779,16 @@ class WebCrawler:
                 blocked_reason,
                 "",
                 True,
+                "",
             )
 
         site_structure = "\n".join(global_nav_menus[:10])
-        final_page_count = "100ページ以上" if is_over_100 or len(visited) >= 100 else len(visited)
+        # 総ページ数は、リダイレクト前の生URL(visited)の件数ではなく、実際に
+        # 表示された実体ページ(canonical_visited)の件数で数える。生URLは
+        # http/httpsの混在や壊れた相対リンクによって同じページに対して
+        # 複数存在しうるため、visitedの件数をそのまま使うと過大カウントに
+        # なる(eas-c.jp等で確認)。
+        final_page_count = "100ページ以上" if is_over_100 or len(canonical_visited) >= 100 else len(canonical_visited)
 
         # 内部的にはトップページ=0階層目として深さを数えているが、これをそのまま
         # 「階層数」として返すと、1ページだけの正常なサイトでも"0"と表示されてしまい、
@@ -2508,6 +2805,15 @@ class WebCrawler:
         # 理由で途中で打ち切っただけであり、「本当にページ数の少ないサイト」とは区別する必要がある。
         queue_exhausted = not queue
 
+        # 「別システム同居」の注記機能は無効化した。blog/topics/news/pages/archives/
+        # contentsと除外リストを積み増しても、今度は"products"(商品一覧)のような
+        # 正当なディレクトリでも誤って注記が出るケースが見つかり、ディレクトリ名の
+        # ブロックリスト方式ではこの種の誤検知にきりがないと判断したため。
+        # _detect_subsystem_note()自体は将来別のアプローチ(例: セッションCookieの
+        # スコープで技術的に異なるシステムかどうかを判定する等)で作り直す可能性を
+        # 考慮してメソッドとしては残すが、呼び出しはしない。
+        subsystem_note = ""
+
         return (
             final_page_count,
             display_depth,
@@ -2523,4 +2829,5 @@ class WebCrawler:
             blocked_reason,
             redirect_target_url,
             queue_exhausted,
+            subsystem_note,
         )
