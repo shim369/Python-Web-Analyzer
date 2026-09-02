@@ -40,6 +40,17 @@ class RenewalEvaluator:
     SCROLL_ANIMATION_KEYWORDS = ["gsap", "scrolltrigger", "data-aos", "locomotive-scroll"]
     VIDEO_KEYWORDS = ["<video", "youtube.com/embed", "vimeo.com", "youtu.be", "player.vimeo"]
 
+    # クロールが時間切れで途中終了し、判定を保留する場合の定型文。
+    # これは「サイトの特徴に基づく不可の理由」ではなく、あくまで調査側の
+    # 都合(時間切れ)を人間に伝えるための注記でしかないため、呼び出し側
+    # (scraper_service.py)ではこの文言をrejection_reason(M列: 不可の理由)
+    # ではなくremarks(N列: 備考)に振り分ける。scraper_service.py側でも
+    # 同じ文言を重複定義しないよう、ここを単一の参照元にする。
+    PENDING_TIMEOUT_REASON = (
+        "クロールが時間切れで途中終了し、内部リンクを全て確認できなかったため判定を保留しました。"
+        "1ページあたりのリダイレクト回数が多い等の理由で通常より時間がかかっているサイトの可能性があります。"
+    )
+
     def _soup(self, html: str) -> BeautifulSoup:
         return BeautifulSoup(html or "", "html.parser")
 
@@ -178,6 +189,32 @@ class RenewalEvaluator:
 
         return any(keyword in body_html for keyword in self.SCROLL_ANIMATION_KEYWORDS)
 
+    #: クロール側(crawler.py)が、実際に確認できた件数・深さの下限値を
+    #: 表すために使う共通のサフィックス("100以上"/"36以上"等)。
+    LOWER_BOUND_SUFFIX = "以上"
+
+    @classmethod
+    def parse_lower_bound(cls, value: int | str) -> tuple[int, bool]:
+        """int、または"{数値}以上"形式の文字列を(数値, 信頼できる下限値かどうか)に変換する。
+
+        クロール側(crawler.py)は、100ページ上限到達時や、時間切れで途中
+        打ち切られた時("要確認"にはならず件数が確定しているケース)に、
+        "100以上"/"36以上"のような「{数値}以上」形式の文字列を返してくる
+        (ページ数・階層数どちらも同じ表記)。これは実際に確認できた件数・
+        深さの下限値(クロールを続ければ増えることはあっても減ることはない)
+        であり、判定の根拠として信頼してよい確定情報である。一方、"要確認"
+        のように「以上」が付かない文字列や数値化できない文字列は、下限値
+        としてすら信用できない値のため(0, False)を返す。
+        """
+        if isinstance(value, int):
+            return value, True
+        if isinstance(value, str) and value.endswith(cls.LOWER_BOUND_SUFFIX):
+            try:
+                return int(value[: -len(cls.LOWER_BOUND_SUFFIX)]), True
+            except ValueError:
+                return 0, False
+        return 0, False
+
     def decide(
         self,
         total_pages: int | str,
@@ -198,12 +235,31 @@ class RenewalEvaluator:
 
         queue_exhausted は、クロール側が発見した内部リンクをすべて訪問し終えて
         自然にキューが空になったか(True)、タイムアウト等で未訪問のリンクを
-        残したまま打ち切ったか(False)を表す。total_pages が1〜2件と少ない場合、
-        この値がTrueであれば「サイトに元々他の内部リンクが存在しない＝本当に
-        ページ数の少ないサイト」である可能性が高いと判断し、要確認にせず
-        通常の評価ロジック（evaluate）に進む。Falseの場合は、タイムアウトや
-        アクセス制限等でクロールが途中終了した可能性が高いため、従来通り
-        要確認として保留する。
+        残したまま打ち切ったか(False)を表す。
+
+        以前は、total_pagesが整数値として返っている(=100ページ上限には
+        達していない)のにqueue_exhaustedがFalseの場合、ページ数・階層数の
+        多寡に関わらず一律「要確認」に倒していた。しかしこれには不具合があった。
+        100ページ上限に達したことで打ち切られたケース(total_pagesは
+        "100以上"の確定値としてこの時点では既にintの100に変換済み)
+        でもqueue_exhaustedはほぼ必ずFalse(=上限到達時点でまだキューに
+        未訪問URLが残っている)になるため、「少なくとも100ページある」という
+        確定情報にもかかわらず判定そのものが「要確認」に握りつぶされ、
+        本来M列に出るべき「ページ数が多いため」等サイト固有の理由が
+        一切表示されなくなっていた(fcs.or.jp・ferie.co.jp等、多数の
+        個別記事ページを持つサイトで確認)。ページ数・ログイン機能の有無
+        等、一度確定した「×」の根拠は、クロールを続けても消えたり減ったり
+        しない(訪問ページが増える方向にしか動かない)ため、queue_exhausted
+        がFalseであっても、既に確定している判定結果はそのまま採用すべき
+        である。
+
+        そのため現在は、まず（信頼できる情報の範囲で）通常の評価ロジック
+        （evaluate）を実行し、それだけで既に「×」の根拠が1つでも
+        見つかっていればqueue_exhaustedの状態に関わらずそれを採用する。
+        「×」の根拠が1つも見つからず、かつ「続きを巡回すれば理由が
+        見つかったかもしれない」という不確実性が残っている場合
+        （ページ数・階層数を確定情報として使えない、またはクロールが
+        途中終了している場合）に限り、「要確認」に倒す。
         """
         if total_pages == 0:
             if has_basic_auth:
@@ -213,19 +269,19 @@ class RenewalEvaluator:
                 return "×", "ベーシック認証がかかっているページがあるため"
             return "要確認", "接続不可またはアクセス拒否のため、判定を保留しました。"
 
-        if isinstance(total_pages, int) and 1 <= total_pages <= 2 and not queue_exhausted:
-            return "要確認", "クロールできたページ数が極端に少ないため判定を保留しました。"
+        pending_reason = self.PENDING_TIMEOUT_REASON
 
-        if max_depth == "要確認":
-            return "要確認", "サイト階層が深すぎるため、別途サイトエクスプローラー等での確認をお願いします。"
+        # ページ数・階層数が"要確認"(=1ページあたりのリダイレクトが異常に
+        # 多いサイト等で、到達件数自体が実態の下限値としてすら信用できない
+        # ケース)の場合は、それを根拠にした判定は行わない(0件扱いで
+        # evaluateへ渡す)。それ以外("36以上"のような時間切れ時の下限値
+        # 確定表記や、通常の整数値)は、実際にクロールできた件数・到達できた
+        # 深さの下限値として信頼できるため、そのまま根拠に使う。
+        page_count_num, page_count_reliable = self.parse_lower_bound(total_pages)
+        max_depth_int, depth_reliable = self.parse_lower_bound(max_depth)
 
-        try:
-            max_depth_int = int(max_depth)
-        except (ValueError, TypeError):
-            max_depth_int = 0
-
-        return self.evaluate(
-            total_pages=int(total_pages),
+        eval_result, reason = self.evaluate(
+            total_pages=page_count_num,
             max_depth=max_depth_int,
             has_login=has_login,
             has_attachment=has_attachment,
@@ -234,6 +290,23 @@ class RenewalEvaluator:
             html_src=html_src,
             page_threshold=page_threshold,
         )
+
+        if eval_result == "×":
+            # ページ数・階層数・ログイン機能の有無等、既に確定した「×」の
+            # 根拠はクロールが途中終了していても覆らない事実なので、
+            # queue_exhausted等の状態に関わらずそのまま採用する。
+            return eval_result, reason
+
+        if not page_count_reliable:
+            return "要確認", pending_reason
+
+        if not depth_reliable:
+            return "要確認", "サイト階層が深すぎるため、別途サイトエクスプローラー等での確認をお願いします。"
+
+        if not queue_exhausted:
+            return "要確認", pending_reason
+
+        return eval_result, reason
 
     def evaluate(
         self,

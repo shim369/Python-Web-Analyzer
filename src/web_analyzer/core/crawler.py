@@ -197,6 +197,14 @@ class WebCrawler:
         "order",
         "orderby",
         "word",
+        # CakePHP 2系のサイト(mod_rewrite未使用時のURL構造をリンク生成時にも
+        # 引きずっているもの)では、"/news/index/page:2?url=news"と
+        # "/news/index/page:2?url=news%2Findex"のように、パス自体を
+        # ミラーしただけの自己参照的な"url"パラメータがリンクごとに値違いで
+        # 付与され、実質同一ページが別ページとして重複カウントされていた
+        # (fcs.or.jpで確認)。コンテンツ識別に使われるパラメータではなく
+        # ルーティングの残骸にすぎないため除去対象に含める。
+        "url",
     }
 
     def __init__(
@@ -472,6 +480,21 @@ class WebCrawler:
         if self._has_nested_pagination_trap(parsed_abs.path):
             return False
 
+        if self._has_calendar_query_trap(parsed_abs.query):
+            return False
+
+        # "pageindices"は、PDFカタログ等をめくれるデジタルブック化する
+        # ビューアウィジェット(flipper.js等)が、検索エンジン向けに
+        # ページ単位で自動生成するSEO用の代替HTML群に使われるディレクトリ名
+        # (fujimaki-necktie.comで確認: /catalog/202604/pageindices/index1.html
+        # 〜index112.htmlのように、カタログ1冊(112ページ)につき100件超の
+        # URLが生成され、ページ数100件上限到達の主因になっていた)。
+        # 実際の閲覧者は"../index.html"のビューア1ページを操作して
+        # めくるだけで、1ページずつ個別URLとして遷移することはなく、
+        # サイトの実コンテンツページとしては数えるべきではない。
+        if "/pageindices/" in parsed_abs.path.lower():
+            return False
+
         return abs_domain == base_domain
 
     def _has_password_login_form(self, html: str) -> bool:
@@ -555,9 +578,20 @@ class WebCrawler:
             "TYPO3": [
                 "typo3",
             ],
-            "concrete5": [
+            # v9(2021年)で"concrete5"から"Concrete CMS"へ改称された。旧称の
+            # サイトも新称のサイトも判定できるよう検出キーワードは両方
+            # 残しつつ、表示名はevaluator.py側のコメント(CAPTCHA_KEYWORDS)
+            # とも表記を揃え、現行の正式名称にする。
+            "Concrete CMS": [
                 "concretecms",
                 "concrete5",
+                # コア機能のJS/CSSが"/concrete/js/...", "/concrete/css/..."のように
+                # "concrete"という名前のディレクトリから配信される。metaタグの
+                # generator表記が"Concrete CMS 9.x"のようにスペース入りで
+                # "concretecms"にマッチしないケースの補完にもなる。末尾スラッシュ
+                # 込みにすることで、建設業者サイト等での"concrete"(コンクリート)
+                # という一般的な単語との誤検知を避ける。
+                "concrete/",
             ],
             "XOOPS": [
                 "xoops",
@@ -798,7 +832,14 @@ class WebCrawler:
         """
         if not query:
             return ""
-        pairs = parse_qsl(query, keep_blank_values=True)
+        # keep_blank_values=Falseにより、"?general="/"?junior="のような値を
+        # 持たないパラメータはここで自動的に除去される。値が空ということは
+        # コンテンツ識別に使われていない(=タブ切り替え等、JS側でしか使われない
+        # フラグ)可能性が高く、実際にferie.co.jpの"/lesson/levelclass-detail/"
+        # ?general=/?junior=は、サーバー側のレンダリングは3パターンとも
+        # 完全に同一で、別ページとして重複カウントされていた。id=1のような
+        # 値を持つパラメータはこれまで通り保持される。
+        pairs = parse_qsl(query, keep_blank_values=False)
         filtered = [(k, v) for k, v in pairs if k.lower() not in self._TRACKING_QUERY_KEYS]
         filtered.sort()
         return urlencode(filtered)
@@ -844,6 +885,26 @@ class WebCrawler:
             else:
                 numeric_run = 0
         return True
+
+    def _has_calendar_query_trap(self, query: str) -> bool:
+        """クエリ文字列に、カレンダー/スケジュール表の月送りウィジェットが
+        生成する年月値(例: "2027-10", "2023-1")が含まれているかを判定する。
+
+        _is_depth_worthy_path()はパスセグメント側の数値ドリルダウン
+        (例: /calendar/2024/08/09/)を検知するが、"schedule.php?month=2027-10"
+        のように年月がクエリ文字列側に入っている場合はこれでは検知できない。
+        この形のカレンダーウィジェットは「前月/翌月」リンクを延々と辿れて
+        しまい(florinet.co.jpで確認: schedule.php?month=2022-12から2030-6
+        まで、実質無限に近い件数のURLバリエーションを生んでいた)、他は
+        7ページ程度の小規模サイトなのにページ数100件上限に達してしまう
+        主因になっていた。年月らしき値(YYYY-M、YYYY-M-D、区切りは-/どちらも)は
+        通常の商品ID・カテゴリスラッグ等とは形が明確に異なるため、この形に
+        一致するクエリ値を持つリンクは巡回対象から除外する。
+        """
+        for _key, value in parse_qsl(query):
+            if re.fullmatch(r"\d{4}[-/]\d{1,2}([-/]\d{1,2})?", value):
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # HTML取得・デコード
@@ -946,9 +1007,17 @@ class WebCrawler:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
 
-                # リアルなブラウザのヘッダー・画面設定を網羅してボット検知を回避
+                # リアルなブラウザのヘッダー・画面設定を網羅してボット検知を回避…
+                # という意図だったが、User-Agentだけは固定文字列で上書きしない
+                # 方がよいことが判明した(fukuda-sangyo.co.jpで確認)。実際の
+                # Chromiumは、User-Agentヘッダーを上書きしてもnavigator.userAgent
+                # やSec-CH-UA系のClient Hintsヘッダーには「本当のバージョン」
+                # (例: HeadlessChrome/149)がそのまま出続けるため、User-Agent文字列
+                # だけ「Chrome/122」のように古いバージョンへ書き換えると、むしろ
+                # UAとClient Hintsの不整合という分かりやすいボット判定シグナルを
+                # 自ら作り出してしまい、固定UA文字列を指定しない(Chromium自身の
+                # 素のUAをそのまま使う)場合よりWAFに弾かれやすくなっていた。
                 context = browser.new_context(
-                    user_agent=self.headers.get("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
                     viewport={"width": 1280, "height": 800},
                     extra_http_headers={
                         "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
@@ -1713,7 +1782,12 @@ class WebCrawler:
                 # ここなら resolved_text の抽出が終わっているので安全に出力できます
                 logger.debug("    入力欄 [name=%s] -> 抽出結果: '%s'", inp.get("name"), resolved_text)
 
-                if resolved_text and not any(k in resolved_text for k in ["送信", "リセット", "確認"]):
+                # "Δ"は、WordPressの「Contact Form 7」プラグインがアクセシビリティ用に
+                # 自動挿入するアンカー記号(スクリーンリーダー向けの目印で、見た目には
+                # 表示されないことが多い)。この記号自体を持つinput/textarea/select要素の
+                # ラベルとして誤って抽出されてしまうことがあり、実際の入力項目とは
+                # 無関係なので除外する。
+                if resolved_text and not any(k in resolved_text for k in ["送信", "リセット", "確認", "Δ"]):
                     if resolved_text not in form_fields:
                         form_fields.append(resolved_text)
 
@@ -2056,6 +2130,18 @@ class WebCrawler:
             fallback_url = start_url.replace("https://", "http://") if start_url.startswith("https://") else ""
 
         base_domain_clean = self._get_clean_domain(primary_url)
+
+        # bare(www無し)ドメインだけSSL証明書の対象がwwwに限定されていたり(SNI不一致)、
+        # サーバー側のバーチャルホスト振り分けがwww付きのリクエストしか正しく認識せず
+        # bareには404を返したりするサイトがある(fw-kenshin.net等: bareのhttpsは
+        # verify_ssl=Falseで接続自体はできてもサーバーが404を返す専用ホストにしか
+        # 到達できず、bareのhttpもそのbareのhttpsへ301リダイレクトして同じ404に
+        # 行き着く。一方www付きのhttpsだけは正常に200でサイト本体へ到達できる)。
+        # primary_url/fallback_url(どちらもbare)が両方失敗した場合の最終手段として、
+        # www付きのURLも試す。
+        www_fallback_urls: list[str] = []
+        if not base_domain_clean.lower().startswith("www."):
+            www_fallback_urls = [f"https://www.{base_domain_clean}", f"http://www.{base_domain_clean}"]
         start_time = time.time()
 
         visited: set[str] = set()
@@ -2109,40 +2195,53 @@ class WebCrawler:
             # UnicodeEncodeError('ascii' codec can't encode characters...)になることがある。
             # 既存の%XXエンコード済み部分を壊さないよう safe="/%" を指定してエンコードする。
             clean_path = quote(clean_path, safe="/%")
-            # _is_valid_internal_link()のドメイン一致判定は netloc.replace("www.", "") で
-            # www有無を無視して「同一サイト」として扱っているのに対し、
-            # normalize_url()側ではnetlocをそのまま保持していたため、内部リンクが
-            # www有りと無しの両方の絶対URLで書かれているサイト(danshinen.org等)で、
-            # 実質同じページが別URL扱いされ二重に訪問・カウントされてしまっていた。
-            # visited/queueの重複排除キーとしてもwww有無を同一視するよう揃える。
-            clean_netloc = re.sub(r"^www\.", "", parsed.netloc, flags=re.IGNORECASE)
             clean_query = self._clean_query(parsed.query)
-            # 注意: ここではスキーム(http/https)は元のまま保持する。
-            # この関数の戻り値はそのままキューに積まれ、実際にclient.get()で
-            # リクエストされるURLになる。以前ここでスキームを常にhttpsへ
-            # 強制していたところ、内部リンクがhttps非対応のサイト
-            # (elastec.co.jp等、トップページ自体がhttpでしか200を返さない)で、
-            # 発見した内部リンクが軒並みhttpsに書き換えられて接続できなくなり、
+            # 注意: ここではネットロック(www有無)・スキーム(http/https)ともに
+            # 元のまま保持する。この関数の戻り値はそのままキューに積まれ、
+            # 実際にclient.get()でリクエストされるURLになる。
+            #
+            # 以前はここでnetlocから"www."を強制除去していた(www有無の両方で
+            # 内部リンクが書かれているサイト(danshinen.org等)での二重カウント
+            # 対策)。しかしこれは、href="/contact/"のような相対リンクを
+            # urljoin()で絶対URL化した結果まで巻き込んでwwwを剥がしてしまう。
+            # www無しの裸ドメインが単純なドメイン転送専用(パスを保持せず
+            # トップページへ丸めてリダイレクトするだけ)になっているサイト
+            # (fuji-kinzoku.co.jp等)では、相対リンクで書かれた実在するページへの
+            # リンクがことごとく裸ドメイン向けに書き換えられてしまい、その結果
+            # 毎回トップページへ301/302で送り返されて「発見したリンクがどれも
+            # 既訪問のトップページに丸め込まれる」状態になり、ほぼ全ページが
+            # 巡回できなくなっていた。
+            #
+            # http/https スキームについても同様の理由(https非対応のサイト
+            # (elastec.co.jp等)で発見した内部リンクが軒並みhttpsに書き換えられ、
             # 全てhttpx.RequestErrorで失敗して(except節でログも残らず握りつぶされる
             # ため気づきにくい)トップページ1件しか巡回できなくなる重大な回帰を
-            # 起こしていた。http/https両方が有効なサイトでの二重カウント対策
-            # (ebi-ken.co.jpで確認)は、実URLではなく重複判定専用のキーである
+            # 起こしていた)で、既に実URLへの書き換えはしない方針になっている。
+            # www有無・http/https混在サイトでの二重カウント対策(danshinen.org・
+            # ebi-ken.co.jp等)は、実URLではなく重複判定専用のキーである
             # _dedup_key() 側でのみ行う。
-            return parsed._replace(netloc=clean_netloc, path=clean_path, query=clean_query, fragment="").geturl()
+            return parsed._replace(path=clean_path, query=clean_query, fragment="").geturl()
 
         def _dedup_key(u: str) -> str:
             """visited/queued_urls/canonical_visitedの重複判定にのみ使うキーを作る。
 
             normalize_url()の戻り値(実際にリクエストするURL)とは別に、
-            スキーム(http/https)を常にhttpsへ統一した文字列を返す。
-            http://とhttps://の両方が有効なサイト(ebi-ken.co.jp等)で、
-            同じページが2つの生URLとして発見されても、この関数を通した
-            比較・登録では同一ページとして扱われ、二重カウントされない。
-            実際のリクエストにはこの関数の戻り値を使ってはならない。
+            スキーム(http/https)を常にhttpsへ、ネットロックのwww有無を
+            常に無し(www.除去)へ統一した文字列を返す。http://とhttps://の
+            両方が有効なサイト(ebi-ken.co.jp等)や、www有無の両方で内部
+            リンクが書かれているサイト(danshinen.org等)で、同じページが
+            異なる生URLとして発見されても、この関数を通した比較・登録では
+            同一ページとして扱われ、二重カウントされない。
+            実際のリクエストにはこの関数の戻り値を使ってはならない
+            (www有無を無条件で書き換えると、www無しの裸ドメインが単純な
+            ドメイン転送専用になっているサイト(fuji-kinzoku.co.jp等)で
+            実在するページへのリンクが軒並み壊れるため。normalize_url()側の
+            コメントも参照)。
             """
             p = urlparse(u)
             scheme = "https" if p.scheme in ("http", "https") else p.scheme
-            return p._replace(scheme=scheme).geturl()
+            netloc = re.sub(r"^www\.", "", p.netloc, flags=re.IGNORECASE)
+            return p._replace(scheme=scheme, netloc=netloc).geturl()
 
         def enqueue(url: str, path_depth: int, priority: bool) -> None:
             key = _dedup_key(url)
@@ -2167,44 +2266,48 @@ class WebCrawler:
                 primary_error: Exception | None = None
                 fallback_error: Exception | None = None
 
-                try:
-                    response = client.get(primary_url)
-                    if response.status_code == 401:
-                        has_basic_auth = True
-                    # raise_for_status()は4xx/5xxで例外を投げて本文を捨ててしまうため、
-                    # アクセス拒否ページ（Fortinet等のネットワーク機器のブロック、または
-                    # サーバー自身が返す403 Forbidden等の汎用エラーページ）の検知は
-                    # 必ず例外化する前に行う。
-                    # (Fortinet等のSSLインスペクションはHTTPS側だけ本文を差し替えることが多く、
-                    # 403等のステータスコードそのものにも実サイトかブロックページかの情報が
-                    # 本文に含まれているため、ステータスに関わらずまず中身を確認する)
-                    candidate_html = self._decode_response(response)
-                    detected_block_reason = self._detect_access_blocked_page(candidate_html)
-                    if detected_block_reason:
-                        blocked_reason = detected_block_reason
-                    response.raise_for_status()
-                    if not detected_block_reason:
-                        first_url = str(response.url)
-                        first_html = candidate_html
-                        blocked_reason = ""
-                except Exception as e:
-                    primary_error = e
-                    if fallback_url:
-                        try:
-                            response = client.get(fallback_url)
-                            if response.status_code == 401:
-                                has_basic_auth = True
-                            candidate_html = self._decode_response(response)
-                            detected_block_reason = self._detect_access_blocked_page(candidate_html)
-                            if detected_block_reason:
-                                blocked_reason = detected_block_reason
-                            response.raise_for_status()
-                            if not detected_block_reason:
-                                first_url = str(response.url)
-                                first_html = candidate_html
-                                blocked_reason = ""
-                        except Exception as e2:
-                            fallback_error = e2
+                def _try_initial_fetch(url: str) -> Exception | None:
+                    """指定URLへの初回アクセスを1回試みる。
+
+                    成功時(ブロックページ検知を含む)はfirst_url/first_html/
+                    blocked_reason/has_basic_authを更新してNoneを返す。例外発生時は
+                    握りつぶさずそのまま返す(呼び出し側で次候補へのフォールバック
+                    判断や、最終的なエラー分類に使うため)。
+                    """
+                    nonlocal first_url, first_html, blocked_reason, has_basic_auth
+                    try:
+                        response = client.get(url)
+                        if response.status_code == 401:
+                            has_basic_auth = True
+                        # raise_for_status()は4xx/5xxで例外を投げて本文を捨ててしまうため、
+                        # アクセス拒否ページ（Fortinet等のネットワーク機器のブロック、または
+                        # サーバー自身が返す403 Forbidden等の汎用エラーページ）の検知は
+                        # 必ず例外化する前に行う。
+                        # (Fortinet等のSSLインスペクションはHTTPS側だけ本文を差し替えることが多く、
+                        # 403等のステータスコードそのものにも実サイトかブロックページかの情報が
+                        # 本文に含まれているため、ステータスに関わらずまず中身を確認する)
+                        candidate_html = self._decode_response(response)
+                        detected_block_reason = self._detect_access_blocked_page(candidate_html)
+                        if detected_block_reason:
+                            blocked_reason = detected_block_reason
+                        response.raise_for_status()
+                        if not detected_block_reason:
+                            first_url = str(response.url)
+                            first_html = candidate_html
+                            blocked_reason = ""
+                        return None
+                    except Exception as e:
+                        return e
+
+                primary_error = _try_initial_fetch(primary_url)
+                if not first_url and fallback_url:
+                    fallback_error = _try_initial_fetch(fallback_url)
+                # bare(www無し)のhttps/httpが両方失敗した場合、www付きも試す
+                # (www_fallback_urlsの説明を参照)。
+                for www_url in www_fallback_urls:
+                    if first_url:
+                        break
+                    fallback_error = _try_initial_fetch(www_url) or fallback_error
 
                 # httpx側でブロックページらしきものを検知していても(blocked_reasonが
                 # 非空でも)、ここでは即断せずPlaywright(実ブラウザ)での再確認を試みる。
@@ -2214,51 +2317,62 @@ class WebCrawler:
                 # だけで確定させると、人間なら普通に見られるサイトを誤って
                 # 「アクセス不可」扱いにしてしまう。
                 if not first_url and self.render_js:
-                    rendered_html, rendered_url, rendered_status, nav_error_reason = self._fetch_rendered_html(primary_url)
-                    if rendered_html:
-                        # Playwrightのgoto()はhttpxのraise_for_status()と違い、4xx/5xxでも
-                        # 例外を投げずにエラーページのHTML本体をそのまま返してしまうため、
-                        # ここでも同様にブロックページ検知を行う。
-                        detected_block_reason = self._detect_access_blocked_page(rendered_html)
-                        if not detected_block_reason and rendered_status is not None:
-                            detected_block_reason = self._reason_for_status_code(rendered_status)
+                    # httpx側と同様、bareドメインが失敗する場合はwww付きも試す
+                    # (実ブラウザでもbare側のSNI不一致・バーチャルホスト未設定に
+                    # よる失敗は避けられないため)。
+                    for render_url in [primary_url, *www_fallback_urls]:
+                        rendered_html, rendered_url, rendered_status, nav_error_reason = self._fetch_rendered_html(render_url)
+                        if rendered_html:
+                            # Playwrightのgoto()はhttpxのraise_for_status()と違い、4xx/5xxでも
+                            # 例外を投げずにエラーページのHTML本体をそのまま返してしまうため、
+                            # ここでも同様にブロックページ検知を行う。
+                            detected_block_reason = self._detect_access_blocked_page(rendered_html)
+                            if not detected_block_reason and rendered_status is not None:
+                                detected_block_reason = self._reason_for_status_code(rendered_status)
 
-                        if detected_block_reason:
-                            # 実ブラウザ(Playwright)でもブロックされた場合のみ、
-                            # 最終的に「アクセス不可」と確定する。
-                            return (
-                                0,
-                                0,
-                                "",
-                                "",
-                                "",
-                                "",
-                                "",
-                                False,
-                                False,
-                                has_basic_auth,
-                                False,
-                                detected_block_reason,
-                                "",
-                                True,
-                                "",
-                            )
+                            if detected_block_reason:
+                                # このURLではブロックされた。他に試す候補が残っていれば
+                                # 続行し、無ければ最終的に「アクセス不可」と確定する。
+                                blocked_reason = detected_block_reason
+                                continue
 
-                        # 実ブラウザでは正常に取得できた(=httpx側の検知は
-                        # 自動化ツール狙い撃ちの誤検知だった)ため、ブロック扱いを解除する。
-                        blocked_reason = ""
-                        first_url = rendered_url or primary_url
-                        first_html = rendered_html
-                        first_html_from_playwright = True
-                    elif nav_error_reason:
-                        # ナビゲーション自体が失敗した(DNS失敗・接続拒否等で
-                        # chrome-error://chromewebdata/に遷移した)ケース。
-                        # このURLを移転先やfirst_urlとして絶対に使わないよう、
-                        # ここでは何も採用せず、理由だけをblocked_reasonに残す。
-                        # (以前はこれを「移転案内ページへのリダイレクト」と誤認し、
-                        #  「すでにリニューアル済のため / 移転先：chrome-error://chromewebdata/」
-                        #  という誤った結果になっていた)
-                        blocked_reason = nav_error_reason
+                            # 実ブラウザでは正常に取得できた(=httpx側の検知は
+                            # 自動化ツール狙い撃ちの誤検知だった)ため、ブロック扱いを解除する。
+                            blocked_reason = ""
+                            first_url = rendered_url or render_url
+                            first_html = rendered_html
+                            first_html_from_playwright = True
+                            break
+                        elif nav_error_reason:
+                            # ナビゲーション自体が失敗した(DNS失敗・接続拒否等で
+                            # chrome-error://chromewebdata/に遷移した)ケース。
+                            # このURLを移転先やfirst_urlとして絶対に使わないよう、
+                            # ここでは何も採用せず、理由だけをblocked_reasonに残す。
+                            # (以前はこれを「移転案内ページへのリダイレクト」と誤認し、
+                            #  「すでにリニューアル済のため / 移転先：chrome-error://chromewebdata/」
+                            #  という誤った結果になっていた)
+                            blocked_reason = nav_error_reason
+
+                    if not first_url and blocked_reason:
+                        # 実ブラウザ(Playwright)でも(bare/www両方を試した上で)ブロック
+                        # された場合のみ、最終的に「アクセス不可」と確定する。
+                        return (
+                            0,
+                            0,
+                            "",
+                            "",
+                            "",
+                            "",
+                            "",
+                            False,
+                            False,
+                            has_basic_auth,
+                            False,
+                            blocked_reason,
+                            "",
+                            True,
+                            "",
+                        )
 
                 if not first_url:
                     # httpxで検知していたブロック理由があればそれを優先し、
@@ -2315,6 +2429,29 @@ class WebCrawler:
                         "",
                     )
 
+                # トップページ自体が"index.php"/"index.html"へのmeta refreshだけの
+                # 薄いスタブになっているサイトへの対応(fujimaki-necktie.comで確認)。
+                # normalize_url()は"/index.php"等をルート"/"と同一視するよう
+                # 正規化する(ddesi.co.jpで、"/"と"/index.html"が別ページとして
+                # 二重カウントされていた問題の対策)。このため、meta refresh先が
+                # 同一ディレクトリの"index.php"/"index.html"だった場合、正規化後は
+                # 遷移元(トップページ自身)と全く同じURL扱いになり、通常の
+                # enqueue()の「既訪問なら無視」ガードに阻まれて一度もリクエストされず、
+                # スタブの中身(実質空)だけがトップページとして扱われてしまっていた。
+                # このケースだけは特別に、通常のキュー経由ではなくここで直接
+                # 遷移先を取得し、スタブの代わりに実際のコンテンツを採用する。
+                self_redirect_target = self._extract_delayed_redirect_target(first_html, first_url)
+                if self_redirect_target and _dedup_key(normalize_url(self_redirect_target)) == _dedup_key(normalize_url(first_url)):
+                    try:
+                        self_redirect_response = client.get(self_redirect_target, headers=self.headers)
+                        if self_redirect_response.status_code == 200:
+                            resolved_first_html = self._decode_response(self_redirect_response)
+                            if resolved_first_html:
+                                first_html = resolved_first_html
+                                first_url = str(self_redirect_response.url)
+                    except httpx.RequestError:
+                        pass
+
                 queue.append((first_url, 0))
                 queued_urls.add(_dedup_key(first_url))
 
@@ -2350,7 +2487,24 @@ class WebCrawler:
                             # first_url は既にリダイレクト追従後の最終URL(str(response.url))
                             resolved_url = first_url
                         else:
-                            response = client.get(current_url, headers=req_headers)
+                            try:
+                                response = client.get(current_url, headers=req_headers)
+                            except httpx.RequestError:
+                                # https接続自体が失敗した(SSL証明書不備・ハンドシェイク
+                                # 失敗等)場合、トップページ自体はhttpsで200が返っていても、
+                                # サイトの他の部分は実質httpでしか機能していないことがある
+                                # (fujimaki-necktie.com: トップページはhttpsで取得できるが
+                                # 中身は"index.phpへmeta refresh"するだけの薄いページで、
+                                # そのindex.phpへのhttps接続だけがSSLハンドシェイク失敗で
+                                # 例外になり、他に発見できるリンクが無いために巡回対象が
+                                # 丸ごと消え1ページ扱いになっていた)。初回アクセス時と同じ
+                                # 考え方で、httpへのフォールバックを1回だけ試みる。
+                                # (except節で握りつぶされて気づきにくくなることを避けるため、
+                                # ここで明示的にフォールバックする)
+                                if not current_url.startswith("https://"):
+                                    raise
+                                current_url = "http://" + current_url[len("https://") :]
+                                response = client.get(current_url, headers=req_headers)
                             if response.status_code == 401:
                                 has_basic_auth = True
                             if response.status_code != 200:
@@ -2368,14 +2522,16 @@ class WebCrawler:
                         # リダイレクト後の実URLが既に別の(リダイレクト前のURLが異なる)
                         # 訪問で処理済みだった場合、中身は同じページなので以降の
                         # リンク抽出等の処理はスキップする。ページ数の集計には
-                        # canonical_visited(正規化済みの実URLの集合、スキームは
-                        # _dedup_key()でhttpsに統一)だけを使い、visited(生URLの
+                        # canonical_visited(正規化済みの実URLの集合、スキーム・
+                        # www有無は_dedup_key()で統一)だけを使い、visited(生URLの
                         # 重複リクエスト防止用)からは意図的に取り消さない。
-                        # normalize_url()自体はhttp/httpsのスキームを統一しない
-                        # (実際のリクエストに使うURLのスキームを勝手に書き換えると、
-                        # https非対応のサイトで接続が軒並み失敗する重大な回帰に
-                        # なることがあったため: elastec.co.jp等で確認)。
-                        # そのため重複判定専用の_dedup_key()でのみスキームを揃える。
+                        # normalize_url()自体はhttp/httpsのスキームやwww有無を
+                        # 書き換えない(実際のリクエストに使うURLを勝手に書き換えると、
+                        # https非対応のサイトで接続が軒並み失敗したり(elastec.co.jp等)、
+                        # www無しの裸ドメインがドメイン転送専用でパスを保持しない
+                        # サイト(fuji-kinzoku.co.jp等)でリンクが軒並み壊れたりする
+                        # 重大な回帰になることがあったため)。そのため重複判定専用の
+                        # _dedup_key()でのみスキーム・www有無を揃える。
                         norm_resolved = normalize_url(resolved_url)
                         resolved_key = _dedup_key(norm_resolved)
                         if resolved_key in canonical_visited and resolved_key != _dedup_key(norm_current):
@@ -2782,13 +2938,18 @@ class WebCrawler:
                 "",
             )
 
+        # キューが空 = 発見できた内部リンクはすべて訪問し終えて自然に終了したことを意味する。
+        # 逆にキューに未訪問のURLが残っている場合、タイムアウトや最大ページ数(100件)到達等の
+        # 理由で途中で打ち切っただけであり、「本当にページ数の少ないサイト」とは区別する必要がある。
+        queue_exhausted = not queue
+
         site_structure = "\n".join(global_nav_menus[:10])
         # 総ページ数は、リダイレクト前の生URL(visited)の件数ではなく、実際に
         # 表示された実体ページ(canonical_visited)の件数で数える。生URLは
         # http/httpsの混在や壊れた相対リンクによって同じページに対して
         # 複数存在しうるため、visitedの件数をそのまま使うと過大カウントに
         # なる(eas-c.jp等で確認)。
-        final_page_count = "100ページ以上" if is_over_100 or len(canonical_visited) >= 100 else len(canonical_visited)
+        final_page_count: int | str = "100以上" if is_over_100 or len(canonical_visited) >= 100 else len(canonical_visited)
 
         # 内部的にはトップページ=0階層目として深さを数えているが、これをそのまま
         # 「階層数」として返すと、1ページだけの正常なサイトでも"0"と表示されてしまい、
@@ -2800,10 +2961,30 @@ class WebCrawler:
         if max_depth > 10:
             display_depth = "要確認"
 
-        # キューが空 = 発見できた内部リンクはすべて訪問し終えて自然に終了したことを意味する。
-        # 逆にキューに未訪問のURLが残っている場合、タイムアウトや最大ページ数(100件)到達等の
-        # 理由で途中で打ち切っただけであり、「本当にページ数の少ないサイト」とは区別する必要がある。
-        queue_exhausted = not queue
+        # queue_exhaustedがFalse(=タイムアウトで途中終了)かつ100ページ上限にも
+        # 達していない場合、final_page_countは「キューに未訪問のリンクを
+        # 残したまま打ち切った時点の、道半ばの数値」でしかない。
+        # 1ページあたりのリダイレクト回数が異常に多いサイト(f-musashino.jp等、
+        # www有無や末尾スラッシュ補正で1ページに2〜3回のリダイレクトが発生する)
+        # では、時間切れになってもそれなりの件数まで進んでしまう。
+        #
+        # 以前はこれをそのままExcelに出力すると正確な集計結果に見えて紛らわしい
+        # という理由で一律「要確認」に置き換えていたが、それでは他ツール
+        # (WEB Explorer等)で別途調べ直さない限り数値が一切埋まらなくなって
+        # しまっていた。訪問済みページ数はクロールを続けるほど増える一方
+        # (減ることはない)ため、途中終了時点の値でも「少なくともこれだけは
+        # 確実にある」という下限値としてはそのまま使える。100ページ上限到達時の
+        # "100以上"と表記を揃え、"{数値}以上"として出力する。
+        #
+        # 一方、階層数(display_depth)はここでは書き換えない。ナビゲーション
+        # メニュー等サイトの主要な階層構造は、ページ数が多いサイトでも
+        # 巡回のごく早い段階(=浅い階層のリンクほど先に見つかる)でほぼ判明する
+        # ため、時間切れで打ち切られたとしても、そこまでに観測できたmax_depthは
+        # 実際の最大階層とほぼ一致していることが多い。ページ数のように
+        # 「打ち切られたせいで大きく過小評価している」状況とは性質が異なるため、
+        # 確定していないことを示す"以上"を付けず、素の数値のまま出力する。
+        if not is_over_100 and not queue_exhausted and isinstance(final_page_count, int):
+            final_page_count = f"{final_page_count}以上"
 
         # 「別システム同居」の注記機能は無効化した。blog/topics/news/pages/archives/
         # contentsと除外リストを積み増しても、今度は"products"(商品一覧)のような

@@ -231,13 +231,15 @@ class SiteScraperService:
         queue_exhausted = bool(queue_exhausted_raw)
         subsystem_note = str(subsystem_note_raw or "")
 
-        # 文字列判定と数値へのクリーンアップ処理
-        if total_pages_fetched == "100ページ以上":
-            total_pages_int = 100
-            total_pages_display: int | str = "100以上"
-        else:
-            total_pages_int = int(total_pages_fetched)
-            total_pages_display = total_pages_int
+        # 文字列判定と数値へのクリーンアップ処理。
+        # crawler.pyはtotal_pages_fetchedとして、通常の整数値の他に
+        # "100以上"(100ページ上限到達)や"36以上"(時間切れで途中終了、ただし
+        # 確認できた件数自体は確定している下限値)のような文字列を返してくる
+        # ことがある。これらはRenewalEvaluator.parse_lower_bound()で数値へ
+        # 戻せるので、Excelにもその数値をそのまま出力する(桁の欠落や
+        # 「要確認」による空欄化を避ける)。
+        total_pages_int, _ = evaluator.parse_lower_bound(total_pages_fetched)
+        total_pages_display: int | str = f"{total_pages_int}以上" if isinstance(total_pages_fetched, str) else total_pages_int
 
         remarks_value = ""
 
@@ -264,11 +266,18 @@ class SiteScraperService:
                 page_threshold=page_threshold,
                 queue_exhausted=queue_exhausted,
             )
-            # ページ数・階層数の集計や◯/×判定そのものは変えず、あくまで人間が
-            # 最終確認する際の参考情報として備考欄に注記するに留める
-            # (別システムを機械的に除外しようとすると、正規のサブディレクトリを
-            # 誤って除外するリスクを負うため)。
-            remarks_value = subsystem_note
+            if rejection_reason == evaluator.PENDING_TIMEOUT_REASON:
+                # decide()側でも、確定した「×」の根拠が無いままクロールが
+                # 途中終了した場合に同じ定型文を返すことがある。上と同じ理由で
+                # M列ではなくN列に出す。
+                rejection_reason = ""
+                remarks_value = evaluator.PENDING_TIMEOUT_REASON
+            else:
+                # ページ数・階層数の集計や◯/×判定そのものは変えず、あくまで人間が
+                # 最終確認する際の参考情報として備考欄に注記するに留める
+                # (別システムを機械的に除外しようとすると、正規のサブディレクトリを
+                # 誤って除外するリスクを負うため)。
+                remarks_value = subsystem_note
 
         # スレッドセーフに結果を書き込み
         with self._lock:

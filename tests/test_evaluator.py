@@ -133,6 +133,29 @@ def test_decide_proceeds_normally_when_queue_exhausted_even_if_few_pages() -> No
     assert status == "◯"
 
 
+def test_decide_ng_when_page_cap_reached_even_if_queue_not_exhausted() -> None:
+    evaluator = RenewalEvaluator()
+
+    # 100ページ上限に達した(total_pages=100)場合、queue_exhaustedは通常False
+    # (上限到達時点でまだキューに未訪問URLが残っているため)になるが、
+    # 「少なくとも100ページある」こと自体は確定情報であり、「要確認」に
+    # 握りつぶさず通常通り「ページ数が多いため」で×判定するべき
+    # (fcs.or.jp/ferie.co.jp等で確認)。
+    status, reason = evaluator.decide(total_pages=100, max_depth=1, has_login=False, has_attachment=False, queue_exhausted=False)
+    assert status == "×"
+    assert "ページ数が多い" in reason
+
+
+def test_decide_ng_when_login_confirmed_even_if_queue_not_exhausted() -> None:
+    evaluator = RenewalEvaluator()
+
+    # ログイン機能の有無はクロールが途中終了していても既に確定した事実であり、
+    # 続きを巡回しても覆らないため「要確認」に握りつぶすべきではない。
+    status, reason = evaluator.decide(total_pages=3, max_depth=1, has_login=True, has_attachment=False, queue_exhausted=False)
+    assert status == "×"
+    assert "ログイン" in reason
+
+
 def test_decide_pending_when_max_depth_unmeasurable() -> None:
     evaluator = RenewalEvaluator()
 
