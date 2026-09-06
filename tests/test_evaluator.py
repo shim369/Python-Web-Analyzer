@@ -140,7 +140,7 @@ def test_decide_ng_when_page_cap_reached_even_if_queue_not_exhausted() -> None:
     # (上限到達時点でまだキューに未訪問URLが残っているため)になるが、
     # 「少なくとも100ページある」こと自体は確定情報であり、「要確認」に
     # 握りつぶさず通常通り「ページ数が多いため」で×判定するべき
-    # (fcs.or.jp/ferie.co.jp等で確認)。
+    # (実際に確認済み)。
     status, reason = evaluator.decide(total_pages=100, max_depth=1, has_login=False, has_attachment=False, queue_exhausted=False)
     assert status == "×"
     assert "ページ数が多い" in reason

@@ -228,7 +228,7 @@ To ensure robustness, core logic is thoroughly covered by unit tests using `pyte
 #### 1. Evaluation / Judgment Logic (Evaluator)
 
 * **Threshold-evaluation validity tests**: Verifies that the `◯` / `×` judgment and its reason text are mapped correctly for each condition — the configured page-count threshold (`page_threshold`), site depth, login functionality, attachment support, Basic Authentication, multilingual support, image CAPTCHA on contact forms, specialized features (calendar / on-site search / chatbot), design gimmicks (video / floating buttons / accordions / tabs / modals), and the presence of rich content.
-* **Automatic "needs review" generation tests**: Verifies that `RenewalEvaluator.decide()` returns "needs review" as the top-priority result on connection failure (0 pages), an extremely small page count (1–2 pages with an unexhausted crawl queue), or an unmeasurably deep site structure — and that in the normal case, it delegates internally to `evaluate()`, generating an appropriate reason text based on the evaluation outcome. This branching logic is consolidated entirely within `evaluator.py`; `SiteScraperService` itself contains none of this decision logic.
+* **Automatic "needs review" generation tests**: Verifies that `RenewalEvaluator.decide()` returns "needs review" on connection failure (0 pages), an unmeasurably deep site structure, or a crawl that was cut off before exhausting its link queue — and that any already-confirmed `×` result takes priority over those regardless of crawl completeness. This branching logic is consolidated entirely within `evaluator.py`; `SiteScraperService` itself contains none of this decision logic.
 
 #### 2. Excel Import/Export Service (ExcelService)
 

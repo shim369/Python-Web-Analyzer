@@ -37,14 +37,14 @@ Excelの1行分の解析・調査結果を保持するミュータブル（可�
 * `description`: 用途 (K列 - メタディスクリプション ➔ `<title>` ➔ `<h1>` の優先度順で抽出したWebサイトの概要文。**現状のコードには文字数の切り詰め処理はなく、抽出した文字列がそのまま格納される**）
 * `contact_fields`: 問合せ項目 (L列 - フォーム内のinput/textarea/selectのラベルをaria属性・label紐付け・祖先要素探索などから抽出し、項目名を**改行区切り**で格納。HubSpot/Tayori等の外部埋め込みフォームを検出した場合はその旨のテキストを格納。iframe内フォームも最大2階層まで再帰的に解析)
 * `rejection_reason`: 不可の理由 (M列 - 判定保留時（ネットワーク機器ブロック・接続不可・ページ数極小・階層深すぎ）の理由や、`RenewalEvaluator` が返す判定理由（改行区切りで複数格納されうる。ページ数超過／3階層以上／ログイン機能／添付機能／ベーシック認証／多言語対応／Captcha／カレンダー／サイト内検索／チャットボット／動画／フローティングボタン／アコーディオン／タブ切り替え／モーダル／Lightbox等／スクロールアニメーション、の中から該当するものすべて）を格納)
-* `remarks`: 備考 (N列 - 通常は空文字列。**移転案内ページを検知した場合のみ`SiteScraperService`が`"移転先：{URL}"`という文字列を設定する。** それ以外の「クロールしたテキスト群から自動生成された特徴文」を出力する機能は未実装。)
+* `remarks`: 備考 (N列 - 通常は空文字列。移転案内ページを検知した場合は`SiteScraperService`が`"移転先：{URL}"`を設定する。それ以外の通常判定時は、クロール結果の`subsystem_note`（別システムらしきものが一部ディレクトリに同居している場合の注記）をそのまま転記し、判定保留の理由が`PENDING_TIMEOUT_REASON`（時間切れ）だった場合はM列の代わりにその定型文をここへ出力する。)
 * `operator_name`: 担当 (O列 - アプリ実行時に指定された担当者名をそのまま格納)
 
 ## 2. サービス層のインターフェース
 
 ### 2.1. `WebCrawler.crawl_and_analyze(start_url: str)`
 
-戻り値は **14要素のtuple**（辞書ではない）。`@measure_time`デコレータが付与されており、呼び出し1回ごとの所要時間がDEBUGログに出力される。
+戻り値は **15要素のtuple**（辞書ではない）。`@measure_time`デコレータが付与されており、呼び出し1回ごとの所要時間がDEBUGログに出力される。
 
 ```python
 (
@@ -62,16 +62,18 @@ Excelの1行分の解析・調査結果を保持するミュータブル（可�
     blocked_reason,       # str（Fortinet等のネットワークセキュリティ機器によるブロックページを検知した場合のみ非空）
     redirect_target_url,  # str（meta refresh/JSタイマーによる別ドメインへの自動リダイレクト＝移転案内ページを検知した場合のみ非空）
     queue_exhausted,      # bool（巡回対象の内部リンクをすべて発見・訪問し尽くして自然にキューが空になった場合True）
+    subsystem_note,       # str（サイトの一部ディレクトリに別システムらしきものが同居し、ページ数の大半を占めている場合の注記。該当なしは空文字）
 )
 ```
 
 呼び出し元（`SiteScraperService`）はこの順序でtupleアンパックを行う。順序や要素数を変更する場合は、呼び出し元・関数の戻り値型ヒント（`tuple[...]`）の両方を同時に修正する必要がある（型ヒントだけ更新が漏れると、実際に返す要素数と宣言が食い違い、mypyの`Incompatible return value type`エラーになる）。
 
-* `has_login`は、`_has_password_login_form`によって検知される。パスワード入力欄（`type="password"`、または`autocomplete="current-password"/"new-password"`）を持つフォームが、サイト共通のヘッダー/グローバルナビ（`<header>`要素、または`_HEADER_LIKE_RE`＝`header|gnav|globalnav|utility|top-?bar|topnav|l-header`にマッチするclass/id）を伴って表示されている場合にTrueとなる。CMS管理画面のログインページ（`wp-login.php`等）を個別列挙して除外する方式は対象CMSが増えるたびにメンテナンスが必要になるため採用せず、「訪問者向けの会員ログイン・マイページは通常のページテンプレートに組み込まれるためサイト共通ヘッダーを伴うが、管理者ログイン画面は単独ページとして表示されヘッダーを伴わない」という構造的な違いで区別している。`login`/`mypage`/`member`/`account`等の文字列はログイン判定そのものには使われておらず、クロールキューの巡回優先度付けにのみ使用される。
-* `has_basic_auth`は、初回アクセス（`primary_url`/`fallback_url`）およびクロールループ内の各ページ取得時、`response.status_code == 401`を`raise_for_status()`呼び出し前に確認することで検知する。サイト全体がベーシック認証で保護されている場合だけでなく、一部の下層ページのみが保護されている場合も検知できる。
-* `blocked_reason`は、取得したHTMLがFortinet Webfilter等のネットワークセキュリティ機器によるブロックページ（実サイトの内容ではない）であるかどうかを判定して設定される。SSL証明書エラーが引き金でこの警告ページが返されているケースを区別して分類する処理（`_extract_fortinet_category`等）を含む。`blocked_reason`が設定された時点で、通常の巡回・判定ロジックには進まず即座に結果を返す。
-* `redirect_target_url`は、取得したHTMLがmeta refreshやJSの`location.href`書き換え等によって数秒後に別ドメインへ自動遷移する「移転案内ページ」かどうかを検知して設定される（`_detect_delayed_cross_domain_redirect`）。設定された時点で即座に結果を返す。
-* `queue_exhausted`は、巡回対象として発見した内部リンクをすべて訪問し終えてキューが自然に空になったか（`True`）、タイムアウトや最大ページ数（100件）到達等で未訪問のリンクを残したまま打ち切ったか（`False`）を表す。`total_pages`が1〜2件と少ない場合に、「元々ページ数の少ないサイト」なのか「クロールが途中で終わっただけ」なのかを`evaluator.py`側で区別するために使う。
+* `has_login`は、`_has_password_login_form`によって検知される。パスワード入力欄（`type="password"`、または`autocomplete="current-password"/"new-password"`）を持つフォームが、サイト共通のヘッダー/グローバルナビ（`<header>`要素、または`_HEADER_LIKE_RE`＝`header|gnav|globalnav|utility|top-?bar|topnav|l-header`にマッチするclass/id）を伴って表示されている場合にTrueとなる。CMS管理画面のログインページを個別列挙して除外する方式は対象CMSが増えるたびにメンテナンスが必要になるため採用せず、「訪問者向けの会員ログイン・マイページは通常のページテンプレートに組み込まれるためサイト共通ヘッダーを伴うが、管理者ログイン画面は単独ページとして表示されヘッダーを伴わない」という構造的な違いで区別している。`login`/`mypage`/`member`/`account`等の文字列はログイン判定そのものには使われておらず、クロールキューの巡回優先度付けにのみ使用される。
+* `has_basic_auth`は、初回アクセスおよびクロールループ内の各ページ取得時、`response.status_code == 401`を`raise_for_status()`呼び出し前に確認することで検知する。サイト全体がベーシック認証で保護されている場合だけでなく、一部の下層ページのみが保護されている場合も検知できる。
+* `blocked_reason`は、取得したHTMLがFortinet Webfilter等のネットワークセキュリティ機器によるブロックページ（実サイトの内容ではない）であるかどうかを判定して設定される。SSL証明書エラーが引き金でこの警告ページが返されているケースを区別して分類する処理を含む。設定された時点で、通常の巡回・判定ロジックには進まず即座に結果を返す。
+* `redirect_target_url`は、取得したHTMLがmeta refreshやJSの`location.href`書き換え等によって数秒後に別ドメインへ自動遷移する「移転案内ページ」かどうかを検知して設定される。設定された時点で即座に結果を返す。
+* `queue_exhausted`は、巡回対象として発見した内部リンクをすべて訪問し終えてキューが自然に空になったか（`True`）、タイムアウトや最大ページ数（100件）到達等で未訪問のリンクを残したまま打ち切ったか（`False`）を表す。「元々ページ数の少ないサイト」なのか「クロールが途中で終わっただけ」なのかを`evaluator.py`側で区別するために使う。
+* `subsystem_note`は、サイト全体のごく一部のディレクトリ配下に別システムらしきものが同居し、そこだけでページ数の大半を占めている場合の注記文字列。ページ数・階層数の集計や判定そのものには影響せず、`SiteScraperService`が通常判定時のN列（備考）にそのまま転記する参考情報。
 
 ### 2.2. `RenewalEvaluator`
 
@@ -79,18 +81,22 @@ Excelの1行分の解析・調査結果を保持するミュータブル（可�
 
 **`decide(total_pages, max_depth, has_login, has_attachment, has_basic_auth=False, has_multilang=False, html_src="", page_threshold=10, queue_exhausted=False) -> tuple[str, str]`**
 
-C列（調査結果）全体、すなわち`"◯"` / `"×"` / `"要確認"`の3値すべてを決定する窓口メソッド。`total_pages`/`max_depth`は`int | str`で受け取り、クローラーの生の戻り値（`max_depth`が文字列`"要確認"`のケースを含む）をそのまま渡せる。以下の判定を`evaluate()`より先に行い、該当すれば即座に`"要確認"`（または`"×"`）とその理由を返す。
+C列（調査結果）全体、すなわち`"◯"` / `"×"` / `"要確認"`の3値すべてを決定する窓口メソッド。`total_pages`/`max_depth`は`int | str`で受け取り、クローラーの生の戻り値（`"100以上"`のような下限値表記や、`max_depth`が文字列`"要確認"`のケースを含む）をそのまま渡せる。判定は次の順で行う。
 
-1. `total_pages == 0`
+1. `total_pages == 0` の場合、`evaluate()`へは進まず即座に確定する。
    * `has_basic_auth=True` → 「ベーシック認証がかかっているページがあるため」で**`"×"`**（接続不可の汎用メッセージより、判定可能な明確な理由を優先する）
    * それ以外 → 「接続不可またはアクセス拒否のため、判定を保留しました。」で**`"要確認"`**
-2. `1 <= total_pages <= 2` かつ `queue_exhausted=False` → 「クロールできたページ数が極端に少ないため判定を保留しました。」で**`"要確認"`**
-   * `queue_exhausted=True`（内部リンクを発見し尽くして自然にキューが空になった）の場合はこの分岐に該当せず、`evaluate()`による通常判定へ進む。
-3. `max_depth == "要確認"`（階層10超過） → 「サイト階層が深すぎるため、別途サイトエクスプローラー等での確認をお願いします。」で**`"要確認"`**
+2. 上記に該当しなければ、`total_pages`/`max_depth`を`parse_lower_bound()`で数値化した上で必ず`evaluate()`を実行する。`parse_lower_bound()`は`int`値、または`"{数値}以上"`形式の文字列を(数値, 信頼できる下限値か)に変換し、`"要確認"`のような下限値表記を伴わない文字列は信頼できない値として扱う。
+3. `evaluate()`の結果が**`"×"`**であれば、`queue_exhausted`等の状態に関わらずそのままその理由で確定する。ページ数・階層数・機能検知など、一度確定した`×`の根拠はクロールを続けても覆らないため。
+4. `evaluate()`が`"×"`にならなかった場合、以下の順で「続きを巡回すれば結果が変わったかもしれない」不確実性を確認し、該当すれば`"要確認"`に倒す。
+   * ページ数が信頼できる下限値でない → `PENDING_TIMEOUT_REASON`（クロールが時間切れで途中終了した旨の定型文）
+   * 階層数が信頼できる下限値でない（`max_depth == "要確認"`、階層10超過相当） → 「サイト階層が深すぎるため、別途サイトエクスプローラー等での確認をお願いします。」
+   * `queue_exhausted=False`（内部リンクを巡回し尽くさずに打ち切られた） → `PENDING_TIMEOUT_REASON`
+5. いずれにも該当しなければ、`evaluate()`の結果（`"◯"`）をそのまま返す。
 
-いずれにも該当しなければ、`max_depth`を`int`に変換した上で内部的に`evaluate()`を呼び出し、その結果をそのまま返す。
+`PENDING_TIMEOUT_REASON`はM列（不可の理由）には出力されない。`SiteScraperService`側でこの定型文だけを判定し、M列を空にした上でN列（備考）へ振り替える（3.1節参照）。
 
-`SiteScraperService`は`evaluate()`を直接呼ばず、この`decide()`のみを呼ぶ。ただし、`decide()`を呼ぶ前段階として、`SiteScraperService`自身が`blocked_reason`（ネットワーク機器ブロック）と`redirect_target_url`（移転案内ページ）の有無を先にチェックしており、いずれかが非空であればそちらを優先して結果を確定させ、`decide()`自体を呼ばない（詳細は3.1節参照）。「`要確認`に倒すかどうか」の分岐（総ページ数0／1〜2／階層計測不能）は`evaluator.py`単体に集約されており、`SiteScraperService`側にはこの種の判断ロジックを持たせていない。これにより`test_evaluator.py`でカバーできる。
+`SiteScraperService`は`evaluate()`を直接呼ばず、この`decide()`のみを呼ぶ。ただし、`decide()`を呼ぶ前段階として、`SiteScraperService`自身が`blocked_reason`（ネットワーク機器ブロック）と`redirect_target_url`（移転案内ページ）の有無を先にチェックしており、いずれかが非空であればそちらを優先して結果を確定させ、`decide()`自体を呼ばない（詳細は3.1節参照）。「`要確認`に倒すかどうか」の判断は`evaluator.py`単体に集約されており、`SiteScraperService`側にはこの種の判断ロジックを持たせていない。これにより`test_evaluator.py`でカバーできる。
 
 **`evaluate(total_pages, max_depth, has_login, has_attachment, has_basic_auth=False, has_multilang=False, html_src="", page_threshold=10) -> tuple[str, str]`**
 
@@ -133,10 +139,10 @@ Google Map埋め込みは、ほぼすべてのコーポレートサイトのア�
 `_process_single_assessment`が1ドメイン分の処理単位であり、以下の順で実行される。
 
 1. `SslChecker.check_ssl_status()`でSSL/常時SSL判定
-2. `WebCrawler(render_js=True, timeout=300.0, page_timeout=8.0).crawl_and_analyze()`でクロール（JSフレームワーク検知でPlaywrightレンダリングが走ると1回あたり15秒前後かかることに加え、記事系ページを大量に持つサイトで90秒では実ページ数を大きく下回ってしまう事例があったため、visited件数100件到達での早期打ち切りを前提に300秒まで引き上げている）
+2. `WebCrawler(render_js=True, timeout=150.0, page_timeout=8.0).crawl_and_analyze()`でクロール（JSフレームワーク検知でPlaywrightレンダリングが走ると1回あたり15秒前後かかる上、記事系ページを大量に持つサイトでは90秒では実ページ数を大きく下回る事例があったため長めに確保。ただし300秒まで引き上げると並列ワーカー1枠を長時間占有し他ドメインの処理を押し出してしまったため、100ページ到達までの余裕とスループットのバランスを取って150秒に調整している）
 3. クロール結果に`redirect_target_url`（移転案内ページ）があれば、`RenewalEvaluator.decide()`を呼ばずに`"×"`（すでにリニューアル済のため）を確定し、備考欄に移転先を記録
 4. そうでなく`blocked_reason`（ネットワーク機器ブロック）があれば、同様に`decide()`を呼ばずに`"要確認"`＋検知した理由を確定
-5. どちらでもなければ`RenewalEvaluator.decide()`を呼び出し、通常の判定フローに委ねる
+5. どちらでもなければ`RenewalEvaluator.decide()`を呼び出し、通常の判定フローに委ねる。返ってきた`rejection_reason`が`PENDING_TIMEOUT_REASON`と一致する場合はM列を空にしてN列（備考）へ振り替え、それ以外の場合はクロール結果の`subsystem_note`をN列にそのまま転記する
 6. 結果を`threading.Lock`配下で`SiteAssessment`インスタンスへスレッドセーフに書き込み
 7. `JobRepository.update_assessment()`でSQLiteへ即座に反映
 
