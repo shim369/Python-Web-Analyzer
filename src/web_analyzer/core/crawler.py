@@ -1,3 +1,4 @@
+import html as html_lib
 import logging
 import posixpath
 import re
@@ -10,6 +11,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup, NavigableString, Tag, XMLParsedAsHTMLWarning
 
+from web_analyzer.core.evaluator import RenewalEvaluator
 from web_analyzer.utils.decorators import measure_time
 
 logger = logging.getLogger(__name__)
@@ -69,6 +71,26 @@ class WebCrawler:
     _REQUIRED_MARK_RE = re.compile("|".join(REQUIRED_MARK_PATTERNS))
     _TEMPLATE_VAR_RE = re.compile(r"\{\{.*?\}\}")
     _EMPTY_PARENS_RE = re.compile(r"[\(（]\s*[\)）]")
+
+    # リンクを辿り尽くして見つかったページ数がこれ以下の場合のみ、sitemap.xmlで補完する
+    SITEMAP_FALLBACK_MAX_PAGES = 2
+    # サイトマップインデックスから読む子サイトマップの最大数
+    MAX_CHILD_SITEMAPS = 5
+
+    # お問い合わせフォームもmailtoリンクも見つからなかった場合にL列(問合せ項目)に出す文言
+    NO_CONTACT_FORM_TEXT = "問い合わせフォームなし"
+
+    # メールアドレスが設定されたmailtoリンク(<a href="mailto:info@example.com">)。
+    # 宛先の無い"mailto:"だけのリンクは対象外。
+    MAILTO_HREF_PATTERN = re.compile(r"^\s*mailto:\s*[^\s@?]+@", re.IGNORECASE)
+
+    # 別ドメインにあるお問い合わせページへのリンク判定用。CONTACT_KEYWORDSは
+    # "support"/"help"/"mail"等を含み、別ドメインに対して使うと
+    # support.google.com等の無関係な外部リンクまで拾ってしまうため、より狭く絞る。
+    EXTERNAL_CONTACT_URL_PATTERN = re.compile(r"contact|inquiry|toiawase|otoiawase", re.IGNORECASE)
+    EXTERNAL_CONTACT_TEXT_PATTERN = re.compile(r"問い合わせ|問合せ|問合わせ|コンタクト|contact", re.IGNORECASE)
+    # 巡回終了後に取得を試みる、別ドメインのお問い合わせページの最大件数
+    MAX_EXTERNAL_CONTACT_PAGES = 3
 
     # お問い合わせページ判定用キーワード(日英混在)
     CONTACT_KEYWORDS = [
@@ -496,7 +518,23 @@ class WebCrawler:
         if "/pageindices/" in parsed_abs.path.lower():
             return False
 
-        return abs_domain == base_domain
+        return abs_domain == base_domain or self._is_shared_ssl_alias(abs_domain, base_domain)
+
+    @staticmethod
+    def _is_shared_ssl_alias(host: str, base_domain: str) -> bool:
+        """レンタルサーバーの共用SSL用ホスト(調査対象サイトの別名)か判定する。
+
+        実際に確認済み: etp-jp.comのメニューのリンク先がすべて
+        "https://etp-jp-com.prm-ssl.jp/contact.html"のような共用SSLホストに
+        なっており、外部ドメイン扱いで巡回されずにページ数・問合せ項目が
+        取得できていなかった。共用SSLホストは先頭ラベルが「ドメイン名の
+        ドットをハイフンに置き換えたもの」になる命名が一般的なため、
+        それに完全一致する場合のみ同じサイトとみなす。
+        """
+        host = host.split(":")[0].lower()
+        base = re.sub(r"^www\.", "", base_domain.split(":")[0].lower())
+        first_label, _, rest = host.partition(".")
+        return bool(rest) and host != base and first_label == base.replace(".", "-")
 
     def _has_password_login_form(self, html: str) -> bool:
         """パスワード入力欄を持つ、訪問者向けのログインフォームが存在するか判定する。
@@ -1416,15 +1454,156 @@ class WebCrawler:
 
         return ""
 
+    def _retry_if_path_dropped(
+        self,
+        client: httpx.Client,
+        requested_url: str,
+        response: httpx.Response,
+        headers: dict[str, str],
+    ) -> httpx.Response:
+        """www有無違いのホストへのリダイレクトでパスが捨てられた場合、元のパスで取り直す。
+
+        実際に確認済み: "https://example.co.jp/contact/"だけが
+        "http://www.example.co.jp/"(トップページ)へ301リダイレクトされ、パスが
+        失われるサイトがある(他のページはwww無しでもそのまま表示される)。
+        リダイレクト先のトップページは巡回済みとして読み飛ばされるため、
+        お問い合わせページに一度も到達できずL列が空欄になっていた。
+        リダイレクト先のホストで元のパスを取得し直し、トップページ以外の
+        ページが返ってきた場合のみそちらを採用する。
+        """
+        if not response.history:
+            return response
+
+        requested = urlparse(requested_url)
+        final = urlparse(str(response.url))
+        if requested.path in ("", "/") or final.path not in ("", "/") or final.query:
+            return response
+
+        def _host(netloc: str) -> str:
+            return re.sub(r"^www\.", "", netloc.split(":")[0].lower())
+
+        # 別ドメインへの転送(移転等)は対象外。www有無の違いだけの場合に限る
+        if final.netloc.lower() == requested.netloc.lower() or _host(final.netloc) != _host(requested.netloc):
+            return response
+
+        retry_url = final._replace(path=requested.path, query=requested.query).geturl()
+        try:
+            retry_response = client.get(retry_url, headers=headers)
+        except httpx.RequestError:
+            return response
+        if retry_response.status_code != 200 or urlparse(str(retry_response.url)).path in ("", "/"):
+            return response
+        return retry_response
+
+    def _fetch_sitemap_page_urls(self, client: httpx.Client, site_url: str) -> list[str]:
+        """サイトのsitemap.xmlに載っているページURLの一覧を返す。
+
+        robots.txtのSitemap:行と、一般的な配置場所(/sitemap.xml等)を順に試し、
+        最初に読めたサイトマップを使う。サイトマップインデックスの場合は
+        子サイトマップを最大MAX_CHILD_SITEMAPS件まで読む(それより深くは辿らない)。
+        """
+        parsed = urlparse(site_url)
+        root = f"{parsed.scheme}://{parsed.netloc}"
+
+        candidates: list[str] = []
+        try:
+            robots = client.get(f"{root}/robots.txt")
+            if robots.status_code == 200:
+                candidates.extend(re.findall(r"(?im)^\s*sitemap:\s*(\S+)", robots.text))
+        except httpx.RequestError:
+            pass
+        candidates.extend(f"{root}{path}" for path in ("/sitemap.xml", "/sitemap_index.xml", "/wp-sitemap.xml"))
+
+        for sitemap_url in dict.fromkeys(candidates):
+            kind, locs = self._read_sitemap(client, sitemap_url)
+            if kind == "urlset":
+                return locs
+            if kind == "sitemapindex":
+                page_urls: list[str] = []
+                for child_url in locs[: self.MAX_CHILD_SITEMAPS]:
+                    child_kind, child_locs = self._read_sitemap(client, child_url)
+                    if child_kind == "urlset":
+                        page_urls.extend(child_locs)
+                return page_urls
+        return []
+
+    def _read_sitemap(self, client: httpx.Client, url: str) -> tuple[str, list[str]]:
+        """サイトマップを取得し、(種類("urlset"/"sitemapindex"/""), <loc>の一覧)を返す。
+
+        SPA等では存在しないパスにもHTMLを200で返すことがあるため、
+        ステータスコードではなくXMLのルート要素の有無で判定する。
+        """
+        try:
+            response = client.get(url)
+        except httpx.RequestError:
+            return "", []
+        if response.status_code != 200:
+            return "", []
+        text = response.text
+        locs = [html_lib.unescape(loc.strip()) for loc in re.findall(r"<loc>\s*(.*?)\s*</loc>", text, re.IGNORECASE | re.DOTALL)]
+        if re.search(r"<sitemapindex[\s>]", text, re.IGNORECASE):
+            return "sitemapindex", locs
+        if re.search(r"<urlset[\s>]", text, re.IGNORECASE):
+            return "urlset", locs
+        return "", []
+
+    def _find_external_contact_links(self, soup: BeautifulSoup, page_url: str, base_domain: str) -> list[str]:
+        """ページ内の、別ドメインにあるお問い合わせページへのリンクURLを返す。
+
+        URLに"contact"等を含むか、リンクテキストが「お問い合わせ」等のものを対象にする。
+        調査対象サイト自身(www有無・共用SSLホストを含む)へのリンクは通常の巡回で
+        処理されるため除外する。
+        """
+        base = re.sub(r"^www\.", "", base_domain.split(":")[0].lower())
+        urls: list[str] = []
+        for a in soup.find_all("a", href=True):
+            href = str(a["href"]).strip()
+            if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
+                continue
+            parsed = urlparse(urljoin(page_url, href))
+            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                continue
+            host = re.sub(r"^www\.", "", parsed.netloc.split(":")[0].lower())
+            if host == base or self._is_shared_ssl_alias(host, base):
+                continue
+            if self.EXTERNAL_CONTACT_URL_PATTERN.search(parsed.netloc + parsed.path) or self.EXTERNAL_CONTACT_TEXT_PATTERN.search(a.get_text(" ", strip=True)):
+                urls.append(parsed._replace(fragment="").geturl())
+        return urls
+
+    def _extract_external_contact_form(self, client: httpx.Client, urls: list[str]) -> tuple[str, bool]:
+        """別ドメインにあるお問い合わせページを取得し、フォームの項目と添付機能の有無を返す。
+
+        リンク元(URL・リンクテキスト)でお問い合わせページと分かっているため、
+        本文欄があればお問い合わせフォームとして採用する(is_contact_page=True)。
+        """
+        for url in urls:
+            try:
+                response = client.get(url)
+            except httpx.RequestError:
+                continue
+            if response.status_code != 200:
+                continue
+            html = self._decode_response(response)
+            fields, has_attachment = self._extract_form_fields(html, str(response.url), client, depth=0)
+            if self._looks_like_genuine_contact_form(BeautifulSoup(html, HTML_PARSER), fields, is_contact_page=True):
+                logger.info("別ドメインのお問い合わせページからフォームを取得しました: %s", response.url)
+                return fields, has_attachment
+        return "", False
+
     def _looks_like_genuine_contact_form(
         self,
         soup: BeautifulSoup,
         fields_text: str,
+        is_contact_page: bool = False,
     ) -> bool:
         """抽出結果をお問い合わせフォームとして確定してよいか判定する。
 
-        URL自体がお問い合わせページの場合は比較的緩く判定する。
-        一方、トップページ等の「お問い合わせリンクがあるだけ」のページでは、
+        本文欄(textarea)があることを必須条件にする。メール欄はログインフォーム
+        や会員登録フォームにもあるため決め手にしない。一方、本文欄はブログの
+        コメント欄にもあるため、コメントフォームは除外する。
+
+        URL自体がお問い合わせページ(is_contact_page)の場合は、本文欄があれば
+        採用する。トップページ等の「お問い合わせリンクがあるだけ」のページでは、
         フォームコンテナ自身にお問い合わせらしい特徴がある場合のみ採用する。
         """
         if not fields_text:
@@ -1461,9 +1640,21 @@ class WebCrawler:
             if not inputs:
                 continue
 
-            has_email = bool(container.find("input", {"type": "email"}))
+            # 本文欄(textarea)の無いフォームは、ログイン・検索・会員登録等とみなす
+            if not container.find("textarea"):
+                continue
 
-            has_textarea = bool(container.find("textarea"))
+            # パスワード欄を持つフォームはログイン・会員登録用
+            if container.find("input", {"type": "password"}):
+                continue
+
+            # ブログのコメント欄(WordPressの#commentform等)は名前・メール・本文を
+            # 持つため、お問い合わせフォームと区別して除外する
+            if self._is_comment_form(container):
+                continue
+
+            if is_contact_page:
+                return True
 
             # name / id / placeholder も問い合わせ判定材料にする
             input_text_parts: list[str] = []
@@ -1478,12 +1669,8 @@ class WebCrawler:
 
             contact_word_count = sum(1 for word in contact_words if word.lower() in container_text or word.lower() in input_metadata)
 
-            # メール + textarea はかなり強い問い合わせフォームの特徴
-            if has_email and has_textarea:
-                return True
-
             # 問い合わせ関連語がフォーム自身に複数存在する場合
-            if contact_word_count >= 2 and (has_email or has_textarea):
+            if contact_word_count >= 2:
                 return True
 
             # 問い合わせフォームではメール欄がなくても、
@@ -1491,9 +1678,19 @@ class WebCrawler:
             has_name = any(word in container_text or word in input_metadata for word in ("お名前", "氏名", "name"))
             has_phone = any(word in container_text or word in input_metadata for word in ("電話番号", "電話", "tel", "phone"))
 
-            if has_textarea and has_name and has_phone:
+            if has_name and has_phone:
                 return True
 
+        return False
+
+    def _is_comment_form(self, container: Tag) -> bool:
+        """ブログ等のコメント投稿フォームか判定する。"""
+        if "wp-comments-post" in str(container.get("action") or "").lower():
+            return True
+        for el in [container, *container.find_parents(limit=3)]:
+            names = " ".join([*(el.get("class") or []), str(el.get("id") or "")]).lower()
+            if "commentform" in names or "comment-form" in names or "comment-respond" in names:
+                return True
         return False
 
     def _find_form_containers(self, soup: BeautifulSoup) -> list[Tag]:
@@ -2163,6 +2360,10 @@ class WebCrawler:
 
         max_depth = 0
         contact_fields = ""
+        # お問い合わせフォームが無いサイトで、L列に"mailto"と出すための目印
+        has_mailto_link = False
+        # 別ドメイン(フォーム専用サービス・共用SSL等)にあるお問い合わせページのURL
+        external_contact_urls: list[str] = []
         has_attachment = False
         has_login = False
         has_basic_auth = False
@@ -2242,6 +2443,10 @@ class WebCrawler:
             p = urlparse(u)
             scheme = "https" if p.scheme in ("http", "https") else p.scheme
             netloc = re.sub(r"^www\.", "", p.netloc, flags=re.IGNORECASE)
+            # 共用SSLホスト(例: etp-jp-com.prm-ssl.jp)は調査対象ドメインと同じサイトの
+            # 別名なので、同じキーにまとめて二重カウントを防ぐ
+            if self._is_shared_ssl_alias(netloc, base_domain_clean):
+                netloc = re.sub(r"^www\.", "", base_domain_clean, flags=re.IGNORECASE)
             return p._replace(scheme=scheme, netloc=netloc).geturl()
 
         def enqueue(url: str, path_depth: int, priority: bool) -> None:
@@ -2457,8 +2662,30 @@ class WebCrawler:
                 queued_urls.add(_dedup_key(first_url))
 
                 previous_url = ""
+                sitemap_tried = False
 
-                while queue:
+                while True:
+                    if not queue:
+                        # リンクを辿り尽くしても数ページしか見つからなかった場合、
+                        # ページ間の移動をJSで行っていて<a href>から辿れないサイトの
+                        # 可能性がある(実際に確認済み: Canva製サイトはリンクが
+                        # href="#page-2"のようなページ内リンクで、実URL"/page-2"へは
+                        # JSで切り替えるため、トップページ1ページだけと判定されていた)。
+                        # その場合に限り、sitemap.xmlに載っているURLで補完して巡回を続ける。
+                        # 通常のサイトで常にサイトマップを使うと、リンクからは辿れない
+                        # タグ一覧・投稿者ページ等まで数えてしまうため、補完に留める。
+                        if sitemap_tried or len(canonical_visited) > self.SITEMAP_FALLBACK_MAX_PAGES:
+                            break
+                        sitemap_tried = True
+                        for sitemap_url in self._fetch_sitemap_page_urls(client, first_url):
+                            if self._is_valid_internal_link(first_url, sitemap_url, base_domain_clean):
+                                norm_sitemap_url = normalize_url(urljoin(first_url, sitemap_url))
+                                sitemap_path_depth = len([p for p in urlparse(norm_sitemap_url).path.split("/") if p])
+                                enqueue(norm_sitemap_url, sitemap_path_depth, False)
+                        if not queue:
+                            break
+                        logger.info("リンクから辿れるページが少ないため、sitemap.xmlのURL(%d件)で補完します: %s", len(queue), first_url)
+
                     if len(canonical_visited) >= 100:
                         is_over_100 = True
                         break
@@ -2510,6 +2737,7 @@ class WebCrawler:
                                 has_basic_auth = True
                             if response.status_code != 200:
                                 continue
+                            response = self._retry_if_path_dropped(client, current_url, response, req_headers)
                             current_html = self._decode_response(response)
                             # normalize_url()でキュー投入時に末尾スラッシュを削っているため、
                             # current_url(例: ".../sdgs")のままリンク解決の基準にすると、
@@ -2551,6 +2779,10 @@ class WebCrawler:
 
                         previous_url = resolved_url
                         soup = BeautifulSoup(current_html, HTML_PARSER)
+                        # 先頭ページ(トップページ)だけを対象にする判定(スクロールアニメーション)
+                        # のために、ページの境界に区切りマーカーを挟む
+                        if combined_html_src:
+                            combined_html_src += f"\n{RenewalEvaluator.PAGE_SEPARATOR}"
                         combined_html_src += f"\n{current_html}"
 
                         if depth > max_depth:
@@ -2852,8 +3084,19 @@ class WebCrawler:
                             # (このページ自体が持つ無関係なフォーム(サイト内検索等)を、
                             #  単に「お問い合わせへのリンクがあるページ」というだけの理由で
                             #  誤って確定させないようにするため)
-                            if self._looks_like_genuine_contact_form(soup, candidate_fields):
+                            if self._looks_like_genuine_contact_form(soup, candidate_fields, is_contact_page=is_contact_url):
                                 contact_fields, has_attachment = candidate_fields, candidate_attachment
+
+                        # メールアドレスへのmailtoリンクの有無(フォームが無い場合の代替の問い合わせ手段)
+                        if not has_mailto_link and soup.find("a", href=self.MAILTO_HREF_PATTERN):
+                            has_mailto_link = True
+
+                        # 別ドメインにあるお問い合わせページへのリンクを記録しておく
+                        # (巡回はしないが、サイト内でフォームが見つからなかった場合に取得する)
+                        if not contact_fields:
+                            for ext_url in self._find_external_contact_links(soup, resolved_url, base_domain_clean):
+                                if ext_url not in external_contact_urls and len(external_contact_urls) < self.MAX_EXTERNAL_CONTACT_PAGES:
+                                    external_contact_urls.append(ext_url)
 
                         # ログイン・マイページ機能の検知
                         # (パスワード欄の有無 + サイト共通ヘッダーの有無という構造的シグナルで判定)
@@ -2917,6 +3160,13 @@ class WebCrawler:
                     except httpx.RequestError:
                         continue
 
+                # サイト内でお問い合わせフォームが見つからなかった場合、別ドメインに
+                # あるお問い合わせページ(例: 共用SSLホストのcontact.html)のフォームを拾う。
+                # ページ数には数えず、そのページから先の巡回もしない。
+                if not contact_fields and external_contact_urls:
+                    contact_fields, external_attachment = self._extract_external_contact_form(client, external_contact_urls)
+                    has_attachment = has_attachment or external_attachment
+
         except Exception as e:
             logger.warning("クローラー内で予期せぬエラーが発生しました: %s", e, exc_info=True)
 
@@ -2943,6 +3193,13 @@ class WebCrawler:
         # 逆にキューに未訪問のURLが残っている場合、タイムアウトや最大ページ数(100件)到達等の
         # 理由で途中で打ち切っただけであり、「本当にページ数の少ないサイト」とは区別する必要がある。
         queue_exhausted = not queue
+
+        # お問い合わせフォームが見つからず、メールアドレスにmailtoリンクが
+        # 設定されている場合は、問い合わせ手段としてL列に"mailto"と出す。
+        # mailtoも無い場合(お問い合わせページに電話番号やメールアドレスの
+        # 記載しか無い場合を含む)は「問い合わせフォームなし」と出す。
+        if not contact_fields:
+            contact_fields = "mailto" if has_mailto_link else self.NO_CONTACT_FORM_TEXT
 
         site_structure = "\n".join(global_nav_menus[:10])
         # 総ページ数は、リダイレクト前の生URL(visited)の件数ではなく、実際に
