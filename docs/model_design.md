@@ -12,7 +12,7 @@
 
 * `id`: ジョブID (UUID文字列)
 * `operator_name`: 担当者名 (ExcelのO列に引き継がれる値)
-* `page_threshold`: ◯ 判定の最大ページ数 (デフォルト: `10`)
+* `page_threshold`: 「ページ数が多いため」で×にならない最大ページ数 (デフォルト: `10`)
   * ※旧仕様の `threshold_1`〜`threshold_3`（3段階の閾値）は廃止され、単一の閾値に統合されている。
   * ※現在のUI（`main.py`）にはこの値を入力させる要素が存在せず、常にデフォルト値 `10` で運用される。
 * `status`: 状態（`pending`: 開始前, `processing`: 処理中, `completed`: 正常終了, `failed`: 異常終了, `interrupted`: 前回起動時に異常終了したまま残っていた状態）
@@ -26,7 +26,7 @@ Excelの1行分の解析・調査結果を保持するミュータブル（可�
 * `job_id`: 紐付くジョブのID (FK)
 * `date_str`: 日付 (A列 - アプリ実行時の日付を `M/D` 形式で格納)
 * `domain_name`: サイト名 (B列 - インポートされたドメイン名)
-* `evaluation_result`: 調査結果 (C列 - **`◯`, `×`, `要確認`** の3値。旧仕様の `◎`/`△` は廃止。判定ロジックの詳細は要件定義書を参照)
+* `evaluation_result`: 調査結果 (C列 - **`×`, `要確認`** の2値（`◯`は出力しない）。旧仕様の `◎`/`△` は廃止。判定ロジックの詳細は要件定義書を参照)
 * `has_ssl`: SSLあり (D列 - 有効なSSL証明書が確認できれば **`あり`**、不可なら **`なし`**、判定不能時は空欄)
 * `is_always_ssl`: SSL常時 (E列 - `http://` から `https://` への自動リダイレクトが確認できれば **`◯`**、そうでなければ **`×`**、判定不能時は空欄)
 * `max_depth`: 階層数 (F列 - `int | None` 型。ただし実際にクローラーから返る値は `int` または文字列 **`"要確認"`**（階層10超過時）であるため、この列には数値以外の文字列が入り得る点に注意)
@@ -35,9 +35,9 @@ Excelの1行分の解析・調査結果を保持するミュータブル（可�
 * `total_pages`: ページ数 (I列 - `int | None` 型。巡回できた総ページ数。接続失敗時は `0`。※クロール中に100ページへ到達した場合はクローラーが `"100ページ以上"` という文字列を返し、`total_pages` には `100` が、Excel出力用の表示値には `"100以上"` が格納される)
 * `cms_name`: 使用CMS (J列 - HTMLシグネチャから幅広い国内外CMSを多角的に判定。WordPress, baserCMS, EC-CUBE, Movable Type, MODX, Drupal, Joomla!, TYPO3, concrete5, XOOPS, NetCommons, PowerCMS, Craft CMS, Sitecore, Kentico, SilverStripe, Jimdo, Wix, Shopify, ColorMe Shop, MakeShop, futureshop, a-blog cms, RCMS, HeartCore, BlueMonkey, BiNDup 等を検知し、非CMSなら空文字列)
 * `description`: 用途 (K列 - メタディスクリプション ➔ `<title>` ➔ `<h1>` の優先度順で抽出したWebサイトの概要文。**現状のコードには文字数の切り詰め処理はなく、抽出した文字列がそのまま格納される**）
-* `contact_fields`: 問合せ項目 (L列 - フォーム内のinput/textarea/selectのラベルをaria属性・label紐付け・祖先要素探索などから抽出し、項目名を**改行区切り**で格納。HubSpot/Tayori等の外部埋め込みフォームを検出した場合はその旨のテキストを格納。iframe内フォームも最大2階層まで再帰的に解析)
+* `contact_fields`: 問合せ項目 (L列 - フォーム内のinput/textarea/selectのラベルをaria属性・label紐付け・祖先要素探索などから抽出し、項目名を**改行区切り**で格納。HubSpot/Tayori等の外部埋め込みフォームを検出した場合はその旨のテキストを格納。iframe内フォームも最大2階層まで再帰的に解析。抽出したフォームは、本文欄（textarea）を持つことを必須条件として採用する（メール欄はログイン・会員登録フォームにもあるため決め手にしない。パスワード欄を持つフォームとブログのコメントフォームは除外）。URLがお問い合わせページなら本文欄があれば採用し、それ以外のページではお問い合わせ関連語が2つ以上、または氏名＋電話番号欄がある場合のみ採用する。お問い合わせフォームが無く、メールアドレスが設定された`mailto:`リンクがある場合は`"mailto"`、mailtoリンクも無い場合は`"問い合わせフォームなし"`、接続失敗時は空欄)
 * `rejection_reason`: 不可の理由 (M列 - 判定保留時（ネットワーク機器ブロック・接続不可・ページ数極小・階層深すぎ）の理由や、`RenewalEvaluator` が返す判定理由（改行区切りで複数格納されうる。ページ数超過／3階層以上／ログイン機能／添付機能／ベーシック認証／多言語対応／Captcha／カレンダー／サイト内検索／チャットボット／動画／フローティングボタン／アコーディオン／タブ切り替え／モーダル／Lightbox等／スクロールアニメーション、の中から該当するものすべて）を格納)
-* `remarks`: 備考 (N列 - 通常は空文字列。移転案内ページを検知した場合は`SiteScraperService`が`"移転先：{URL}"`に加え、改行して`WhoisChecker.get_hosting_provider()`が返したホスティング業者名を`"サーバー：{業者名}"`（特定できなければ`"サーバー：取得できませんでした"`）の形式で設定する。それ以外の通常判定時は、クロール結果の`subsystem_note`（別システムらしきものが一部ディレクトリに同居している場合の注記）をそのまま転記し、判定保留の理由が`PENDING_TIMEOUT_REASON`（時間切れ）だった場合はM列の代わりにその定型文をここへ出力する。)
+* `remarks`: 備考 (N列 - 通常は空文字列。移転案内ページを検知した場合は`SiteScraperService`が`"移転先：{URL}"`を設定する。それ以外の通常判定時は、クロール結果の`subsystem_note`（別システムらしきものが一部ディレクトリに同居している場合の注記）をそのまま転記し、判定保留の理由が`PENDING_TIMEOUT_REASON`（時間切れ）だった場合はM列の代わりにその定型文をここへ出力する。)
 * `operator_name`: 担当 (O列 - アプリ実行時に指定された担当者名をそのまま格納)
 
 ## 2. サービス層のインターフェース
@@ -81,7 +81,7 @@ Excelの1行分の解析・調査結果を保持するミュータブル（可�
 
 **`decide(total_pages, max_depth, has_login, has_attachment, has_basic_auth=False, has_multilang=False, html_src="", page_threshold=10, queue_exhausted=False) -> tuple[str, str]`**
 
-C列（調査結果）全体、すなわち`"◯"` / `"×"` / `"要確認"`の3値すべてを決定する窓口メソッド。`total_pages`/`max_depth`は`int | str`で受け取り、クローラーの生の戻り値（`"100以上"`のような下限値表記や、`max_depth`が文字列`"要確認"`のケースを含む）をそのまま渡せる。判定は次の順で行う。
+C列（調査結果）全体、すなわち`"×"` / `"要確認"`の2値を決定する窓口メソッド（`"◯"`は返さない）。`total_pages`/`max_depth`は`int | str`で受け取り、クローラーの生の戻り値（`"100以上"`のような下限値表記や、`max_depth`が文字列`"要確認"`のケースを含む）をそのまま渡せる。判定は次の順で行う。
 
 1. `total_pages == 0` の場合、`evaluate()`へは進まず即座に確定する。
    * `has_basic_auth=True` → 「ベーシック認証がかかっているページがあるため」で**`"×"`**（接続不可の汎用メッセージより、判定可能な明確な理由を優先する）
@@ -92,7 +92,7 @@ C列（調査結果）全体、すなわち`"◯"` / `"×"` / `"要確認"`の3�
    * ページ数が信頼できる下限値でない → `PENDING_TIMEOUT_REASON`（クロールが時間切れで途中終了した旨の定型文）
    * 階層数が信頼できる下限値でない（`max_depth == "要確認"`、階層10超過相当） → 「サイト階層が深すぎるため、別途サイトエクスプローラー等での確認をお願いします。」
    * `queue_exhausted=False`（内部リンクを巡回し尽くさずに打ち切られた） → `PENDING_TIMEOUT_REASON`
-5. いずれにも該当しなければ、`evaluate()`の結果（`"◯"`）をそのまま返す。
+5. いずれにも該当しなければ（`evaluate()`の結果が`"◯"`）、自動判定で検知できない要素が残っている可能性があるため、`"要確認"`と定型文`NO_NG_REASON_NOTE`（「×の根拠が見つからなかったため、目視で確認してください。」）を返す。`SiteScraperService`はこの定型文を`PENDING_TIMEOUT_REASON`と同様にM列ではなくN列（備考）に振り分ける。
 
 `PENDING_TIMEOUT_REASON`はM列（不可の理由）には出力されない。`SiteScraperService`側でこの定型文だけを判定し、M列を空にした上でN列（備考）へ振り替える（3.1節参照）。
 
@@ -100,7 +100,7 @@ C列（調査結果）全体、すなわち`"◯"` / `"×"` / `"要確認"`の3�
 
 **`evaluate(total_pages, max_depth, has_login, has_attachment, has_basic_auth=False, has_multilang=False, html_src="", page_threshold=10) -> tuple[str, str]`**
 
-`"要確認"`に倒す特殊ケースを考慮しない、純粋な◯/×判定ロジック。`total_pages`/`max_depth`はどちらも`int`（`decide()`側で変換済みの値）を受け取る。`html_src`は`<body>`要素の中身のみを対象に判定される（`<link>`/`<script>`/`<style>`/`<meta>`等のアセットタグは各種セレクタ判定から除外）。
+`"要確認"`に倒す特殊ケースを考慮しない、純粋な◯/×判定ロジック。`total_pages`/`max_depth`はどちらも`int`（`decide()`側で変換済みの値）を受け取る。`html_src`は`<body>`要素の中身のみを対象に判定される（`<link>`/`<script>`/`<style>`/`<meta>`等のアセットタグは各種セレクタ判定から除外）。クローラーは巡回した複数ページのHTMLを連結して渡すため、`<body>`が複数ある場合はその全てを対象にする。例外として、スクロールアニメーションは**トップページ（連結HTMLの先頭ページ）のみ**を対象にし、ライブラリ読み込みは`<head>`内も対象にする。ページの境界はクローラーが挟む区切りマーカー（`RenewalEvaluator.PAGE_SEPARATOR`、HTMLコメント）で判別する。
 
 判定される項目と対応するロジック:
 
@@ -112,17 +112,19 @@ C列（調査結果）全体、すなわち`"◯"` / `"×"` / `"要確認"`の3�
 | 添付機能 | 呼び出し元から渡される`has_attachment`（クローラー側で判定済み） |
 | ベーシック認証 | 呼び出し元から渡される`has_basic_auth`（クローラー側で判定済み） |
 | 多言語対応 | 呼び出し元から渡される`has_multilang`（クローラー側で判定済み）に加え、`has_multilang=False`だった場合でもHTML内の言語切り替えUI（`_has_multilang`）を独自に再チェックする二重判定 |
-| Captcha | `CAPTCHA_KEYWORDS`（画像認証プラグイン固有の識別子）に加え、`.g-recaptcha`/`.h-captcha`/`class*='captcha'`等のセレクタ |
-| チャットボット | `CHATBOT_KEYWORDS`（sinclo, chamo, Zendesk, channel.io, HubSpot Conversations, Intercom, Crisp, Tidio, ChatPlus, Zoho SalesIQ 等、埋め込み時にしか出現しない固有ドメイン・識別子） |
-| カレンダー | `.wp-calendar`/`.xo-event-calendar`/`iframe[src*='calendar.google']`等のセレクタ（`CALENDAR_KEYWORDS`はクラス名の一部として利用） |
-| サイト内検索 | `input[type="search"]`の存在、または`SEARCH_KEYWORDS`（「絞り込み検索」「条件検索」等の文言） |
+| Captcha | ユーザーが操作する画像認証のみ対象。表示型の`.g-recaptcha`/`.h-captcha`（`data-size="invisible"`は除外）、class/id/name/src/altに`captcha`を含む`<img>`/`<input>`（hiddenと、`recaptcha`を含む名前は除外）、または`CAPTCHA_KEYWORDS`（画像認証プラグイン固有の識別子）を属性・スクリプト内に含む。reCAPTCHA v3/invisible型（「reCAPTCHAで保護されています」のバッジ・注記のみ）は画像認証を求めないため対象外 |
+| チャットボット | `CHATBOT_KEYWORDS`（sinclo, Chamo(`chamo-chat.com`), Zendesk, channel.io, HubSpot Conversations, Intercom, Crisp, Tidio, ChatPlus, Zoho SalesIQ 等、埋め込み時にしか出現しない固有ドメイン・識別子）を属性・スクリプト内に含む |
+| カレンダー | `.wp-calendar`/`.xo-event-calendar`/`iframe[src*='calendar.google']`、またはclass/idのセグメントに`calendar`を含む要素（`calendar-icon`等のアイコン用は除外） |
+| サイト内検索 | `input[type="search"]`の存在、または`SEARCH_KEYWORDS`（「絞り込み検索」「条件検索」等の文言）が操作UI（a/button/label/form等）のテキストまたは属性値（placeholder等）に含まれる |
 | 動画 | `<video>`タグ、または`iframe`のsrcにYouTube/Vimeo埋め込みを含む |
-| フローティングボタン | クラス名に`floating`/`fixed-btn`/`follow-window`を含む、またはインラインスタイルに`position:fixed`を含む要素の存在（専用のキーワード定数は持たず、`_has_floating`メソッド内で直接判定） |
-| アコーディオン | `.accordion`/`[data-bs-toggle='collapse']`/`<details>`等のセレクタ（`_has_accordion`） |
-| タブ切り替え | `[role='tab']`/`.nav-tabs`/`[data-bs-toggle='tab']`等のセレクタ（`_has_tabs`） |
-| モーダル | `.modal`/`.modal-dialog`/`[data-bs-toggle='modal']`等のセレクタ（`_has_modal`） |
-| ギャラリー（Lightbox等） | `RICH_UI_KEYWORDS`をクラス名の一部として用いたセレクタ（`.lightbox`/`.fancybox`/`[data-lightbox]`等） |
-| スクロールアニメーション | `SCROLL_ANIMATION_KEYWORDS`（gsap, scrolltrigger, data-aos, locomotive-scroll） |
+| フローティングボタン | class/idのセグメントに`floating`/`fixed-btn`/`follow-window`を含む要素（`form-floating`/`floating-label`は除外）、またはインラインスタイルに`position:fixed`を持ち、リンク/ボタンを含む要素（header/nav、Cookie同意バナー、メニュー、モーダル等は除外） |
+| アコーディオン | `[data-bs-toggle='collapse']`/`<details>`、またはclass/idのセグメントに`accordion`を含む要素（`_has_accordion`） |
+| タブ切り替え | `[role='tab']`/`[role='tablist']`/`[data-bs-toggle='tab']`、またはclass/idのセグメントに`tabs`/`tab-content`/`tab-pane`/`tablist`を含む要素（`_has_tabs`） |
+| モーダル | `[data-bs-toggle='modal']`/`[role='dialog'][aria-modal='true']`、またはclass/idのセグメントに`modal`を含む要素（`_has_modal`） |
+| ギャラリー（Lightbox等） | `[data-lightbox]`/`[data-fancybox]`、またはclass/idのセグメントに`lightbox`/`glightbox`/`fancybox`を含む要素 |
+| スクロールアニメーション | `SCROLL_ANIMATION_KEYWORDS`（GSAP/ScrollTrigger, AOS, Locomotive Scroll, ScrollReveal, ScrollMagic, sal.js, WOW.js, jQuery inview）を`<body>`内の属性・スクリプト、または`<head>`を含むドキュメント全体の`<script>`/`<link>`に含む。あるいはclass/idのセグメントに`wow`/`inview`を含む要素（`SCROLL_ANIMATION_CLASS_NAMES`） |
+
+class/idの判定は、`[class*='tabs']`のような部分一致ではなく、`-`/`_`/camelCaseで分割したセグメント単位で照合する（`stabs`/`tablet`/`slang-`等の無関係なクラス名に当たらないようにするため）。キーワードの文字列検索も`str(body)`全体ではなく、タグの属性名・属性値と`<script>`の中身（または操作UIの表示テキスト）に限定しており、本文の文章やHTMLコメント中の単語には反応しない。
 
 理由テキストの生成に使われるキーワード等はクラス変数として`RenewalEvaluator`に集約されているが、**実際にクラス変数として定義されているのは`CAPTCHA_KEYWORDS` / `CHATBOT_KEYWORDS` / `CALENDAR_KEYWORDS` / `SEARCH_KEYWORDS` / `RICH_UI_KEYWORDS` / `MULTILANG_KEYWORDS` / `SCROLL_ANIMATION_KEYWORDS` / `VIDEO_KEYWORDS`のみ**である点に注意。フローティングボタン・アコーディオン・タブ・モーダルの4項目については、専用のキーワード定数（`FLOATING_BUTTON_KEYWORDS`等）は存在せず、各判定メソッド内でCSSセレクタを直接指定する形で実装されている（誤検知回避のため、当初1つのキーワードリストにまとめていたものを機能ごとに独立させた経緯がある）。
 
@@ -140,7 +142,7 @@ Google Map埋め込みは、ほぼすべてのコーポレートサイトのア�
 
 1. `SslChecker.check_ssl_status()`でSSL/常時SSL判定
 2. `WebCrawler(render_js=True, timeout=150.0, page_timeout=8.0).crawl_and_analyze()`でクロール（JSフレームワーク検知でPlaywrightレンダリングが走ると1回あたり15秒前後かかる上、記事系ページを大量に持つサイトでは90秒では実ページ数を大きく下回る事例があったため長めに確保。ただし300秒まで引き上げると並列ワーカー1枠を長時間占有し他ドメインの処理を押し出してしまったため、100ページ到達までの余裕とスループットのバランスを取って150秒に調整している）
-3. クロール結果に`redirect_target_url`（移転案内ページ）があれば、`RenewalEvaluator.decide()`を呼ばずに`"×"`（すでにリニューアル済のため）を確定し、備考欄に移転先を記録。あわせて`WhoisChecker.get_hosting_provider(redirect_target_url)`で移転先ドメインのホスティング業者を調べ、備考欄に追記する（取得中の例外はキャッチして「取得できませんでした」扱いとし、判定処理自体は止めない）
+3. クロール結果に`redirect_target_url`（移転案内ページ）があれば、`RenewalEvaluator.decide()`を呼ばずに`"×"`（すでにリニューアル済のため）を確定し、備考欄に移転先を記録
 4. そうでなく`blocked_reason`（ネットワーク機器ブロック）があれば、同様に`decide()`を呼ばずに`"要確認"`＋検知した理由を確定
 5. どちらでもなければ`RenewalEvaluator.decide()`を呼び出し、通常の判定フローに委ねる。返ってきた`rejection_reason`が`PENDING_TIMEOUT_REASON`と一致する場合はM列を空にしてN列（備考）へ振り替え、それ以外の場合はクロール結果の`subsystem_note`をN列にそのまま転記する
 6. 結果を`threading.Lock`配下で`SiteAssessment`インスタンスへスレッドセーフに書き込み
@@ -159,15 +161,6 @@ Google Map埋め込みは、ほぼすべてのコーポレートサイトのア�
 * `reconcile_interrupted_jobs`: アプリ起動時に一度だけ呼び出す。前回`processing`のまま残っている（＝Ctrl+C等で異常終了した）ジョブを検出し、`interrupted`状態に修正する。これを行わないと、UIが「処理実行中...」の表示のまま完了しないゾンビ状態になる。
 
 `main.py`側では、`st.cache_resource`でプロセス全体につき1つだけ`SiteScraperService`（および内部の`JobRepository`）を生成・共有する。これにより、ブラウザが完全にリロードされて新しいセッションが作られても、サーバープロセス自体が生きている限りジョブの進捗・結果を保持できる。`SiteScraperService.get_job_progress`は、まずインメモリキャッシュを参照し、無ければ（プロセス再起動直後や別セッションからの初回参照時）`JobRepository`からDBの内容を復元してキャッシュに載せる。
-
-### 3.3. `WhoisChecker`（ホスティング業者の特定）
-
-`get_hosting_provider(url_or_domain: str) -> str`のみを公開する小さなクラス。`SiteScraperService`が移転案内ページ検知時にのみ呼び出す（通常判定時は呼ばれない）。
-
-* 外部ライブラリを追加せず、WHOISプロトコル（TCP/43番ポート）へ生ソケットで問い合わせる自前実装。まずIANAのルートWHOISサーバー（`whois.iana.org`）へ問い合わせ、応答の`refer:`行からTLDごとの権威WHOISサーバーを動的に解決するため、TLDごとの個別対応をハードコードする必要がない（`.jp`のみ、IANA応答が得られない場合のフォールバックとして`whois.jprs.jp`を直接指定）。
-* `.com`/`.net`等の"thin"レジストリ（登録者情報を持たず、レジストラの所在だけを返す）だった場合は、応答中の`Registrar WHOIS Server:`行からレジストラ側WHOISサーバーへ再問い合わせるフォールバックを持つ。
-* 応答からネームサーバー（`Name Server:` / `nserver:` / `[Name Server]`の3パターン）を抽出し、先頭のホスト名からドメイン部分（例: `sv14061.xserver.jp` → `xserver.jp`）を返す。`co.jp`/`ne.jp`等の日本語ccTLD第2レベルは末尾3ラベルを採用する。
-* ソケット通信の失敗や想定外の応答は内部で例外を握りつぶし、空文字列を返す（呼び出し元の`SiteScraperService`側で「取得できませんでした」に読み替える）。判定結果（C列）には一切影響せず、備考欄への付加情報にとどまる。
 
 ## 4. ユーティリティ層 (`utils/`)
 
