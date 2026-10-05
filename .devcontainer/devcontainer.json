@@ -27,17 +27,17 @@
   "postCreateCommand": "uv sync",
 
   "postAttachCommand": {
-    "server": "uv run streamlit run src/web_analyzer/main.py --server.enableCORS false --server.enableXsrfProtection false"
+    "server": "uv run streamlit run src/web_analyzer/main.py --server.port 8502 --server.enableCORS false --server.enableXsrfProtection false"
   },
 
   "portsAttributes": {
-    "8501": {
+    "8502": {
       "label": "Application",
       "onAutoForward": "openPreview"
     }
   },
 
   "forwardPorts": [
-    8501
+    8502
   ]
 }

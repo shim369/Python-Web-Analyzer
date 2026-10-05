@@ -43,11 +43,11 @@ select = ["E", "F", "I", "UP", "B"]
 python_version = "3.12"
 strict = true
 ignore_missing_imports = true
-incremental = false
+incremental = false  # キャッシュによる差分チェックを完全に無効化
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-p no:cacheprovider"
+addopts = "-p no:cacheprovider"  # キャッシュプラグインを停止
 
 [tool.uv]
 python-preference = "only-managed"

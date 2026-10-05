@@ -1,3 +1,6 @@
 [server]
 # バックグラウンドに回ったタブのセッション維持時間を120分（7200秒）に延長
 disconnectTimeout = 7200
+port = 8502
+enableCORS = false
+enableXsrfProtection = false
