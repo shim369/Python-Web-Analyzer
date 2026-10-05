@@ -73,6 +73,26 @@ def test_excel_export_writes_expected_cell_values(tmp_path: Path) -> None:
     assert str(ws.cell(row=4, column=9).value or "") == ""
 
 
+def test_excel_export_blanks_zero_pages_and_depth(tmp_path: Path) -> None:
+    """階層数・ページ数が0(接続失敗等で計測できていない)の場合は空欄で出力する。"""
+    test_file = tmp_path / "zero_test.xlsx"
+
+    assessments = [
+        _make_assessment(id="1", evaluation_result="要確認", total_pages=0, max_depth=0),
+        _make_assessment(id="2", evaluation_result="×", total_pages="100以上", max_depth=3),  # type: ignore[arg-type]
+    ]
+    ExcelService.export_excel(assessments, test_file)
+
+    wb = load_workbook(str(test_file))
+    ws = wb.active
+    assert ws is not None
+
+    assert ws.cell(row=2, column=6).value in (None, "")  # F列: 階層数
+    assert ws.cell(row=2, column=9).value in (None, "")  # I列: ページ数
+    assert ws.cell(row=3, column=6).value == 3
+    assert ws.cell(row=3, column=9).value == "100以上"
+
+
 def test_excel_export_strips_illegal_control_characters(tmp_path: Path) -> None:
     """Excelが受け付けない制御文字が混入していても、例外にならず除去されることを確認する。"""
     test_file = tmp_path / "control_chars.xlsx"

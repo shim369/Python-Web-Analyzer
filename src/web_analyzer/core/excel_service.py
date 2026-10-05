@@ -34,6 +34,13 @@ def _estimate_wrapped_line_count(text: str, column_width: float) -> int:
     return total_lines
 
 
+def _blank_if_zero(value: int | str | None) -> int | str:
+    """階層数・ページ数の出力用。未取得(None)や0(接続失敗等で計測できていない)は空欄にする。"""
+    if value is None or value == 0 or value in ("0", "0以上"):
+        return ""
+    return value
+
+
 class ExcelService:
     """Excelファイルのパースおよび生成を担当するサービス"""
 
@@ -160,10 +167,10 @@ class ExcelService:
                 item.evaluation_result,
                 item.has_ssl,
                 item.is_always_ssl,
-                item.max_depth if item.max_depth is not None else "",
+                _blank_if_zero(item.max_depth),
                 item.svcmd,
                 item.site_structure,
-                item.total_pages if item.total_pages is not None else "",
+                _blank_if_zero(item.total_pages),
                 item.cms_name,
                 item.description,
                 item.contact_fields,
