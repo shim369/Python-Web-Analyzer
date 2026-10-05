@@ -5,8 +5,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from web_analyzer.core.crawler import WebCrawler
 from web_analyzer.core.evaluator import RenewalEvaluator
 from web_analyzer.core.job_repository import JobRepository
+from web_analyzer.core.reverse_dns_checker import ReverseDnsChecker
 from web_analyzer.core.ssl_checker import SslChecker
-from web_analyzer.core.whois_checker import WhoisChecker
 from web_analyzer.models import ScrapingJob, SiteAssessment
 
 logger = logging.getLogger(__name__)
@@ -32,7 +32,7 @@ class SiteScraperService:
         repository: JobRepository | None = None,
     ) -> None:
         self.ssl_checker = SslChecker()
-        self.whois_checker = WhoisChecker()
+        self.reverse_dns_checker = ReverseDnsChecker()
         self._jobs_cache: dict[str, ScrapingJob] = {}
         self._results_cache: dict[str, list[SiteAssessment]] = {}
         self._lock = threading.Lock()
@@ -252,12 +252,12 @@ class SiteScraperService:
             eval_result, rejection_reason = "×", "すでにリニューアル済のため"
             remarks_value = f"移転先：{redirect_target_url}"
             try:
-                hosting_provider = self.whois_checker.get_hosting_provider(redirect_target_url)
+                server_info = self.reverse_dns_checker.get_server_info(redirect_target_url)
             except Exception as e:
-                logger.warning(f"[{item.domain_name}] リダイレクト先のWHOIS情報取得中にエラーが発生しました: {e}")
-                hosting_provider = ""
-            hosting_provider_display = hosting_provider or "取得できませんでした"
-            remarks_value += f"\nサーバー：{hosting_provider_display}"
+                logger.warning(f"[{item.domain_name}] リダイレクト先のサーバー情報取得中にエラーが発生しました: {e}")
+                server_info = ""
+            server_info_display = server_info or "取得できませんでした"
+            remarks_value += f"\nサーバー：{server_info_display}"
         elif blocked_reason:
             # Fortinet等のネットワーク機器によるSSL証明書エラー/ブロックページを取得した場合、
             # 他の項目は実サイトの内容を反映していないため、通常の判定ロジックを通さず
