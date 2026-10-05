@@ -79,7 +79,7 @@ def test_excel_export_blanks_zero_pages_and_depth(tmp_path: Path) -> None:
 
     assessments = [
         _make_assessment(id="1", evaluation_result="要確認", total_pages=0, max_depth=0),
-        _make_assessment(id="2", evaluation_result="×", total_pages="100以上", max_depth=3),  # type: ignore[arg-type]
+        _make_assessment(id="2", evaluation_result="×", total_pages="100以上", max_depth=3),
     ]
     ExcelService.export_excel(assessments, test_file)
 
