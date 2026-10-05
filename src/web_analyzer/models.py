@@ -8,7 +8,7 @@ class ScrapingJob:
 
     id: str
     operator_name: str
-    page_threshold: int = 10  # ◯判定の最大ページ数
+    page_threshold: int = 10  # これを超えると「ページ数が多いため」で×になる最大ページ数
     status: str = "pending"  # pending, processing, completed, failed
     created_at: datetime = field(default_factory=datetime.now)
 

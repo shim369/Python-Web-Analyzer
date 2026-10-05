@@ -281,6 +281,11 @@ class SiteScraperService:
                 # M列ではなくN列に出す。
                 rejection_reason = ""
                 remarks_value = evaluator.PENDING_TIMEOUT_REASON
+            elif rejection_reason == evaluator.NO_NG_REASON_NOTE:
+                # 「×」の根拠が見つからず「要確認」とした場合の注記も、
+                # 不可の理由ではないためM列ではなくN列に出す。
+                rejection_reason = ""
+                remarks_value = "\n".join(filter(None, [evaluator.NO_NG_REASON_NOTE, subsystem_note]))
             else:
                 # ページ数・階層数の集計や◯/×判定そのものは変えず、あくまで人間が
                 # 最終確認する際の参考情報として備考欄に注記するに留める

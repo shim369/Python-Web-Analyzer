@@ -1,26 +1,33 @@
+import re
+from typing import Any
+
 from bs4 import BeautifulSoup, Tag
 
 
 class RenewalEvaluator:
-    """Improved RenewalEvaluator (excerpt). Replace your class with this version as needed."""
+    """クロール結果とHTMLから、サイトリニューアル可否(×/要確認)と理由を判定する。"""
 
-    # reCAPTCHA/hCaptcha自体はウィジェットが読み込まれているだけで、
-    # 実際にユーザーへ「画像内の文字を入力させる」認証があるとは限らないため
-    # (invisible/チェックボックス型のことも多い)、判定対象には含めない。
-    # ここでは、実際にそうした画像認証を実装していると確認できている
-    # プラグイン固有のクラス名/識別子のみを対象にする。
+    # 画像認証は、_has_captcha()内で、表示型のreCAPTCHA v2/hCaptchaウィジェット、
+    # および"captcha"を名前に含む画像・入力欄(IMAGE_CAPTCHA_PATTERN)から検出する
+    # (reCAPTCHA v3/invisible型は画像認証を求めないため対象外)。
+    # このリストはそれを補完するもので、画像認証を実装しているCMS/プラグイン
+    # 固有のクラス名/識別子を、<body>内のタグの属性・スクリプトから部分一致で
+    # 検出するために使う。
     CAPTCHA_KEYWORDS = [
         "image_auth_jp",  # WordPress: 画像認証(ひらがな)プラグイン (Contact Form 7用)
         "ccm-captcha-image",  # Concrete CMS: 画像認証のimgタグ
         "ccm-input-captcha",  # Concrete CMS: 画像認証の入力欄
     ]
+    # 画像認証の<img>/<input>のclass・id・name・src・altに現れる"captcha"。
+    # "recaptcha"/"grecaptcha"(reCAPTCHAのトークン受け渡し用)は除外する。
+    IMAGE_CAPTCHA_PATTERN = re.compile(r"(?<!re)captcha")
     # ブランド名だけの単語は一般名詞や無関係な文脈と衝突しやすいため
     # (例: "chatbot"はそれ自体が一般用語、"intercom"は「インターホン」の意味でも使われる)、
     # 可能な限り各サービスのスクリプト読み込み元ドメインなど、実際に埋め込まれた
     # ときにしか出現しない固有の文字列を使う。
     CHATBOT_KEYWORDS = [
         "ws1.sinclo.jp",  # sinclo
-        "chamo",  # Chamo
+        "chamo-chat.com",  # Chamo (GENIEE CHAT)
         "zdassets.com",
         "zopim.com",  # Zendesk Chat
         "cdn.channel.io",  # channel.io
@@ -37,7 +44,23 @@ class RenewalEvaluator:
     SEARCH_KEYWORDS = ["絞り込み検索", "条件検索", "サイト内検索", "キーワード検索"]
     RICH_UI_KEYWORDS = ["lightbox", "fancybox", "data-lightbox"]
     MULTILANG_KEYWORDS = ["translate.google", "language-list", "lang-select", "言語切り替え"]
-    SCROLL_ANIMATION_KEYWORDS = ["gsap", "scrolltrigger", "data-aos", "locomotive-scroll"]
+    SCROLL_ANIMATION_KEYWORDS = [
+        "gsap",
+        "scrolltrigger",
+        "data-aos",  # AOS
+        "/aos.js",  # "chaos.js"等に当たらないよう"/"から照合
+        "/aos.css",
+        "locomotive-scroll",
+        "scrollreveal",  # ScrollReveal
+        "scrollmagic",  # ScrollMagic
+        "data-sal",  # sal.js ("sal.js"だと"universal.js"等に当たるため属性で照合)
+        "/wow.js",  # WOW.js
+        "/wow.min.js",
+        "data-wow-",
+        "jquery.inview",  # jQuery inview
+    ]
+    # スクロールアニメーションライブラリが要求するclass名(セグメント単位で照合)
+    SCROLL_ANIMATION_CLASS_NAMES = ("wow", "inview")
     VIDEO_KEYWORDS = ["<video", "youtube.com/embed", "vimeo.com", "youtu.be", "player.vimeo"]
 
     # クロールが時間切れで途中終了し、判定を保留する場合の定型文。
@@ -51,100 +74,237 @@ class RenewalEvaluator:
         "1ページあたりのリダイレクト回数が多い等の理由で通常より時間がかかっているサイトの可能性があります。"
     )
 
+    # 「×」の根拠が1つも見つからず、「◯」の代わりに「要確認」とする場合の定型文。
+    # PENDING_TIMEOUT_REASONと同様、不可の理由ではなく人間への注記なので、
+    # 呼び出し側(scraper_service.py)ではM列ではなくN列(備考)に振り分ける。
+    NO_NG_REASON_NOTE = "×の根拠が見つからなかったため、目視で確認してください。"
+
+    # crawler.pyが複数ページのHTMLを連結してhtml_srcを作る際に、ページの
+    # 境界に挟む区切りマーカー。先頭(=トップページ)だけを対象にする判定で使う。
+    # HTMLコメントなので、他の判定(属性・スクリプト・UIテキスト)には影響しない。
+    PAGE_SEPARATOR = "<!-- web-analyzer:page-separator -->"
+
+    # UI要素ではないため、セレクタ/クラス名による判定から除外するアセットタグ。
+    ASSET_TAGS = ("link", "script", "style", "meta")
+
+    # 表示テキストからキーワードを探す際の対象タグ。見出しや本文(<p>等)の
+    # 文章中で機能名に言及しているだけのケースを拾わないよう、操作UIを
+    # 構成する要素のテキストに限定する。
+    UI_TEXT_TAGS = ("a", "button", "label", "option", "summary", "legend", "form")
+
+    # position:fixedの要素のうち、フローティングボタンではなくヘッダー・
+    # ナビゲーション・Cookie同意バナー等の固定表示UIとみなして除外する
+    # class/idのセグメント。
+    FIXED_NON_BUTTON_SEGMENTS = {
+        "header",
+        "nav",
+        "navbar",
+        "navigation",
+        "menu",
+        "drawer",
+        "cookie",
+        "cookies",
+        "consent",
+        "gdpr",
+        "cmp",
+        "modal",
+        "overlay",
+        "loading",
+        "loader",
+    }
+
     def _soup(self, html: str) -> BeautifulSoup:
         return BeautifulSoup(html or "", "html.parser")
 
-    def _body(self, soup: BeautifulSoup) -> Tag | BeautifulSoup:
-        """判定対象を<body>内に限定する。bodyが無ければ従来通り全体を返す。"""
-        return soup.body or soup
+    def _bodies(self, soup: BeautifulSoup) -> list[Tag | BeautifulSoup]:
+        """判定対象を<body>内に限定するため、全ての<body>要素を返す。
+
+        crawler.pyは巡回した複数ページのHTMLを連結してhtml_srcとして渡すため、
+        <body>は複数存在しうる。soup.bodyは最初の1つしか返さず、2ページ目
+        以降が判定対象から漏れてしまうため、全ての<body>を対象にする。
+        閉じタグの欠落で入れ子になった<body>は外側の<body>の検索に含まれる
+        ため除外する。bodyが無ければ全体を返す。
+        """
+        bodies = [b for b in soup.find_all("body") if b.find_parent("body") is None]
+        return bodies or [soup]
+
+    def _body_tags(self, soup: BeautifulSoup, *args: Any, **kwargs: Any) -> list[Tag]:
+        """全ての<body>内でfind_all(*args, **kwargs)した結果を連結して返す。"""
+        return [tag for body in self._bodies(soup) for tag in body.find_all(*args, **kwargs)]
 
     def _select_ui_elements(self, soup: BeautifulSoup, selector: str) -> list[Tag]:
         """<body>内のUI要素を検索し、<link>や<script>などのアセットタグを除外する"""
-        body = self._body(soup)
-        elements = body.select(selector)
-        return [el for el in elements if el.name not in ("link", "script", "style", "meta")]
+        elements = [el for body in self._bodies(soup) for el in body.select(selector)]
+        return [el for el in elements if el.name not in self.ASSET_TAGS]
+
+    @staticmethod
+    def _name_segments(name: str) -> list[str]:
+        """class名/idを"-"/"_"/camelCaseの区切りで小文字のセグメントに分割する。
+
+        "form-floating" → ["form", "floating"]、"tabContent" → ["tab", "content"]
+        """
+        name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "-", name)
+        return [seg for seg in re.split(r"[-_\s]+", name.lower()) if seg]
+
+    @staticmethod
+    def _contains_phrase(segments: list[str], phrase: str) -> bool:
+        """セグメント列に、"-"区切りのphraseが連続した並びとして含まれるか。"""
+        words = phrase.split("-")
+        n = len(words)
+        return any(segments[i : i + n] == words for i in range(len(segments) - n + 1))
+
+    def _has_named_element(
+        self,
+        soup: BeautifulSoup,
+        phrases: tuple[str, ...],
+        exclude: tuple[str, ...] = (),
+    ) -> bool:
+        """<body>内に、class/idがphrasesのいずれかをセグメント単位で含む要素があるか。
+
+        "[class*='tabs']"のような部分一致では"stabs"や"tablets"等の無関係な
+        クラス名にも当たってしまうため、区切り文字で分割したセグメント単位で
+        照合する。excludeのいずれかを含むclass/idは対象外にする。
+        """
+        for tag in self._body_tags(soup, True):
+            if tag.name in self.ASSET_TAGS:
+                continue
+            names = list(tag.get("class") or [])
+            if tag.get("id"):
+                names.append(str(tag["id"]))
+            for name in names:
+                segments = self._name_segments(name)
+                if any(self._contains_phrase(segments, p) for p in exclude):
+                    continue
+                if any(self._contains_phrase(segments, p) for p in phrases):
+                    return True
+        return False
+
+    def _markup_text(self, soup: BeautifulSoup) -> str:
+        """<body>内の全タグの属性名・属性値と<script>の中身を連結した小文字文字列。
+
+        str(body)をそのまま検索すると、本文テキストやHTMLコメント中の単語
+        (記事中の「gsap」等)にも反応してしまうため、実装の痕跡が現れる
+        属性とスクリプトだけに対象を絞る。
+        """
+        parts: list[str] = []
+        for tag in self._body_tags(soup, True):
+            for key, value in tag.attrs.items():
+                parts.append(key)
+                parts.append(" ".join(value) if isinstance(value, list) else str(value))
+            if tag.name == "script" and tag.string:
+                parts.append(tag.string)
+        return "\n".join(parts).lower()
+
+    def _ui_text(self, soup: BeautifulSoup) -> str:
+        """<body>内の操作UI要素(UI_TEXT_TAGS)の表示テキストを連結した文字列。"""
+        return "\n".join(tag.get_text(" ", strip=True) for tag in self._body_tags(soup, self.UI_TEXT_TAGS))
 
     def _has_calendar(self, soup: BeautifulSoup) -> bool:
-        return bool(self._select_ui_elements(soup, ".wp-calendar,.xo-event-calendar,iframe[src*='calendar.google' i],[class*='calendar' i],[id*='calendar' i]"))
+        if self._select_ui_elements(soup, ".wp-calendar,.xo-event-calendar,iframe[src*='calendar.google' i]"):
+            return True
+        # "calendar-icon"のようなアイコン用クラスはカレンダー機能そのものではないため除外
+        return self._has_named_element(soup, ("calendar",), exclude=("icon", "ico"))
 
     def _has_accordion(self, soup: BeautifulSoup) -> bool:
-        return bool(self._select_ui_elements(soup, ".accordion,[data-bs-toggle='collapse'],details,[class*='accordion' i],[id*='accordion' i]"))
+        # <details>/<summary>はブラウザ標準の開閉UIそのものなので、アコーディオンとして扱う
+        if self._select_ui_elements(soup, "[data-bs-toggle='collapse'],details"):
+            return True
+        return self._has_named_element(soup, ("accordion",))
 
     def _has_tabs(self, soup: BeautifulSoup) -> bool:
-        return bool(self._select_ui_elements(soup, "[role='tab'],.nav-tabs,[data-bs-toggle='tab'],[class*='tabs' i],[class*='tab-content' i],[id*='tabs' i]"))
+        if self._select_ui_elements(soup, "[role='tab'],[role='tablist'],[data-bs-toggle='tab']"):
+            return True
+        return self._has_named_element(soup, ("tabs", "tab-content", "tab-pane", "tablist"))
 
     def _has_modal(self, soup: BeautifulSoup) -> bool:
-        return bool(self._select_ui_elements(soup, ".modal,.modal-dialog,[data-bs-toggle='modal'],[class*='modal' i],[id*='modal' i]"))
+        if self._select_ui_elements(soup, "[data-bs-toggle='modal'],[role='dialog'][aria-modal='true' i]"):
+            return True
+        return self._has_named_element(soup, ("modal",))
 
     def _has_floating(self, soup: BeautifulSoup) -> bool:
-        body = self._body(soup)
+        # Bootstrap 5の"form-floating"や"floating-label"はフォームのラベル表現で
+        # あり、画面追従ボタンではないため除外する。
+        if self._has_named_element(
+            soup,
+            ("floating", "fixed-btn", "follow-window"),
+            exclude=("form-floating", "label"),
+        ):
+            return True
 
-        for tag in body.find_all(True):
-            # <link> や <script> などのアセットタグはアコーディオン等の属性ID誤検知を防ぐため除外
-            if tag.name in ("link", "script", "style", "meta"):
+        for tag in self._body_tags(soup, style=True):
+            if tag.name in self.ASSET_TAGS:
                 continue
-
-            cls = " ".join(tag.get("class", [])).lower()
-
-            if any(
-                x in cls
-                for x in (
-                    "floating",
-                    "fixed-btn",
-                    "follow-window",
-                )
-            ):
-                return True
-
-            style = (tag.get("style") or "").replace(" ", "").lower()
-            if "position:fixed" in style:
+            style = str(tag["style"]).replace(" ", "").lower()
+            if "position:fixed" not in style:
+                continue
+            if self._is_fixed_non_button(tag):
+                continue
+            # 固定表示の要素のうち、リンクやボタンを持つもの(=押せるもの)だけを
+            # フローティングボタンとみなす
+            if tag.name in ("a", "button") or tag.find(["a", "button"]):
                 return True
 
         return False
 
-    def _has_search(self, soup: BeautifulSoup, html: str) -> bool:
-        body = self._body(soup)
+    def _is_fixed_non_button(self, tag: Tag) -> bool:
+        """position:fixedの要素が、ヘッダー・ナビ・Cookie同意バナー等か判定する。"""
+        if tag.name in ("header", "nav") or tag.find(["header", "nav"]):
+            return True
+        names = list(tag.get("class") or [])
+        if tag.get("id"):
+            names.append(str(tag["id"]))
+        return any(seg in self.FIXED_NON_BUTTON_SEGMENTS for name in names for seg in self._name_segments(name))
 
-        if body.find("input", {"type": "search"}):
+    def _has_search(self, soup: BeautifulSoup) -> bool:
+        if self._body_tags(soup, "input", {"type": "search"}):
             return True
 
-        body_html = str(body).lower()
-        return any(x in body_html for x in self.SEARCH_KEYWORDS)
+        # 本文中で「サイト内検索」等に言及しているだけのケースを拾わないよう、
+        # 操作UIのテキストと属性値(placeholder/aria-label等)に限定して探す
+        text = self._ui_text(soup) + "\n" + self._markup_text(soup)
+        return any(x in text for x in self.SEARCH_KEYWORDS)
 
     def _has_captcha(self, soup: BeautifulSoup) -> bool:
-        """<body>内にCaptcha関連の実装が存在するか判定する。"""
-        body = self._body(soup)
+        """<body>内に、ユーザーが操作する画像認証(Captcha)が存在するか判定する。
 
-        # reCAPTCHA / hCaptcha
-        if self._select_ui_elements(
-            soup,
-            ".g-recaptcha,.h-captcha,[class*='captcha' i],[id*='captcha' i]",
-        ):
-            return True
+        reCAPTCHA v3や、v2/hCaptchaのinvisible型は「reCAPTCHAで保護されています」
+        というバッジ・注記が表示されるだけで、ユーザーに画像認証を求めない。
+        そのため、バッジ(.grecaptcha-badge)や注記テキスト、トークン受け渡し用の
+        g-recaptcha-response等、reCAPTCHA関連のclass/idがあるだけでは対象にしない。
+        """
+        # reCAPTCHA v2(チェックボックス型) / hCaptchaのウィジェット。
+        # data-size="invisible"は画面に表示されない型なので除外する。
+        for widget in self._select_ui_elements(soup, ".g-recaptcha,.h-captcha"):
+            if str(widget.get("data-size") or "").lower() != "invisible":
+                return True
+
+        # 画像認証の画像・入力欄(Really Simple CAPTCHA等)。"recaptcha"を含む
+        # 名前はreCAPTCHAのトークン受け渡し用なので除外する。
+        for tag in self._body_tags(soup, ["img", "input"]):
+            if tag.name == "input" and str(tag.get("type") or "").lower() == "hidden":
+                continue
+            attrs = " ".join(" ".join(v) if isinstance(v, list) else str(v) for k, v in tag.attrs.items() if k in ("class", "id", "name", "src", "alt")).lower()
+            if self.IMAGE_CAPTCHA_PATTERN.search(attrs):
+                return True
 
         # CMS / プラグイン固有の画像認証
-        body_html = str(body).lower()
-
-        return any(keyword in body_html for keyword in self.CAPTCHA_KEYWORDS)
+        markup = self._markup_text(soup)
+        return any(keyword in markup for keyword in self.CAPTCHA_KEYWORDS)
 
     def _has_chatbot(self, soup: BeautifulSoup) -> bool:
         """<body>内にチャットボット本体が存在するか判定する。"""
-        body = self._body(soup)
-        body_html = str(body).lower()
-
-        return any(keyword in body_html for keyword in self.CHATBOT_KEYWORDS)
+        markup = self._markup_text(soup)
+        return any(keyword in markup for keyword in self.CHATBOT_KEYWORDS)
 
     def _has_video(self, soup: BeautifulSoup) -> bool:
         """<body>内に実際の動画要素・埋め込みが存在するか判定する。"""
-        body = self._body(soup)
-
         # HTML要素としてのvideo
-        if body.find("video"):
+        if self._body_tags(soup, "video"):
             return True
 
         # YouTube / Vimeo等のiframe
-        for iframe in body.find_all("iframe"):
-            src = (iframe.get("src") or "").lower()
+        for iframe in self._body_tags(soup, "iframe"):
+            src = str(iframe.get("src") or "").lower()
 
             if any(
                 keyword in src
@@ -161,50 +321,64 @@ class RenewalEvaluator:
 
     def _has_rich_ui(self, soup: BeautifulSoup) -> bool:
         """<body>内にLightbox等の実際のリッチUI要素が存在するか判定する。"""
-        return bool(
-            self._select_ui_elements(
-                soup,
-                ".lightbox,.fancybox,[data-lightbox],[class*='lightbox' i],[class*='fancybox' i],[id*='lightbox' i],[id*='fancybox' i]",
-            )
-        )
+        if self._select_ui_elements(soup, "[data-lightbox],[data-fancybox]"):
+            return True
+        return self._has_named_element(soup, ("lightbox", "glightbox", "fancybox"))
 
     def _has_multilang(self, soup: BeautifulSoup) -> bool:
         """<body>内に実際の多言語切り替えUIが存在するか判定する。"""
-        body = self._body(soup)
-        body_html = str(body).lower()
-
-        # 明確な言語切り替え用クラス・ID・属性
-        if self._select_ui_elements(
-            soup,
-            "[class*='language' i],[class*='lang-' i],[class*='lang_' i],[id*='language' i],[id*='lang-' i],[id*='lang_' i],[class*='言語' i],[id*='言語' i]",
-        ):
+        # 明確な言語切り替え用クラス・ID("lang-select"/"language-list"等)
+        if self._has_named_element(soup, ("lang", "language", "languages", "言語")):
             return True
 
-        return any(keyword in body_html for keyword in self.MULTILANG_KEYWORDS)
+        text = self._ui_text(soup) + "\n" + self._markup_text(soup)
+        return any(keyword in text for keyword in self.MULTILANG_KEYWORDS)
+
+    def _asset_text(self, soup: BeautifulSoup) -> str:
+        """<head>を含むドキュメント全体の<script>/<link>のsrc・hrefと<script>の中身。
+
+        GSAP/AOS等のライブラリは<head>で読み込まれることが多く、<body>内
+        だけを見ると読み込みの痕跡を見落とすため、こちらは全体を対象にする。
+        """
+        parts: list[str] = []
+        for tag in soup.find_all(["script", "link"]):
+            parts.append(str(tag.get("src") or tag.get("href") or ""))
+            if tag.name == "script" and tag.string:
+                parts.append(tag.string)
+        return "\n".join(parts).lower()
+
+    def _top_page_soup(self, html_src: str) -> BeautifulSoup:
+        """連結されたhtml_srcから、先頭ページ(トップページ)のHTMLだけをパースする。"""
+        return self._soup(html_src.split(self.PAGE_SEPARATOR, 1)[0])
 
     def _has_scroll_animation(self, soup: BeautifulSoup) -> bool:
-        """<body>内にスクロールアニメーション関連の実装が存在するか判定する。"""
-        body = self._body(soup)
-        body_html = str(body).lower()
+        """スクロールアニメーション関連の実装が存在するか判定する。
 
-        return any(keyword in body_html for keyword in self.SCROLL_ANIMATION_KEYWORDS)
+        evaluate()からはトップページのみのsoupが渡される。
+        ライブラリの読み込み(<head>内を含む)、またはライブラリ固有の
+        属性(data-aos等)・クラス名(WOW.jsの"wow"等)を<body>内から探す。
+        """
+        text = self._markup_text(soup) + "\n" + self._asset_text(soup)
+        if any(keyword in text for keyword in self.SCROLL_ANIMATION_KEYWORDS):
+            return True
+        return self._has_named_element(soup, self.SCROLL_ANIMATION_CLASS_NAMES)
 
-    #: クロール側(crawler.py)が、実際に確認できた件数・深さの下限値を
-    #: 表すために使う共通のサフィックス("100以上"/"36以上"等)。
+    #: クロール側(crawler.py)が、実際に確認できたページ数の下限値を
+    #: 表すために使うサフィックス("100以上"/"36以上"等)。
     LOWER_BOUND_SUFFIX = "以上"
 
     @classmethod
     def parse_lower_bound(cls, value: int | str) -> tuple[int, bool]:
         """int、または"{数値}以上"形式の文字列を(数値, 信頼できる下限値かどうか)に変換する。
 
-        クロール側(crawler.py)は、100ページ上限到達時や、時間切れで途中
-        打ち切られた時("要確認"にはならず件数が確定しているケース)に、
-        "100以上"/"36以上"のような「{数値}以上」形式の文字列を返してくる
-        (ページ数・階層数どちらも同じ表記)。これは実際に確認できた件数・
-        深さの下限値(クロールを続ければ増えることはあっても減ることはない)
-        であり、判定の根拠として信頼してよい確定情報である。一方、"要確認"
-        のように「以上」が付かない文字列や数値化できない文字列は、下限値
-        としてすら信用できない値のため(0, False)を返す。
+        クロール側(crawler.py)は、総ページ数について、100ページ上限到達時や
+        時間切れで途中打ち切られた時に"100以上"/"36以上"のような
+        「{数値}以上」形式の文字列を返してくる。これは実際に確認できた
+        件数の下限値(クロールを続ければ増えることはあっても減ることはない)
+        であり、判定の根拠として信頼してよい確定情報である。
+        階層数は整数、または10階層超で計測不能を表す"要確認"のどちらかで
+        返ってくる。"要確認"のように「以上」が付かない文字列や数値化できない
+        文字列は、下限値としてすら信用できない値のため(0, False)を返す。
         """
         if isinstance(value, int):
             return value, True
@@ -227,35 +401,28 @@ class RenewalEvaluator:
         page_threshold: int = 10,
         queue_exhausted: bool = False,
     ) -> tuple[str, str]:
-        """クロール結果から調査結果（◯/×/要確認）と理由を一括で決定する。
+        """クロール結果から調査結果（×/要確認）と理由を一括で決定する。
 
-        「そもそも判定不能として要確認に倒すか」という、接続失敗・ページ数極小・
-        階層数計測不能といった特殊ケースの判断もここに集約する。
+        調査結果は「×」か「要確認」のどちらかで、「◯」は返さない
+        (evaluate()が「◯」の場合も「要確認」にする)。
+
+        「そもそも判定不能として要確認に倒すか」という、接続失敗・階層数計測不能・
+        クロールの途中終了といった特殊ケースの判断もここに集約する。
         evaluate() を直接呼ぶより、こちらを呼ぶことを推奨する。
 
         queue_exhausted は、クロール側が発見した内部リンクをすべて訪問し終えて
-        自然にキューが空になったか(True)、タイムアウト等で未訪問のリンクを
-        残したまま打ち切ったか(False)を表す。
+        自然にキューが空になったか(True)、タイムアウトや100ページ上限到達で
+        未訪問のリンクを残したまま打ち切ったか(False)を表す。
 
-        以前は、total_pagesが整数値として返っている(=100ページ上限には
-        達していない)のにqueue_exhaustedがFalseの場合、ページ数・階層数の
-        多寡に関わらず一律「要確認」に倒していた。しかしこれには不具合があった。
-        100ページ上限に達したことで打ち切られたケース(total_pagesは
-        "100以上"の確定値としてこの時点では既にintの100に変換済み)
-        でもqueue_exhaustedはほぼ必ずFalse(=上限到達時点でまだキューに
-        未訪問URLが残っている)になるため、「少なくとも100ページある」という
-        確定情報にもかかわらず判定そのものが「要確認」に握りつぶされ、
-        本来M列に出るべき「ページ数が多いため」等サイト固有の理由が
-        一切表示されなくなっていた(多数の個別記事ページを持つサイトで確認)。
-        ページ数・ログイン機能の有無
-        等、一度確定した「×」の根拠は、クロールを続けても消えたり減ったり
-        しない(訪問ページが増える方向にしか動かない)ため、queue_exhausted
-        がFalseであっても、既に確定している判定結果はそのまま採用すべき
-        である。
+        ページ数・ログイン機能の有無等、一度確定した「×」の根拠は、
+        クロールを続けても消えたり減ったりしない(訪問ページが増える方向に
+        しか動かない)。例えば100ページ上限で打ち切られたサイトは
+        queue_exhaustedがほぼ必ずFalseになるが、「少なくとも100ページある」
+        こと自体は確定情報である。
 
-        そのため現在は、まず（信頼できる情報の範囲で）通常の評価ロジック
-        （evaluate）を実行し、それだけで既に「×」の根拠が1つでも
-        見つかっていればqueue_exhaustedの状態に関わらずそれを採用する。
+        そのため、まず（信頼できる情報の範囲で）通常の評価ロジック
+        （evaluate）を実行し、「×」の根拠が1つでも見つかっていれば
+        queue_exhaustedの状態に関わらずそれを採用する。
         「×」の根拠が1つも見つからず、かつ「続きを巡回すれば理由が
         見つかったかもしれない」という不確実性が残っている場合
         （ページ数・階層数を確定情報として使えない、またはクロールが
@@ -271,12 +438,11 @@ class RenewalEvaluator:
 
         pending_reason = self.PENDING_TIMEOUT_REASON
 
-        # ページ数・階層数が"要確認"(=1ページあたりのリダイレクトが異常に
-        # 多いサイト等で、到達件数自体が実態の下限値としてすら信用できない
-        # ケース)の場合は、それを根拠にした判定は行わない(0件扱いで
-        # evaluateへ渡す)。それ以外("36以上"のような時間切れ時の下限値
-        # 確定表記や、通常の整数値)は、実際にクロールできた件数・到達できた
-        # 深さの下限値として信頼できるため、そのまま根拠に使う。
+        # ページ数・階層数が数値化できない文字列(階層数の"要確認"=10階層超で
+        # 計測不能、等)の場合は、それを根拠にした判定は行わない(0扱いで
+        # evaluateへ渡す)。それ以外("36以上"のようなページ数の下限値表記や、
+        # 通常の整数値)は、実際にクロールできた件数・到達できた深さとして
+        # 信頼できるため、そのまま根拠に使う。
         page_count_num, page_count_reliable = self.parse_lower_bound(total_pages)
         max_depth_int, depth_reliable = self.parse_lower_bound(max_depth)
 
@@ -306,7 +472,10 @@ class RenewalEvaluator:
         if not queue_exhausted:
             return "要確認", pending_reason
 
-        return eval_result, reason
+        # evaluate()が「◯」でも、自動判定で検知できない要素(JSで描画される
+        # UI等)が残っている可能性があるため、調査結果としては「◯」を出さず
+        # 「要確認」として人手での確認に回す。
+        return "要確認", self.NO_NG_REASON_NOTE
 
     def evaluate(
         self,
@@ -321,7 +490,7 @@ class RenewalEvaluator:
     ) -> tuple[str, str]:
         """判定結果(◯/×)と、NGの場合の理由（改行区切り文字列）を一括で返す。
 
-        接続失敗・ページ数極小・階層数計測不能などの特殊ケースを考慮せず、
+        接続失敗・階層数計測不能・クロールの途中終了などの特殊ケースを考慮せず、
         純粋なビジネスルールのみで◯/×を決める。特殊ケースを含めた
         最終判定が必要な場合は decide() を使うこと。
         """
@@ -367,7 +536,7 @@ class RenewalEvaluator:
         if self._has_calendar(soup):
             reasons.append("カレンダー機能が実装されているため")
 
-        if self._has_search(soup, html_lower):
+        if self._has_search(soup):
             reasons.append("サイト内検索・絞り込み検索機能があるため")
 
         if self._has_chatbot(soup):
@@ -375,7 +544,7 @@ class RenewalEvaluator:
 
         # --- デザイン・ギミック面 ---
         if self._has_video(soup):
-            reasons.append("トップイメージ等に動画が使用されているため")
+            reasons.append("動画（videoタグやYouTube/Vimeo埋め込み）が使用されているため")
 
         if self._has_floating(soup):
             reasons.append("フローティングボタン（画面追従ボタン）があるため")
@@ -396,8 +565,9 @@ class RenewalEvaluator:
         if not has_multilang and self._has_multilang(soup):
             reasons.append("多言語対応（言語切り替え機能）があるため")
 
-        if self._has_scroll_animation(soup):
-            reasons.append("スクロールアニメーション（GSAP等）が多用されているため")
+        # スクロールアニメーションはトップページのみで判定する
+        if self._has_scroll_animation(self._top_page_soup(html_src)):
+            reasons.append("スクロールアニメーション（GSAP等）が使用されているため")
 
         if reasons:
             return "×", "\n".join(reasons)
