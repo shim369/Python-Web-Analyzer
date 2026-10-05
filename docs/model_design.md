@@ -36,8 +36,8 @@ Excelの1行分の解析・調査結果を保持するミュータブル（可�
 * `cms_name`: 使用CMS (J列 - HTMLシグネチャから幅広い国内外CMSを多角的に判定。WordPress, baserCMS, EC-CUBE, Movable Type, MODX, Drupal, Joomla!, TYPO3, concrete5, XOOPS, NetCommons, PowerCMS, Craft CMS, Sitecore, Kentico, SilverStripe, Jimdo, Wix, Shopify, ColorMe Shop, MakeShop, futureshop, a-blog cms, RCMS, HeartCore, BlueMonkey, BiNDup 等を検知し、非CMSなら空文字列)
 * `description`: 用途 (K列 - メタディスクリプション ➔ `<title>` ➔ `<h1>` の優先度順で抽出したWebサイトの概要文。**現状のコードには文字数の切り詰め処理はなく、抽出した文字列がそのまま格納される**）
 * `contact_fields`: 問合せ項目 (L列 - フォーム内のinput/textarea/selectのラベルをaria属性・label紐付け・祖先要素探索などから抽出し、項目名を**改行区切り**で格納。HubSpot/Tayori等の外部埋め込みフォームを検出した場合はその旨のテキストを格納。iframe内フォームも最大2階層まで再帰的に解析。抽出したフォームは、本文欄（textarea）を持つことを必須条件として採用する（メール欄はログイン・会員登録フォームにもあるため決め手にしない。パスワード欄を持つフォームとブログのコメントフォームは除外）。URLがお問い合わせページなら本文欄があれば採用し、それ以外のページではお問い合わせ関連語が2つ以上、または氏名＋電話番号欄がある場合のみ採用する。お問い合わせフォームが無く、メールアドレスが設定された`mailto:`リンクがある場合は`"mailto"`、mailtoリンクも無い場合は`"問い合わせフォームなし"`、接続失敗時は空欄)
-* `rejection_reason`: 不可の理由 (M列 - 判定保留時（ネットワーク機器ブロック・接続不可・ページ数極小・階層深すぎ）の理由や、`RenewalEvaluator` が返す判定理由（改行区切りで複数格納されうる。ページ数超過／3階層以上／ログイン機能／添付機能／ベーシック認証／多言語対応／Captcha／カレンダー／サイト内検索／チャットボット／動画／フローティングボタン／アコーディオン／タブ切り替え／モーダル／Lightbox等／スクロールアニメーション、の中から該当するものすべて）を格納)
-* `remarks`: 備考 (N列 - 通常は空文字列。移転案内ページを検知した場合は`SiteScraperService`が`"移転先：{URL}"`を設定する。それ以外の通常判定時は、クロール結果の`subsystem_note`（別システムらしきものが一部ディレクトリに同居している場合の注記）をそのまま転記し、判定保留の理由が`PENDING_TIMEOUT_REASON`（時間切れ）だった場合はM列の代わりにその定型文をここへ出力する。)
+* `rejection_reason`: 不可の理由 (M列 - 判定保留時（ネットワーク機器ブロック・接続不可・階層深すぎ）の理由や、`RenewalEvaluator` が返す判定理由（改行区切りで複数格納されうる。ページ数超過／3階層以上／ログイン機能／添付機能／ベーシック認証／多言語対応／Captcha／カレンダー／サイト内検索／チャットボット／動画／フローティングボタン／アコーディオン／タブ切り替え／モーダル／Lightbox等／スクロールアニメーション、の中から該当するものすべて）を格納)
+* `remarks`: 備考 (N列 - 通常は空文字列。移転案内ページを検知した場合は`SiteScraperService`が`"移転先：{URL}"`に加え、改行して`ReverseDnsChecker.get_server_info()`が返したサーバー情報を`"サーバー：{逆引きホスト名（管理組織名）}"`（取得できなければ`"サーバー：取得できませんでした"`）の形式で設定する。それ以外の通常判定時は、クロール結果の`subsystem_note`（別システムらしきものが一部ディレクトリに同居している場合の注記）をそのまま転記し、判定保留の理由が`PENDING_TIMEOUT_REASON`（時間切れ）または`NO_NG_REASON_NOTE`（×の根拠なし）だった場合はM列の代わりにその定型文をここへ出力する。)
 * `operator_name`: 担当 (O列 - アプリ実行時に指定された担当者名をそのまま格納)
 
 ## 2. サービス層のインターフェース
@@ -142,9 +142,9 @@ Google Map埋め込みは、ほぼすべてのコーポレートサイトのア�
 
 1. `SslChecker.check_ssl_status()`でSSL/常時SSL判定
 2. `WebCrawler(render_js=True, timeout=150.0, page_timeout=8.0).crawl_and_analyze()`でクロール（JSフレームワーク検知でPlaywrightレンダリングが走ると1回あたり15秒前後かかる上、記事系ページを大量に持つサイトでは90秒では実ページ数を大きく下回る事例があったため長めに確保。ただし300秒まで引き上げると並列ワーカー1枠を長時間占有し他ドメインの処理を押し出してしまったため、100ページ到達までの余裕とスループットのバランスを取って150秒に調整している）
-3. クロール結果に`redirect_target_url`（移転案内ページ）があれば、`RenewalEvaluator.decide()`を呼ばずに`"×"`（すでにリニューアル済のため）を確定し、備考欄に移転先を記録
+3. クロール結果に`redirect_target_url`（移転案内ページ）があれば、`RenewalEvaluator.decide()`を呼ばずに`"×"`（すでにリニューアル済のため）を確定し、備考欄に移転先を記録。あわせて`ReverseDnsChecker.get_server_info(redirect_target_url)`で移転先のサーバー情報を調べ、備考欄に追記する
 4. そうでなく`blocked_reason`（ネットワーク機器ブロック）があれば、同様に`decide()`を呼ばずに`"要確認"`＋検知した理由を確定
-5. どちらでもなければ`RenewalEvaluator.decide()`を呼び出し、通常の判定フローに委ねる。返ってきた`rejection_reason`が`PENDING_TIMEOUT_REASON`と一致する場合はM列を空にしてN列（備考）へ振り替え、それ以外の場合はクロール結果の`subsystem_note`をN列にそのまま転記する
+5. どちらでもなければ`RenewalEvaluator.decide()`を呼び出し、通常の判定フローに委ねる。返ってきた`rejection_reason`が`PENDING_TIMEOUT_REASON`または`NO_NG_REASON_NOTE`と一致する場合はM列を空にしてN列（備考）へ振り替え、それ以外の場合はクロール結果の`subsystem_note`をN列にそのまま転記する
 6. 結果を`threading.Lock`配下で`SiteAssessment`インスタンスへスレッドセーフに書き込み
 7. `JobRepository.update_assessment()`でSQLiteへ即座に反映
 
@@ -161,6 +161,14 @@ Google Map埋め込みは、ほぼすべてのコーポレートサイトのア�
 * `reconcile_interrupted_jobs`: アプリ起動時に一度だけ呼び出す。前回`processing`のまま残っている（＝Ctrl+C等で異常終了した）ジョブを検出し、`interrupted`状態に修正する。これを行わないと、UIが「処理実行中...」の表示のまま完了しないゾンビ状態になる。
 
 `main.py`側では、`st.cache_resource`でプロセス全体につき1つだけ`SiteScraperService`（および内部の`JobRepository`）を生成・共有する。これにより、ブラウザが完全にリロードされて新しいセッションが作られても、サーバープロセス自体が生きている限りジョブの進捗・結果を保持できる。`SiteScraperService.get_job_progress`は、まずインメモリキャッシュを参照し、無ければ（プロセス再起動直後や別セッションからの初回参照時）`JobRepository`からDBの内容を復元してキャッシュに載せる。
+
+### 3.3. `ReverseDnsChecker`（移転先サーバーの特定）
+
+`get_server_info(url_or_domain: str) -> str`のみを公開する小さなクラス。`SiteScraperService`が移転案内ページ検知時にのみ呼び出す（通常判定時は呼ばれない）。
+
+* ネームサーバー（DNSの管理先）は必ずしもWebサーバーの運用会社と一致しない（DNSだけCloudflare等で管理し、実体は別のレンタルサーバー等）ため、ドメインを正引きしたIPアドレス（IPv4）を起点に調べる。
+* `socket.gethostbyaddr()`によるPTR逆引きのホスト名（例: `sv14061.xserver.jp`）と、RDAP（`https://rdap.org/ip/{ip}`。管轄レジストリへリダイレクトされる）によるIPアドレスの管理組織名を取得する。管理組織名は`registrant`ロールのエンティティの`fn`、無ければ`remarks`の先頭（JPNIC配下）、それも無ければネットワーク名で代用する。
+* 戻り値は`"{ホスト名}（{組織名}）"`形式。片方しか取れなければ取れた方だけ、どちらも取れなければ空文字列を返す（呼び出し元で「取得できませんでした」に読み替える）。判定結果（C列）には一切影響せず、備考欄への付加情報にとどまる。
 
 ## 4. ユーティリティ層 (`utils/`)
 
