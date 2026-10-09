@@ -577,9 +577,7 @@ class WebCrawler:
         soup = BeautifulSoup(html or "", HTML_PARSER)
         body = soup.body or soup
 
-        has_password_field = bool(
-            body.find("input", attrs={"type": re.compile(r"^password$", re.I)}) or body.find(attrs={"autocomplete": re.compile(r"current-password|new-password", re.I)})
-        )
+        has_password_field = bool(body.find("input", attrs={"type": re.compile(r"^password$", re.I)}) or body.find(attrs={"autocomplete": re.compile(r"current-password|new-password", re.I)}))
         if not has_password_field:
             return False
 
@@ -2017,9 +2015,7 @@ class WebCrawler:
                             if parent.name == "fieldset":
                                 legend = parent.find("legend", recursive=False)
                                 if isinstance(legend, Tag):
-                                    legend_text = "".join(
-                                        str(c) if isinstance(c, NavigableString) else c.get_text() for c in legend.children if not (isinstance(c, Tag) and c.name == "i")
-                                    ).strip()
+                                    legend_text = "".join(str(c) if isinstance(c, NavigableString) else c.get_text() for c in legend.children if not (isinstance(c, Tag) and c.name == "i")).strip()
                                     legend_text = self._remove_required_marks(legend_text)
                                     if (
                                         legend_text
@@ -2074,16 +2070,14 @@ class WebCrawler:
         ),
         (
             ["this connection is invalid", "ssl certificate"],
-            "SSL証明書エラー（期限切れ等）によりセキュリティ機器がアクセスをブロックしたため、"
-            "実際のサイト内容を取得できませんでした。別ネットワークからの再調査、または手動確認をお願いします。",
+            "SSL証明書エラー（期限切れ等）によりセキュリティ機器がアクセスをブロックしたため、実際のサイト内容を取得できませんでした。別ネットワークからの再調査、または手動確認をお願いします。",
         ),
         (
             # 「Web Page Blocked!」型のFortiGate標準ブロックページ用。
             # カテゴリ名（フィッシング等）は _extract_fortinet_category() で別途抽出し、
             # 検知できた場合はこのデフォルト文言より詳細な理由文で上書きする。
             ["web page blocked"],
-            "ネットワーク側のセキュリティ機器（Fortinet等）によりアクセスがブロックされました。"
-            "実際のサイト内容を取得できませんでした。別ネットワークからの再調査、または手動確認をお願いします。",
+            "ネットワーク側のセキュリティ機器（Fortinet等）によりアクセスがブロックされました。実際のサイト内容を取得できませんでした。別ネットワークからの再調査、または手動確認をお願いします。",
         ),
     ]
 
