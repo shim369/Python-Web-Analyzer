@@ -70,7 +70,8 @@ class WebCrawler:
     ]
     _REQUIRED_MARK_RE = re.compile("|".join(REQUIRED_MARK_PATTERNS))
     _TEMPLATE_VAR_RE = re.compile(r"\{\{.*?\}\}")
-    _EMPTY_PARENS_RE = re.compile(r"[\(（]\s*[\)）]")
+    # 「必須」等を除去した後に残る空の括弧(例: "お名前〔必須〕" → "お名前〔〕")
+    _EMPTY_PARENS_RE = re.compile(r"[\(（]\s*[\)）]|〔\s*〕|【\s*】|［\s*］|\[\s*\]|<\s*>|＜\s*＞")
 
     # リンクを辿り尽くして見つかったページ数がこれ以下の場合のみ、sitemap.xmlで補完する
     SITEMAP_FALLBACK_MAX_PAGES = 2
@@ -149,6 +150,25 @@ class WebCrawler:
     # フォームらしきコンテナ(form要素が無い場合の代替検出用)
     _FORM_LIKE_CLASS_RE = re.compile(r"form|contact|inquiry|entry", re.I)
     _LABEL_LIKE_CLASS_RE = re.compile(r"label|title|item-?label|form-?label|field-?name", re.I)
+
+    # URLにキーワード"form"を部分一致で探すと、"/information/"等の無関係な単語にも
+    # マッチしてしまう(実際に確認済み: お知らせ一覧"/information/"配下の記事が
+    # すべて優先巡回扱いになって100ページ上限を使い切り、トップページから
+    # リンクされている"/inquiry/"に一度も到達しないまま「問い合わせフォームなし」と
+    # なっていた)。キーワード判定の前にこれらの単語を取り除いてから照合する。
+    _FORM_FALSE_POSITIVE_RE = re.compile(r"information|platform|uniform|performance|transform|format", re.I)
+
+    # お問い合わせページへのリンクらしいリンクテキスト。URLにキーワードを含まない
+    # お問い合わせページ(例: "/materials/"の「資料請求」)を優先巡回するために使う。
+    CONTACT_LINK_TEXT_RE = re.compile(r"問い合わせ|問合せ|問合わせ|資料請求|ご相談|コンタクト|contact|inquiry", re.I)
+
+    # 静的HTMLに入力欄が無いお問い合わせページを、JSレンダリングし直して
+    # フォームを探す最大回数(1ページあたり数秒かかるため、時間予算を食い潰さないよう制限する)
+    MAX_CONTACT_PAGE_RENDERS = 2
+
+    # <form>要素も疑似フォームのdivも無い場合に、本文欄(textarea)を起点として
+    # フォーム相当のまとまりとみなす祖先要素を探す際の最大遡り階層数
+    MAX_BARE_FORM_ANCESTOR_LEVELS = 6
 
     # 多言語切り替えウィジェットらしきコンテナのclass/id判定用
     # (グローバルナビの中ではなく、ヘッダー上部などに単独で配置されるケースを拾うための正規表現)
@@ -422,6 +442,11 @@ class WebCrawler:
                 "内容を確認することをおすすめします。"
             )
         return ""
+
+    def _url_has_keyword(self, url: str, keywords: tuple[str, ...] | list[str]) -> bool:
+        """URLにキーワードのいずれかが含まれるか判定する("/information/"等による"form"の誤検知を除く)。"""
+        url_lower = self._FORM_FALSE_POSITIVE_RE.sub("", url.lower())
+        return any(k.lower() in url_lower for k in keywords)
 
     def _is_valid_internal_link(self, current_url: str, href: str, base_domain: str) -> bool:
         if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
@@ -1403,6 +1428,20 @@ class WebCrawler:
         classes = " ".join(el.get("class", [])).lower()
         return bool(self._HINT_ELEMENT_CLASS_RE.search(classes))
 
+    def _looks_like_navigation(self, el: Tag) -> bool:
+        """ナビメニュー等(「構成」列の内容)を表す要素かどうかを判定する。
+
+        フォームのコンテナがヘッダーやグローバルナビまで包んでいる場合、
+        「直前の兄弟要素」をラベルとみなす探索がナビに届き、
+        「ホーム会社概要事業内容」のようなメニュー文字列を問合せ項目として
+        拾ってしまうため、ラベル候補から除外する。
+        フォーム項目のラベルがリンクを複数含むことはまず無いため、
+        リンク2つ以上もナビとみなす。
+        """
+        if el.name in ("nav", "header", "footer") or el.find(["nav", "header", "footer"]):
+            return True
+        return len(el.find_all("a")) >= 2
+
     def _direct_child_text(self, el: Tag) -> str:
         """要素の「直接の」子テキストノードだけを連結して返す(入れ子タグの中の文字は含めない)。
 
@@ -1693,6 +1732,13 @@ class WebCrawler:
                 return True
         return False
 
+    @staticmethod
+    def _is_fillable_field(inp: Tag) -> bool:
+        """hidden・送信ボタン等ではない、利用者が入力する項目か判定する。"""
+        t_val = inp.get("type", "text")
+        itype = "".join([str(x) for x in t_val]).lower().strip() if isinstance(t_val, list) else str(t_val).lower().strip()
+        return itype not in ("hidden", "submit", "button", "image", "reset")
+
     def _find_form_containers(self, soup: BeautifulSoup) -> list[Tag]:
         """<form>タグや疑似フォームを探すが、検索窓（Search）関連は最初から完全に除外する。"""
         raw_containers: list[Tag] = list(soup.find_all("form"))
@@ -1712,7 +1758,9 @@ class WebCrawler:
         # 内側の候補は二重処理を避けるためスキップする。
         added_divs: list[Tag] = []
         for candidate in soup.find_all("div", class_=self._FORM_LIKE_CLASS_RE):
-            if not candidate.find(["input", "textarea", "select"]):
+            # 送信ボタンだけを包むdiv(例: <div class="btnForm"><input type="image"></div>)は
+            # 入力項目を持たないので疑似フォームとはみなさない
+            if not any(self._is_fillable_field(inp) for inp in candidate.find_all(["input", "textarea", "select"])):
                 continue
             if candidate.find("form") is not None:
                 continue
@@ -1721,15 +1769,26 @@ class WebCrawler:
             added_divs.append(candidate)
         raw_containers.extend(added_divs)
 
-        # 最後の手段: <form>タグも、それらしいclass名を持つdivも一切無いページ
-        # (例: 見た目上はただの<table>にinputが並んでいるだけで、実際の送信は
-        # 別途JSで隠しフォームに値をコピーして行う、古い自前実装のフォーム)。
-        # メールアドレス欄またはメッセージ本文欄(textarea)が実在する場合に限り、
-        # <body>全体を1つのコンテナとして扱う。
-        if not raw_containers and (soup.find("input", {"type": "email"}) or soup.find("textarea")):
-            body = soup.body
-            if isinstance(body, Tag):
-                raw_containers.append(body)
+        # <form>要素も疑似フォームのdivも無く、JSで送信する裸の入力欄だけが
+        # 並んでいるページ(実際に確認済み: <div id="section01"><dl><dt>お名前</dt>
+        # <dd><input></dd></dl>...)に対応する。<body>全体をコンテナにすると
+        # ナビメニューまで拾ってしまうため、本文欄(textarea)から祖先を遡り、
+        # 他の入力欄を2つ以上含む最初の要素だけをフォーム相当として扱う。
+        if not any(c.find("textarea") for c in raw_containers):
+            textarea = soup.find("textarea")
+            if isinstance(textarea, Tag):
+                for level, ancestor in enumerate(textarea.parents):
+                    if level >= self.MAX_BARE_FORM_ANCESTOR_LEVELS or not isinstance(ancestor, Tag) or ancestor.name in ("body", "html"):
+                        break
+                    other_inputs = [inp for inp in ancestor.find_all(["input", "select"]) if self._is_fillable_field(inp)]
+                    if len(other_inputs) >= 2:
+                        raw_containers.append(ancestor)
+                        break
+
+        # 以前は<form>も疑似フォームのdivも無いページで<body>全体を1つの
+        # コンテナとして扱っていたが、ラベル探索がページ全体に広がり、
+        # ヘッダーのナビメニュー(「構成」列の内容)を問合せ項目として拾って
+        # しまうため廃止した。
 
         seen_ids = set()
         unique_containers = []
@@ -1881,7 +1940,7 @@ class WebCrawler:
                             # ラベル用の<td>は入力欄を含まないはずなので、それを条件に
                             # 別の項目の入力セルを誤って拾わないようにする。
                             prev_tds = [t for t in parent.find_previous_siblings("td") if isinstance(t, Tag)]
-                            if prev_tds and not prev_tds[0].find(["input", "textarea", "select"]) and not self._looks_like_hint_element(prev_tds[0]):
+                            if prev_tds and not prev_tds[0].find(["input", "textarea", "select"]) and not self._looks_like_hint_element(prev_tds[0]) and not self._looks_like_navigation(prev_tds[0]):
                                 # t = self._remove_required_marks(prev_tds[0].get_text(strip=True))
                                 t = self._get_clean_element_text(prev_tds[0])
                                 if t and len(t) < 50 and re.search(r"[A-Za-zぁ-んァ-ヶー一-龠々]", t):
@@ -1894,7 +1953,7 @@ class WebCrawler:
                             own_siblings = inp.find_previous_siblings(["p", "label", "span", "div", "dt", "th"])
                             if own_siblings and isinstance(own_siblings[0], Tag):
                                 candidate = own_siblings[0]
-                                if not candidate.find(["input", "textarea", "select"]) and not self._looks_like_hint_element(candidate):
+                                if not candidate.find(["input", "textarea", "select"]) and not self._looks_like_hint_element(candidate) and not self._looks_like_navigation(candidate):
                                     t = self._get_clean_element_text(candidate)
                                     if t and len(t) < 50 and re.search(r"[A-Za-zぁ-んァ-ヶー一-龠々]", t):
                                         resolved_text = t
@@ -1934,10 +1993,17 @@ class WebCrawler:
                                 resolved_text = own_text
                                 break
 
-                            siblings = parent.find_previous_siblings(["div", "span", "label", "dt", "th", "p", "table"])
-                            if siblings and isinstance(siblings[0], Tag):
+                            # 見出しタグ(<h3>お名前</h3><p><input></p>のような、
+                            # ブロックエディタで組まれたフォーム)も対象にする。また、
+                            # 間に挟まった空の要素(<p><label></label></p>等)は読み飛ばす。
+                            siblings = [
+                                sib
+                                for sib in parent.find_previous_siblings(["div", "span", "label", "dt", "th", "p", "table", "h2", "h3", "h4", "h5", "h6"])
+                                if isinstance(sib, Tag) and (sib.get_text(strip=True) or sib.find(["input", "textarea", "select"]))
+                            ]
+                            if siblings:
                                 candidate = siblings[0]
-                                if not candidate.find(["input", "textarea", "select"]) and not self._looks_like_hint_element(candidate):
+                                if not candidate.find(["input", "textarea", "select"]) and not self._looks_like_hint_element(candidate) and not self._looks_like_navigation(candidate):
                                     # t = self._remove_required_marks(candidate.get_text(strip=True))
                                     t = self._get_clean_element_text(candidate)
                                     if t and len(t) < 50 and re.search(r"[A-Za-zぁ-んァ-ヶー一-龠々]", t):
@@ -2362,6 +2428,7 @@ class WebCrawler:
         contact_fields = ""
         # お問い合わせフォームが無いサイトで、L列に"mailto"と出すための目印
         has_mailto_link = False
+        contact_page_renders = 0
         # 別ドメイン(フォーム専用サービス・共用SSL等)にあるお問い合わせページのURL
         external_contact_urls: list[str] = []
         has_attachment = False
@@ -3058,7 +3125,7 @@ class WebCrawler:
                                         global_nav_menus.append(menu_text)
 
                         # お問い合わせ判定
-                        is_contact_url = any(k.lower() in resolved_url.lower() for k in self.CONTACT_KEYWORDS)
+                        is_contact_url = self._url_has_keyword(resolved_url, self.CONTACT_KEYWORDS)
                         contact_link_tag = next(
                             (
                                 a
@@ -3073,7 +3140,12 @@ class WebCrawler:
                         )
                         has_contact_text = contact_link_tag is not None
 
-                        if (is_contact_url or has_contact_text) and not contact_fields:
+                        # URLにもリンクテキストにもお問い合わせを示す語が無いページ
+                        # (例: "/materials/"の資料請求フォーム)でも、本文欄(textarea)を
+                        # 持つページはフォーム抽出を試みる(採用可否は下の
+                        # _looks_like_genuine_contact_form()で厳しめに検証する)。
+                        has_textarea = soup.find("textarea") is not None
+                        if (is_contact_url or has_contact_text or has_textarea) and not contact_fields:
                             candidate_fields, candidate_attachment = self._extract_form_fields(
                                 current_html,
                                 resolved_url,
@@ -3086,6 +3158,32 @@ class WebCrawler:
                             #  誤って確定させないようにするため)
                             if self._looks_like_genuine_contact_form(soup, candidate_fields, is_contact_page=is_contact_url):
                                 contact_fields, has_attachment = candidate_fields, candidate_attachment
+
+                        # Next.js等のJSフレームワーク製サイトでは、お問い合わせページの
+                        # フォームがクライアント側で描画され、静的HTMLには入力欄が1つも
+                        # 無いことがある(実際に確認済み)。Playwrightでのレンダリングは
+                        # 通常トップページにしか行わないため、お問い合わせページに限り
+                        # レンダリングし直してフォームを探す。
+                        if (
+                            is_contact_url
+                            and not contact_fields
+                            and self.render_js
+                            and contact_page_renders < self.MAX_CONTACT_PAGE_RENDERS
+                            and not soup.find(["input", "textarea", "select"])
+                            and self._detect_js_framework(current_html)
+                        ):
+                            contact_page_renders += 1
+                            rendered_contact_html, _rendered_url, _rendered_status, _nav_error = self._fetch_rendered_html(resolved_url)
+                            if rendered_contact_html:
+                                candidate_fields, candidate_attachment = self._extract_form_fields(
+                                    rendered_contact_html,
+                                    resolved_url,
+                                    client,
+                                    depth=0,
+                                )
+                                rendered_soup = BeautifulSoup(rendered_contact_html, HTML_PARSER)
+                                if self._looks_like_genuine_contact_form(rendered_soup, candidate_fields, is_contact_page=True):
+                                    contact_fields, has_attachment = candidate_fields, candidate_attachment
 
                         # メールアドレスへのmailtoリンクの有無(フォームが無い場合の代替の問い合わせ手段)
                         if not has_mailto_link and soup.find("a", href=self.MAILTO_HREF_PATTERN):
@@ -3106,6 +3204,7 @@ class WebCrawler:
                         # 内部リンク巡回
                         anchor_tags = soup.find_all("a", href=True)
                         candidate_hrefs = [link["href"] for link in anchor_tags]
+                        contact_text_hrefs = {link["href"] for link in anchor_tags if self.CONTACT_LINK_TEXT_RE.search(link.get_text(" ", strip=True))}
                         candidate_hrefs.extend([f.get("src") for f in soup.find_all("frame") if f.get("src")])
                         candidate_hrefs.extend(self._extract_js_links(current_html))
 
@@ -3140,9 +3239,9 @@ class WebCrawler:
                                 # `if depth > max_depth: max_depth = depth` を参照)。
                                 # ここではenqueue()の優先度判定に使うpath_depthの算出のみ行う。
 
-                                is_priority = any(
-                                    k.lower() in norm_abs.lower()
-                                    for k in (
+                                is_priority = href in contact_text_hrefs or self._url_has_keyword(
+                                    norm_abs,
+                                    (
                                         "contact",
                                         "inquiry",
                                         "otoiawase",
@@ -3151,7 +3250,7 @@ class WebCrawler:
                                         "mypage",
                                         "member",
                                         "account",
-                                    )
+                                    ),
                                 )
                                 enqueue(norm_abs, path_depth, is_priority)
 
