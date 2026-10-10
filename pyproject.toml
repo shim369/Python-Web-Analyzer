@@ -7,9 +7,10 @@ requires-python = ">=3.12"
 dependencies = [
     "beautifulsoup4>=4.15.0",
     "httpx>=0.28.1",
+    "lxml>=6.1.1",
     "openpyxl>=3.1.5",
     "playwright>=1.61.0",
-    "python-wappalyzer>=0.3.1",
+    "requests>=2.34.2",
     "streamlit>=1.59.2",
 ]
 
@@ -27,7 +28,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project.scripts]
-web-analyzer = "web_analyzer.main:main"
+web-analyzer = "web_analyzer.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/web_analyzer"]
