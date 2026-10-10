@@ -38,15 +38,17 @@ Python学習およびポートフォリオ作成を目的として開発した�
 * **インテリジェントなクローラー防御回避とSSL監査機構**
   * **スマートSSL＆リダイレクト検証**: 初回アクセスは `http://` で行い、WAF（Web Application Firewall）やサーバーによる `https://` への自動リダイレクトの有無を追跡することで、「常時SSL」の判定基準であるリダイレクト処理を正確に検証。リダイレクトされない環境であっても個別に `https://` 接続を検証する柔軟な設計。
   * **HTTPS専用サイトへの対応**: ポート80を受け付けない等、`http://` 接続自体が失敗するHTTPS専用サイトに対しては、`https://` への直接接続を試みるフォールバックを実装し、判定不能への誤フォールバックを回避。証明書のホスト名不一致（SSLError）を検知した場合は`www.`付きドメインでの再試行も行う。
-  * **ネットワークセキュリティ機器によるブロックページの検知**: Fortinet Webfilter等のネットワーク機器がSSLインスペクションで通信を遮断・差し替えている場合、実サイトの内容ではなくブロックページ自体を取得してしまうケースがある。これを検知し、原因（カテゴリ分類やSSL証明書エラーの可能性等）を判定理由として明示した上で、他の判定ロジックを通さず「要確認」として結果に反映。
+  * **アクセス拒否ページの検知**: Fortinet Webfilter等のネットワーク機器がSSLインスペクションで通信を遮断・差し替えている場合や、サーバー自身が403 Forbidden／429 Too Many Requests／5xx等のエラーページを返す場合、実サイトの内容ではなくそのページ自体を取得してしまうケースがある。これを検知し、原因（カテゴリ分類、SSL証明書エラーの可能性、サーバー側のボット対策・レート制限等）を判定理由として明示した上で、他の判定ロジックを通さず「要確認」として結果に反映。自動化ツールだけを狙い撃ちでブロックする機器もあるため、httpxでブロックを検知した場合はPlaywright（実ブラウザ）で再確認し、それでもブロックされた場合のみ確定する。
   * **移転案内ページの検知**: meta refreshやJSタイマーによって数秒後に別ドメインへ自動遷移する「移転案内ページ」を検知した場合、通常の判定ロジックを通さず「×（すでにリニューアル済のため）」として即座に確定し、移転先URLを備考欄に記録。あわせて`ReverseDnsChecker`が移転先ドメインのIPアドレスから逆引きホスト名とRDAPの管理組織名を調べ、「サーバー：{逆引きホスト名（管理組織名）}」として備考欄に併記する（取得できなければ「サーバー：取得できませんでした」）。
-  * **接続不能時の安全なフォールバック**: DNSエラーやボット拒否（403/401ブロック）、タイムアウト等の例外発生時もシステムをクラッシュさせず判定不能として安全にキャッチ。巡回フェーズへ「ページ数 0」として結果を引き継ぎ、最終結果を最優先で『要確認』に分類する堅牢性を担保。
+  * **接続不能時の安全なフォールバック**: DNSエラーやタイムアウト等の例外発生時もシステムをクラッシュさせず判定不能として安全にキャッチ。`https://`（ドメイン名のみの入力時の既定）→`http://`→`www.`付きの順に初回アクセスを試み、すべて失敗した場合は「ページ数 0」として結果を引き継ぎ、最終結果を最優先で『要確認』に分類する堅牢性を担保（ベーシック認証が原因と判明している場合は『×』）。
   * **ブラウザ欺瞞（User-Agent）と通信偽装**: プレーンなPythonスクレイパーを即座にブロックする防御壁を突破するため、最新のWebブラウザ（Chrome）のヘッダー情報を模倣。
   * **無限リンクトラップの検知**: カレンダーページ等が生成する単純な繰り返しパスに加え、JS遷移リンクの誤解決等によって生じる複数セグメント単位の繰り返しパターンも検知し、無限巡回を未然に防止。
 
 * **主要CMSおよびサイト構成の高精度な動的検出**
-  * 静的なHTML構文解析だけでなく、`wp-content` / `wp-includes` 資産などのHTMLソース内のシグネチャから、WordPress、baserCMS、EC-CUBE、Movable Type、Shopify、Wixなど30種以上の国内外CMSを多角的に判定。非CMSサイトは空欄と自動識別。
-  * `<form>` タグに限らず、`role="form"` や擬似フォーム（divベース）も検出対象とし、`aria-labelledby` / `label for` / 祖先要素解析など複数の手がかりからフォーム項目ラベルを解決。HubSpotやTayori等の外部埋め込みフォームも検出。iframe内フォームも再帰的に解析。`<form>`タグの無いJS送信型フォーム（textareaを起点に祖先要素を特定）や、JSフレームワーク製サイトでクライアント側描画されるお問い合わせフォーム（Playwrightで再レンダリング）にも対応し、ナビメニューを項目として誤って拾わないよう除外する。
+  * 静的なHTML構文解析だけでなく、`wp-content` / `wp-includes` 資産などのHTMLソース内のシグネチャから、WordPress（出力上は`WP`）、baserCMS、EC-CUBE、Movable Type、Concrete CMS、Shopify、Wixなど約30種の国内外CMSを多角的に判定。非CMSサイトは空欄と自動識別。
+  * リンクを辿り尽くしても2ページ以下しか見つからないサイト（JSでページ遷移するサイト等）は、`robots.txt`の`Sitemap:`行や`/sitemap.xml`等に載っているURLで補完して巡回を続ける。
+  * JSレンダリング（Playwright）は常時ではなく必要な場面に限定して使用する：トップページでJSフレームワーク（または中身の空のSPAシェル）を検知した場合の再レンダリング、httpxでアクセス拒否された場合の実ブラウザでの再確認、静的HTMLに入力欄が無いお問い合わせページの再レンダリング（1サイト最大2ページ）。Playwright未導入環境では自動的に通常のHTTP取得へフォールバックする。
+  * `<form>` タグに限らず、`role="form"` や擬似フォーム（divベース）も検出対象とし、`aria-labelledby` / `label for` / 祖先要素解析など複数の手がかりからフォーム項目ラベルを解決。HubSpotやTayori等の外部埋め込みフォームも検出。iframe内フォームも再帰的に解析。`<form>`タグの無いJS送信型フォーム（textareaを起点に祖先要素を特定）や、JSフレームワーク製サイトでクライアント側描画されるお問い合わせフォーム（Playwrightで再レンダリング）にも対応し、ナビメニューを項目として誤って拾わないよう除外する。サイト内にフォームが無い場合は、別ドメインのお問い合わせページ（最大3件）も確認し、それでも無ければ`mailto:`リンクの有無に応じて「mailto」／「問い合わせフォームなし」と出力する。
 
 * **判定理由の多角的な自動検知・自動生成**
   * ページ数超過、3階層以上の深いサイト構成、ログイン／マイページ機能、お問い合わせフォームの添付機能、ベーシック認証（401 Unauthorized、初回アクセス時に加えクロール中の各ページ取得時にも検知）、多言語切り替え機能に加え、フォームの画像認証（Captcha）、カレンダー機能、サイト内検索・絞り込み検索、チャットボット導入、動画（videoタグ／YouTube・Vimeo埋め込み）、フローティングボタン、アコーディオン、タブ切り替え、モーダルウィンドウ、Lightbox等のギャラリー機能、GSAP等のスクロールアニメーションの有無まで検出し、判定理由として自動的に列挙。アコーディオン／タブ／モーダル／フローティングボタンの検知は、通常のハンバーガーメニュー等にも使われる汎用属性（`data-toggle`/`aria-expanded`）を避け、機能ごとに独立したCSSセレクタ・クラス名判定で誤検知を抑えている。
@@ -59,7 +61,7 @@ Python学習およびポートフォリオ作成を目的として開発した�
 
 * **Mypy Strict適合を意識したモデル設計と型安全性の徹底**
   * ドメインモデル `ScrapingJob` のプロパティをイミュータブル（Read-only）に設計し、スレッドセーフな状態管理を強制。状態の書き換えが必要な場合は、新しいインスタンスを再生成する「値オブジェクト」の設計思想を徹底。
-  * `SiteAssessment` モデル内の数値を扱うフィールド（ページ数、階層数）の型定義を `int | None` に厳密化。画面表示のための文字列表現（例: 100ページ以上を出力時に `"100以上"` とする処理）はExcel出力の直前まで遅延させることで、ビジネスロジック内でのMypyエラーを排除し型安全性を確立。
+  * `SiteAssessment` モデル内の数値を扱うフィールド（ページ数、階層数）の型定義は `int | None` を基本とし、判定ロジック（`RenewalEvaluator`）には `parse_lower_bound()` で数値化した `int` のみを渡すことで、ビジネスロジック内の型安全性を確保。なお、クローラーが返す下限値表記（100ページ上限到達時の `"100以上"`、時間切れ時の `"36以上"` 等）や階層数の `"要確認"` は、現状 `SiteScraperService` が文字列のまま格納している（該当箇所は `# type: ignore` で型チェックを回避）。未取得・0の値はExcel出力時に空欄へ変換する。
 
 * **共通ロギング基盤とデコレータによる横断的関心事の分離**
   * `dictConfig` ベースの共通ロガー設定（`utils/logger.py`）をアプリ起動時に一度だけ適用し、コンソール（INFO以上）とログファイル（実行ごとに秒単位まで含めた個別ファイル `logs/app_YYYYMMDD_HHMMSS.log`、DEBUG以上）の両方へ出力。各モジュールは`logging.getLogger(__name__)`のみで統一されたログ設定の恩恵を受けられる設計。
@@ -84,8 +86,9 @@ Python学習およびポートフォリオ作成を目的として開発した�
 | Web UI Framework | Streamlit (Custom Flat UI with CSS styling) |
 | Scraping & Parsing | HTTPX, BeautifulSoup4（`lxml`パーサー優先、Playwrightによるオプショナルなレンダリング対応） |
 | SSL Verification | Requests |
+| Server Lookup | socket（正引き・PTR逆引き）, RDAP（`rdap.org`、HTTPX経由） |
 | Persistence | SQLite（WALモード） |
-| Data Processing | OpenPyXL (Excel import / export, 元の行順維持マージ) |
+| Data Processing | OpenPyXL (Excel import / export, 列幅・行高の自動調整) |
 | Testing | Pytest |
 | Linter & Formatter | Ruff |
 | Type Check | Mypy (Strict仕様適合) |
@@ -97,7 +100,14 @@ Python学習およびポートフォリオ作成を目的として開発した�
 
 ```text
 PYTHON-WEB-ANALYZER/
-├── docs/                      # ドキュメント関連ファイル（要件定義書等）
+├── .devcontainer/             # Dev Container / Codespaces 設定
+├── .github/workflows/ci.yml   # GitHub Actions CI定義
+├── .streamlit/config.toml     # Streamlitサーバー設定（ポート8502等）
+├── docs/                      # ドキュメント関連ファイル
+│   ├── images/                # スクリーンショット・アイコン
+│   ├── model_design.md        # クラス設計・モデル設計
+│   ├── requirements_definition.md # 要件定義書
+│   └── screen_transition.md   # 画面遷移・処理フロー図
 ├── src/
 │   └── web_analyzer/          # アプリケーションソースコード
 │       ├── core/              # コアロジック
@@ -112,6 +122,7 @@ PYTHON-WEB-ANALYZER/
 │       │   ├── decorators.py      # measure_time / log_action デコレータ
 │       │   └── logger.py          # dictConfigベースの共通ロガー設定
 │       ├── __init__.py
+│       ├── cli.py             # `web-analyzer` コマンドの起動用ラッパー
 │       ├── main.py            # アプリケーションのエントリーポイント（Streamlit UI）
 │       └── models.py          # データモデル定義（ScrapingJob / SiteAssessment）
 ├── data/                       # SQLiteデータベースファイル出力先
@@ -119,13 +130,15 @@ PYTHON-WEB-ANALYZER/
 ├── logs/                      # 実行ごとのログファイル出力先
 ├── tests/                     # ユニットテスト
 │   ├── test_evaluator.py      # 評価ロジックのテスト
-│   ├── test_excel_service.py  # Excel出力のテスト
+│   ├── test_excel_service.py  # Excel入出力のテスト
+│   ├── test_reverse_dns_checker.py # サーバー情報取得のテスト
 │   └── test_ssl_checker.py    # SSL検証のテスト
 ├── .gitignore
 ├── .python-version
 ├── LICENSE                    # MITライセンス
 ├── pyproject.toml             # プロジェクト設定・依存関係定義
 ├── README.md                  # プロジェクト概要・評価者向け説明書
+├── README.en.md               # 英語版README
 └── uv.lock                    # uvロックファイル（厳密なバージョンロック）
 
 ```
@@ -157,6 +170,10 @@ cd PYTHON-WEB-ANALYZER
 # uv を用いて lock ファイルに記録された依存関係を完全に同期 (自動で仮想環境が作成されます)
 uv sync
 
+# （任意）JSレンダリングを有効にする場合は、Playwright用のChromiumを導入
+# 未導入でも動作するが、JS描画サイトの検知精度が下がる
+uv run playwright install chromium
+
 ```
 
 ---
@@ -166,7 +183,14 @@ uv sync
 ```bash
 uv run streamlit run src/web_analyzer/main.py
 
+# または（上と同じ。追加の引数はstreamlitへそのまま渡される）
+uv run web-analyzer
+
 ```
+
+`.streamlit/config.toml` によりポート `8502` で起動します（ブラウザで `http://localhost:8502` を開く）。Dev Container / GitHub Codespaces で開いた場合は、`uv sync` とアプリ起動が自動で実行されます。
+
+実行時には、カレントディレクトリ（プロジェクトルート）配下に `data/jobs.db`（SQLite）、`temp/`（アップロード・出力Excel）、`logs/`（ログファイル）が自動作成されます。
 
 ---
 
@@ -198,26 +222,14 @@ uv run mypy src tests
 
 ## GitHub Actions (CI)
 
-GitHub Actionsを利用したCIパイプラインを構築しています。
+GitHub Actionsを利用したCIパイプライン（`.github/workflows/ci.yml`）を構築しています。
 
-ジョブを以下の2段階に分離し、静的解析（Lint/Type Check）に成功した場合のみテストを実行する構成としています。
+push / pull request のたびに、単一ジョブ `lint-and-test` 内で以下のステップを順に実行します。前のステップが失敗した時点でジョブは終了するため、静的解析に失敗した場合はテストまで進みません。
 
-### 1. Lint Job
-
-* Ruff
-* Mypy
-
-### 2. Test Job
-
-* Pytest
-
-```yaml
-test:
-  needs: lint
-
-```
-
-上記により、Lintエラーが発生した場合は不要なテスト実行をスキップし、CIの実行リソースを節約します。
+1. Ruff（Lint）: `uv run ruff check .`
+2. Ruff（Format Check）: `uv run ruff format --check .`
+3. Mypy（Type Check）: `uv run mypy src`
+4. Pytest: `uv run pytest`
 
 ---
 
@@ -232,11 +244,15 @@ test:
 
 #### 2. Excel入出力サービス (ExcelService)
 
-* **元の行順維持と双方向保証**：インポートされたExcelシートの行順・構造を完全に維持したまま、解析結果の日付（M/D形式）や各ステータスをマージして出力できるかのI/Oテスト。また、100ページ以上のデータがExcel出力時に安全に `"100以上"` 文字列に変換されるかの配置・変換ロジック検証。制御文字混入時に例外を出さず除去できるかの検証も含む。
+* **入出力の妥当性**：インポート時にB列（空ならA列）からドメインを読み取り、`サイト名`等のヘッダー行をスキップできるかの検証。エクスポート時に、A〜O列の固定ヘッダーの下へ各フィールドが正しいセルに出力されるか、`"100以上"`等の下限値表記がそのまま出力されるか、ページ数・階層数が0の場合に空欄になるかの検証。制御文字混入時に例外を出さず除去できるかの検証も含む。
 
 #### 3. セキュリティ監査モジュール (SslChecker)
 
 * **SSL接続・リダイレクト検証の正常性**：初期接続パラメーター（最大10秒のリクエストタイムアウト設定）の妥当性、`http://` 接続自体が失敗した場合の `https://` 直接接続フォールバック、証明書ホスト名不一致時のみ`www.`付きドメインで再試行する分岐、および正常なHTTPS通信から例外発生時（判定不能時の `None, None` 返却）にいたるまでのハンドリング検証。`requests.Session`をモック化した`FakeSession`によって外部通信を伴わずロジックのみを検証。
+
+#### 4. サーバー情報取得 (ReverseDnsChecker)
+
+* **逆引き・RDAPの組み立て検証**：RDAPレスポンスから管理組織名を優先順位（`registrant`の`fn` → `remarks`先頭 → ネットワーク名）どおりに抽出できるか、通信失敗・不正なレスポンス時に空文字を返すか、URLからホスト名のみを取り出して正引きするか、ホスト名・組織名の片方しか取れない場合の出力形式、正引きできない場合に後続の問い合わせを行わないことを、`socket`/`httpx`をモック化して検証。
 
 ---
 

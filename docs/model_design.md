@@ -32,12 +32,12 @@ Excelの1行分の解析・調査結果を保持するミュータブル（可�
 * `max_depth`: 階層数 (F列 - `int | None` 型。ただし実際にクローラーから返る値は `int` または文字列 **`"要確認"`**（階層10超過時）であるため、この列には数値以外の文字列が入り得る点に注意)
 * `svcmd`: svcmd (G列 - 常に**空欄**を維持)
 * `site_structure`: 構成 (H列 - 自動検出したグローバルナビゲーションのメニューテキストを最大10件、**改行区切り**で格納。多言語切り替えメニュー等は除外)
-* `total_pages`: ページ数 (I列 - `int | None` 型。巡回できた総ページ数。接続失敗時は `0`。※クロール中に100ページへ到達した場合はクローラーが `"100ページ以上"` という文字列を返し、`total_pages` には `100` が、Excel出力用の表示値には `"100以上"` が格納される)
-* `cms_name`: 使用CMS (J列 - HTMLシグネチャから幅広い国内外CMSを多角的に判定。WordPress, baserCMS, EC-CUBE, Movable Type, MODX, Drupal, Joomla!, TYPO3, concrete5, XOOPS, NetCommons, PowerCMS, Craft CMS, Sitecore, Kentico, SilverStripe, Jimdo, Wix, Shopify, ColorMe Shop, MakeShop, futureshop, a-blog cms, RCMS, HeartCore, BlueMonkey, BiNDup 等を検知し、非CMSなら空文字列)
+* `total_pages`: ページ数 (I列 - `int | None` 型。巡回できた総ページ数。接続失敗時は `0`（Excelでは空欄）。※クロール中に100ページへ到達した場合はクローラーが `"100以上"`、時間切れで途中終了した場合は確認できた件数の下限値として `"36以上"` のような `"{数値}以上"` 形式の文字列を返す。`SiteScraperService`は判定には`parse_lower_bound()`で数値化した値を使いつつ、`total_pages`には`"{数値}以上"`の文字列をそのまま格納する（型ヒント上は`int | None`のため`# type: ignore`で代入している）)
+* `cms_name`: 使用CMS (J列 - HTMLシグネチャから幅広い国内外CMSを多角的に判定。WordPress, baserCMS, EC-CUBE, Movable Type, MODX, Drupal, Joomla!, TYPO3, Concrete CMS（旧concrete5）, DNN (DotNetNuke), XOOPS, NetCommons, PowerCMS, Craft CMS, Sitecore, Kentico, SilverStripe, Jimdo, Wix, Shopify, ColorMe Shop, MakeShop, futureshop, a-blog cms, RCMS, HeartCore, BlueMonkey, BiNDup 等の約30種を検知し、非CMSなら空文字列。WordPressは`"WP"`として出力される)
 * `description`: 用途 (K列 - メタディスクリプション ➔ `<title>` ➔ `<h1>` の優先度順で抽出したWebサイトの概要文。**現状のコードには文字数の切り詰め処理はなく、抽出した文字列がそのまま格納される**）
 * `contact_fields`: 問合せ項目 (L列 - フォーム内のinput/textarea/selectのラベルをaria属性・label紐付け・祖先要素探索などから抽出し、項目名を**改行区切り**で格納。HubSpot/Tayori等の外部埋め込みフォームを検出した場合はその旨のテキストを格納。iframe内フォームも最大2階層まで再帰的に解析。抽出したフォームは、本文欄（textarea）を持つことを必須条件として採用する（メール欄はログイン・会員登録フォームにもあるため決め手にしない。パスワード欄を持つフォームとブログのコメントフォームは除外）。URLがお問い合わせページなら本文欄があれば採用し、それ以外のページではお問い合わせ関連語が2つ以上、または氏名＋電話番号欄がある場合のみ採用する。フォーム抽出は、URL（`_url_has_keyword()`で`information`/`platform`/`format`等の`form`誤検知語を除いて照合）またはリンクテキストがお問い合わせを示すページに加え、本文欄（textarea）を持つ全ページで試みる。JSフレームワーク製サイトでお問い合わせページの静的HTMLに入力欄が無い場合は、`MAX_CONTACT_PAGE_RENDERS`（2）ページまでPlaywrightで再レンダリングして抽出する。`<form>`も疑似フォームdivも無いページでは、`<body>`全体ではなく、textareaから`MAX_BARE_FORM_ANCESTOR_LEVELS`（6）階層まで遡って他の入力欄を2つ以上含む最初の祖先要素をフォームとみなす。ナビ等（`_looks_like_navigation()`）はラベル候補から除外する。お問い合わせフォームが無く、メールアドレスが設定された`mailto:`リンクがある場合は`"mailto"`、mailtoリンクも無い場合は`"問い合わせフォームなし"`、接続失敗時は空欄)
 * `rejection_reason`: 不可の理由 (M列 - 判定保留時（ネットワーク機器ブロック・接続不可・階層深すぎ）の理由や、`RenewalEvaluator` が返す判定理由（改行区切りで複数格納されうる。ページ数超過／3階層以上／ログイン機能／添付機能／ベーシック認証／多言語対応／Captcha／カレンダー／サイト内検索／チャットボット／動画／フローティングボタン／アコーディオン／タブ切り替え／モーダル／Lightbox等／スクロールアニメーション、の中から該当するものすべて）を格納)
-* `remarks`: 備考 (N列 - 通常は空文字列。移転案内ページを検知した場合は`SiteScraperService`が`"移転先：{URL}"`に加え、改行して`ReverseDnsChecker.get_server_info()`が返したサーバー情報を`"サーバー：{逆引きホスト名（管理組織名）}"`（取得できなければ`"サーバー：取得できませんでした"`）の形式で設定する。それ以外の通常判定時は、クロール結果の`subsystem_note`（別システムらしきものが一部ディレクトリに同居している場合の注記）をそのまま転記し、判定保留の理由が`PENDING_TIMEOUT_REASON`（時間切れ）または`NO_NG_REASON_NOTE`（×の根拠なし）だった場合はM列の代わりにその定型文をここへ出力する。)
+* `remarks`: 備考 (N列 - 通常は空文字列。移転案内ページを検知した場合は`SiteScraperService`が`"移転先：{URL}"`に加え、改行して`ReverseDnsChecker.get_server_info()`が返したサーバー情報を`"サーバー：{逆引きホスト名（管理組織名）}"`（取得できなければ`"サーバー：取得できませんでした"`）の形式で設定する。それ以外の通常判定時は、クロール結果の`subsystem_note`をそのまま転記する（ただし注記機能は現在無効化されており常に空文字列）。判定保留の理由が`PENDING_TIMEOUT_REASON`（時間切れ）または`NO_NG_REASON_NOTE`（×の根拠なし）だった場合はM列の代わりにその定型文をここへ出力する。)
 * `operator_name`: 担当 (O列 - アプリ実行時に指定された担当者名をそのまま格納)
 
 ## 2. サービス層のインターフェース
@@ -48,7 +48,7 @@ Excelの1行分の解析・調査結果を保持するミュータブル（可�
 
 ```python
 (
-    total_pages,          # int | "100ページ以上"
+    total_pages,          # int | "100以上"（上限到達時） | "{数値}以上"（時間切れで途中終了時）
     max_depth,            # int | "要確認"（階層10超過時）
     contact_fields,       # str（改行区切り）
     site_structure,       # str（改行区切り、最大10件）
@@ -59,10 +59,10 @@ Excelの1行分の解析・調査結果を保持するミュータブル（可�
     has_login,            # bool
     has_basic_auth,       # bool（クロール中に401 Unauthorizedを検知したページが1件でもあればTrue）
     has_multilang,        # bool（ヘッダー等に配置された多言語切り替えUIをクロール中に検知していればTrue）
-    blocked_reason,       # str（Fortinet等のネットワークセキュリティ機器によるブロックページを検知した場合のみ非空）
+    blocked_reason,       # str（Fortinet等のネットワーク機器によるブロックページ、またはサーバー自身の403/429/5xx等のエラーページでアクセスできなかった場合のみ非空）
     redirect_target_url,  # str（meta refresh/JSタイマーによる別ドメインへの自動リダイレクト＝移転案内ページを検知した場合のみ非空）
     queue_exhausted,      # bool（巡回対象の内部リンクをすべて発見・訪問し尽くして自然にキューが空になった場合True）
-    subsystem_note,       # str（サイトの一部ディレクトリに別システムらしきものが同居し、ページ数の大半を占めている場合の注記。該当なしは空文字）
+    subsystem_note,       # str（別システム同居の注記。機能は現在無効化されており常に空文字）
 )
 ```
 
@@ -70,10 +70,10 @@ Excelの1行分の解析・調査結果を保持するミュータブル（可�
 
 * `has_login`は、`_has_password_login_form`によって検知される。パスワード入力欄（`type="password"`、または`autocomplete="current-password"/"new-password"`）を持つフォームが、サイト共通のヘッダー/グローバルナビ（`<header>`要素、または`_HEADER_LIKE_RE`＝`header|gnav|globalnav|utility|top-?bar|topnav|l-header`にマッチするclass/id）を伴って表示されている場合にTrueとなる。CMS管理画面のログインページを個別列挙して除外する方式は対象CMSが増えるたびにメンテナンスが必要になるため採用せず、「訪問者向けの会員ログイン・マイページは通常のページテンプレートに組み込まれるためサイト共通ヘッダーを伴うが、管理者ログイン画面は単独ページとして表示されヘッダーを伴わない」という構造的な違いで区別している。`login`/`mypage`/`member`/`account`等の文字列はログイン判定そのものには使われておらず、クロールキューの巡回優先度付けにのみ使用される。
 * `has_basic_auth`は、初回アクセスおよびクロールループ内の各ページ取得時、`response.status_code == 401`を`raise_for_status()`呼び出し前に確認することで検知する。サイト全体がベーシック認証で保護されている場合だけでなく、一部の下層ページのみが保護されている場合も検知できる。
-* `blocked_reason`は、取得したHTMLがFortinet Webfilter等のネットワークセキュリティ機器によるブロックページ（実サイトの内容ではない）であるかどうかを判定して設定される。SSL証明書エラーが引き金でこの警告ページが返されているケースを区別して分類する処理を含む。設定された時点で、通常の巡回・判定ロジックには進まず即座に結果を返す。
+* `blocked_reason`は、取得したHTMLが実サイトの内容ではなくアクセス拒否ページであるかどうかを`_detect_access_blocked_page()`で判定して設定される。Fortinet Webfilter等のネットワークセキュリティ機器によるブロックページ（`_detect_network_block_page()`。SSL証明書エラーが引き金でこの警告ページが返されているケースを区別して分類する処理を含む）を優先的に確認し、該当しなければサーバー自身が返す汎用エラーページ（`_detect_generic_error_page()`。Apache/Nginxの標準403ページ等）を確認する。HTTPステータスコード（403/429/5xx等）からも`_reason_for_status_code()`で理由文を生成する。初回アクセス時にhttpxでブロックを検知しても即断せず、`render_js=True`であればPlaywright（実ブラウザ）でbare/www付きの両方を再確認し、それでもブロックされた場合のみ確定する（自動化ツールのみを狙い撃ちでブロックする機器があるため）。確定した時点で、通常の巡回・判定ロジックには進まず即座に結果を返す。
 * `redirect_target_url`は、取得したHTMLがmeta refreshやJSの`location.href`書き換え等によって数秒後に別ドメインへ自動遷移する「移転案内ページ」かどうかを検知して設定される。設定された時点で即座に結果を返す。
 * `queue_exhausted`は、巡回対象として発見した内部リンクをすべて訪問し終えてキューが自然に空になったか（`True`）、タイムアウトや最大ページ数（100件）到達等で未訪問のリンクを残したまま打ち切ったか（`False`）を表す。「元々ページ数の少ないサイト」なのか「クロールが途中で終わっただけ」なのかを`evaluator.py`側で区別するために使う。
-* `subsystem_note`は、サイト全体のごく一部のディレクトリ配下に別システムらしきものが同居し、そこだけでページ数の大半を占めている場合の注記文字列。ページ数・階層数の集計や判定そのものには影響せず、`SiteScraperService`が通常判定時のN列（備考）にそのまま転記する参考情報。
+* `subsystem_note`は、サイト全体のごく一部のディレクトリ配下に別システムらしきものが同居し、そこだけでページ数の大半を占めている場合の注記文字列として設計された要素。ディレクトリ名のブロックリスト方式では`products`等の正当なディレクトリでも誤検知が避けられなかったため、**注記機能は現在無効化されており、常に空文字列を返す**（判定メソッド`_detect_subsystem_note()`は将来の作り直しに備えて残しているが呼び出されない）。戻り値の要素と`SiteScraperService`側の転記処理は互換性のため残っている。
 
 ### 2.2. `RenewalEvaluator`
 
@@ -144,7 +144,7 @@ Google Map埋め込みは、ほぼすべてのコーポレートサイトのア�
 2. `WebCrawler(render_js=True, timeout=150.0, page_timeout=8.0).crawl_and_analyze()`でクロール（JSフレームワーク検知でPlaywrightレンダリングが走ると1回あたり15秒前後かかる上、記事系ページを大量に持つサイトでは90秒では実ページ数を大きく下回る事例があったため長めに確保。ただし300秒まで引き上げると並列ワーカー1枠を長時間占有し他ドメインの処理を押し出してしまったため、100ページ到達までの余裕とスループットのバランスを取って150秒に調整している）
 3. クロール結果に`redirect_target_url`（移転案内ページ）があれば、`RenewalEvaluator.decide()`を呼ばずに`"×"`（すでにリニューアル済のため）を確定し、備考欄に移転先を記録。あわせて`ReverseDnsChecker.get_server_info(redirect_target_url)`で移転先のサーバー情報を調べ、備考欄に追記する
 4. そうでなく`blocked_reason`（ネットワーク機器ブロック）があれば、同様に`decide()`を呼ばずに`"要確認"`＋検知した理由を確定
-5. どちらでもなければ`RenewalEvaluator.decide()`を呼び出し、通常の判定フローに委ねる。返ってきた`rejection_reason`が`PENDING_TIMEOUT_REASON`または`NO_NG_REASON_NOTE`と一致する場合はM列を空にしてN列（備考）へ振り替え、それ以外の場合はクロール結果の`subsystem_note`をN列にそのまま転記する
+5. どちらでもなければ`RenewalEvaluator.decide()`を呼び出し、通常の判定フローに委ねる。返ってきた`rejection_reason`が`PENDING_TIMEOUT_REASON`または`NO_NG_REASON_NOTE`と一致する場合はM列を空にしてN列（備考）へ振り替え、それ以外の場合はクロール結果の`subsystem_note`をN列にそのまま転記する（現在は常に空文字列）
 6. 結果を`threading.Lock`配下で`SiteAssessment`インスタンスへスレッドセーフに書き込み
 7. `JobRepository.update_assessment()`でSQLiteへ即座に反映
 

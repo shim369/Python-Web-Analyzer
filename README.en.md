@@ -12,7 +12,7 @@ It was developed to systematically learn practical backend architecture patterns
 
 ## Overview
 
-Given an Excel list of domains (with domain names in column B), this web application automatically crawls each domain to check **SSL support (including whether HTTPS is enforced), site structure (multi-signature CMS detection), and total page count**, then assigns a business evaluation (**◯, ×, or 要確認 / "needs review"**) based on a configurable page-count threshold, site depth, presence of a login/member area, file-attachment support in contact forms, Basic Authentication, multilingual support, CAPTCHA on contact forms, specialized features (calendars, on-site search, chatbots), design gimmicks (video, floating buttons, accordions, tabs, modals), and rich content (Lightbox galleries, scroll animations, etc.).
+Given an Excel list of domains (with domain names in column B), this web application automatically crawls each domain to check **SSL support (including whether HTTPS is enforced), site structure (multi-signature CMS detection), and total page count**, then assigns a business evaluation (**× or 要確認 / "needs review"**) based on a page-count threshold (10 pages by default), site depth, presence of a login/member area, file-attachment support in contact forms, Basic Authentication, multilingual support, CAPTCHA on contact forms, specialized features (calendars, on-site search, chatbots), design gimmicks (video, floating buttons, accordions, tabs, modals), and rich content (Lightbox galleries, scroll animations, etc.).
 
 This is more than a simple scraper: it implements its own crawl-rate throttling to minimize load on target servers, spoofed headers to work around Cloudflare and similar bot-blocking (403/401 errors), detection and root-cause classification of block pages served by network security appliances such as Fortinet, detection of "site has moved" redirect pages (automatic redirects to a different domain), a two-tier SSL audit mechanism combining HTTP redirect tracking with a direct HTTPS check, and a safety mechanism that detects infinite link traps and aborts crawling.
 
@@ -38,18 +38,20 @@ The frontend is built with Streamlit. By coordinating `st.rerun()` with a backgr
 * **Intelligent crawler-defense evasion and SSL auditing**
   * **Smart SSL & redirect verification**: The initial request is made over `http://`, tracking whether a WAF or the server itself issues an automatic redirect to `https://` — this is the actual criterion for "HTTPS enforced." If no redirect occurs, the tool independently verifies a direct `https://` connection as a flexible fallback.
   * **Support for HTTPS-only sites**: For sites where the `http://` connection itself fails (e.g., port 80 isn't accepted), a fallback attempts a direct `https://` connection, avoiding a false "undeterminable" result. If a certificate hostname mismatch (`SSLError`) is detected, the tool also retries once against the `www.`-prefixed domain.
-  * **Detection of block pages from network security appliances**: When a device such as a Fortinet Webfilter performs SSL inspection and intercepts/replaces the traffic, the crawler may end up fetching the appliance's block page instead of the actual site content. The tool detects this, explicitly surfaces the likely cause (category classification, possible SSL certificate error, etc.) as the judgment reason, and short-circuits the rest of the evaluation logic, reporting the result as "needs review."
+  * **Detection of access-denied pages**: When a device such as a Fortinet Webfilter performs SSL inspection and intercepts/replaces the traffic, or when the server itself returns a 403 Forbidden / 429 Too Many Requests / 5xx error page, the crawler may end up fetching that page instead of the actual site content. The tool detects this, explicitly surfaces the likely cause (category classification, possible SSL certificate error, server-side bot protection or rate limiting, etc.) as the judgment reason, and short-circuits the rest of the evaluation logic, reporting the result as "needs review." Because some appliances block only automated tools, a block detected via httpx is re-checked with Playwright (a real browser) and is only confirmed if the real browser is blocked as well.
   * **Detection of "site relocated" pages**: If a page auto-redirects to a different domain after a few seconds via meta refresh or a JS timer (a typical "we've moved" notice page), the tool bypasses the normal evaluation logic entirely, immediately marks the result as "×" (already renewed/relocated), and records the destination URL in the remarks column. `ReverseDnsChecker` also looks up the destination's reverse-DNS hostname and RDAP IP organization and appends them as "サーバー：{hostname (organization)}" (or "サーバー：取得できませんでした" if unavailable).
-  * **Safe fallback on unreachable sites**: DNS errors, bot-blocking (403/401), timeouts, and similar exceptions are all safely caught without crashing the app, resulting in an "undeterminable" state. This is carried into the crawl phase as "0 pages," which classifies the final result as "needs review" with an appropriate error reason.
+  * **Safe fallback on unreachable sites**: DNS errors, timeouts, and similar exceptions are all safely caught without crashing the app, resulting in an "undeterminable" state. The initial request is tried as `https://` (the default for bare domain input), then `http://`, then the `www.`-prefixed host; if all fail, this is carried into the crawl phase as "0 pages," which classifies the final result as "needs review" with an appropriate error reason ("×" if Basic Authentication is identified as the cause).
   * **Browser impersonation (User-Agent) and traffic spoofing**: Mimics the headers of an up-to-date web browser (Chrome) in order to get past defenses that would otherwise immediately block a plain Python scraper.
   * **Infinite link-trap detection**: In addition to simple repeating paths generated by things like calendar pages, the tool also detects repeating segment patterns caused by misresolved relative paths in JS-based navigation, preventing infinite crawling.
 
 * **High-precision, dynamic detection of major CMS platforms and site structure**
-  * Goes beyond static HTML parsing, using signatures found in the HTML source — such as `wp-content` / `wp-includes` assets — to identify 30+ CMS platforms both domestic and international, including WordPress, baserCMS, EC-CUBE, Movable Type, Shopify, and Wix. Non-CMS sites are automatically identified and left blank.
-  * Detection isn't limited to `<form>` tags — it also covers `role="form"` and pseudo-forms built from `div`s, resolving form field labels from multiple sources including `aria-labelledby`, `label for`, and ancestor-element analysis. Externally embedded forms (HubSpot, Tayori, etc.) are also detected. Forms inside iframes are analyzed recursively. It also handles JS-submitted forms with no `<form>` tag (locating the form container by walking up from the `textarea`) and contact forms rendered client-side by JS frameworks (re-rendered with Playwright), while excluding navigation menus from being picked up as form fields.
+  * Goes beyond static HTML parsing, using signatures found in the HTML source — such as `wp-content` / `wp-includes` assets — to identify about 30 CMS platforms both domestic and international, including WordPress (output as `WP`), baserCMS, EC-CUBE, Movable Type, Concrete CMS, Shopify, and Wix. Non-CMS sites are automatically identified and left blank.
+  * For sites where following links finds 2 pages or fewer (e.g. sites that navigate between pages with JS), the crawl is supplemented with URLs listed in the sitemap (`Sitemap:` lines in `robots.txt`, `/sitemap.xml`, etc.).
+  * JS rendering (Playwright) is used only where it's needed rather than on every page: re-rendering the top page when a JS framework (or an empty SPA shell) is detected, re-checking with a real browser when httpx access is denied, and re-rendering contact pages whose static HTML has no input fields (up to 2 pages per site). In environments without Playwright, the crawler automatically falls back to plain HTTP fetching.
+  * Detection isn't limited to `<form>` tags — it also covers `role="form"` and pseudo-forms built from `div`s, resolving form field labels from multiple sources including `aria-labelledby`, `label for`, and ancestor-element analysis. Externally embedded forms (HubSpot, Tayori, etc.) are also detected. Forms inside iframes are analyzed recursively. It also handles JS-submitted forms with no `<form>` tag (locating the form container by walking up from the `textarea`) and contact forms rendered client-side by JS frameworks (re-rendered with Playwright), while excluding navigation menus from being picked up as form fields. If no form is found on the site itself, contact pages on other domains (up to 3) are checked as well; if there is still none, the output is "mailto" or "問い合わせフォームなし" (no contact form) depending on whether a `mailto:` link exists.
 
 * **Multi-signal automatic detection and generation of evaluation reasons**
-  * Detects and automatically lists, as evaluation reasons: excessive page count, a 3+ level deep site structure, login/member-area functionality, file-attachment support in contact forms, Basic Authentication (checked both on the initial request and on every page fetched during the crawl), multilingual switching, image CAPTCHA on forms, calendar functionality, on-site/filtered search, chatbot integration, video in the hero area, floating buttons, accordions, tab switching, modal windows, Lightbox-style galleries, and heavy use of scroll animation (GSAP, etc.). To detect accordions, tabs, modals, and floating buttons, the tool deliberately avoids generic attributes like `data-toggle` / `aria-expanded` — which are also common in ordinary hamburger-menu navigation and would cause false positives — and instead uses a dedicated CSS selector/class name per feature.
+  * Detects and automatically lists, as evaluation reasons: excessive page count, a 3+ level deep site structure, login/member-area functionality, file-attachment support in contact forms, Basic Authentication (checked both on the initial request and on every page fetched during the crawl), multilingual switching, image CAPTCHA on forms, calendar functionality, on-site/filtered search, chatbot integration, video (`<video>` tags / YouTube or Vimeo embeds), floating buttons, accordions, tab switching, modal windows, Lightbox-style galleries, and heavy use of scroll animation (GSAP, etc.). To detect accordions, tabs, modals, and floating buttons, the tool deliberately avoids generic attributes like `data-toggle` / `aria-expanded` — which are also common in ordinary hamburger-menu navigation and would cause false positives — and instead uses a dedicated CSS selector/class name per feature.
   * Google Maps embeds are intentionally excluded from detection, since they appear on nearly every corporate site's "access" page and don't function as a meaningful signal on their own.
   * When the site depth is measured as extremely deep and the automated measurement can't be trusted (more than 10 levels), the tool deliberately avoids forcing a numeric judgment and instead reports "needs review" for manual inspection.
 
@@ -59,7 +61,7 @@ The frontend is built with Streamlit. By coordinating `st.rerun()` with a backgr
 
 * **Model design and type safety aligned with Mypy Strict**
   * The domain model `ScrapingJob` is designed to be immutable (read-only), enforcing thread-safe state management. When state needs to change, a new instance is created instead — a "value object" design philosophy applied consistently.
-  * Numeric fields on `SiteAssessment` (page count, depth) are strictly typed as `int | None`. String representations meant purely for display (e.g. rendering "100+" once the page count reaches 100) are deferred all the way to the point of Excel export, keeping the business logic itself free of Mypy errors and preserving type safety.
+  * Numeric fields on `SiteAssessment` (page count, depth) are typed as `int | None`, and the judgment logic (`RenewalEvaluator`) only ever receives `int` values normalized via `parse_lower_bound()`, keeping the business logic type-safe. Note that the lower-bound notations returned by the crawler (`"100以上"` when the 100-page cap is reached, `"36以上"` when the crawl times out, etc.) and the depth value `"要確認"` are currently stored as strings by `SiteScraperService` (those assignments bypass the type checker with `# type: ignore`). Missing or zero values are converted to blank cells at Excel export time.
 
 * **Shared logging infrastructure with decorators for cross-cutting concerns**
   * A shared `dictConfig`-based logger configuration (`utils/logger.py`) is applied once at app startup, writing to both the console (INFO and above) and a per-run log file with a second-level timestamp in its name (`logs/app_YYYYMMDD_HHMMSS.log`, DEBUG and above). Every module benefits from this unified logging setup just by calling `logging.getLogger(__name__)`.
@@ -84,8 +86,9 @@ The frontend is built with Streamlit. By coordinating `st.rerun()` with a backgr
 | Web UI Framework | Streamlit (custom flat UI with CSS styling) |
 | Scraping & Parsing | HTTPX, BeautifulSoup4 (prefers the `lxml` parser; optional JS rendering via Playwright) |
 | SSL Verification | Requests |
+| Server Lookup | socket (forward / PTR reverse lookup), RDAP (`rdap.org`, via HTTPX) |
 | Persistence | SQLite (WAL mode) |
-| Data Processing | OpenPyXL (Excel import/export, merging results while preserving original row order) |
+| Data Processing | OpenPyXL (Excel import/export, automatic column width / row height) |
 | Testing | Pytest |
 | Linter & Formatter | Ruff |
 | Type Check | Mypy (Strict mode compliant) |
@@ -97,7 +100,14 @@ The frontend is built with Streamlit. By coordinating `st.rerun()` with a backgr
 
 ```text
 PYTHON-WEB-ANALYZER/
-├── docs/                      # Documentation (requirements spec, etc.)
+├── .devcontainer/             # Dev Container / Codespaces configuration
+├── .github/workflows/ci.yml   # GitHub Actions CI definition
+├── .streamlit/config.toml     # Streamlit server settings (port 8502, etc.)
+├── docs/                      # Documentation
+│   ├── images/                # Screenshots and icons
+│   ├── model_design.md        # Class / model design
+│   ├── requirements_definition.md # Requirements specification
+│   └── screen_transition.md   # Screen transition / processing flow diagram
 ├── src/
 │   └── web_analyzer/          # Application source code
 │       ├── core/              # Core logic
@@ -112,6 +122,7 @@ PYTHON-WEB-ANALYZER/
 │       │   ├── decorators.py      # measure_time / log_action decorators
 │       │   └── logger.py          # dictConfig-based shared logger setup
 │       ├── __init__.py
+│       ├── cli.py             # Launcher for the `web-analyzer` command
 │       ├── main.py            # Application entry point (Streamlit UI)
 │       └── models.py          # Data models (ScrapingJob / SiteAssessment)
 ├── data/                       # Output location for the SQLite database file
@@ -119,13 +130,15 @@ PYTHON-WEB-ANALYZER/
 ├── logs/                      # Output location for per-run log files
 ├── tests/                     # Unit tests
 │   ├── test_evaluator.py      # Tests for evaluation logic
-│   ├── test_excel_service.py  # Tests for Excel output
+│   ├── test_excel_service.py  # Tests for Excel import/export
+│   ├── test_reverse_dns_checker.py # Tests for server lookup
 │   └── test_ssl_checker.py    # Tests for SSL verification
 ├── .gitignore
 ├── .python-version
 ├── LICENSE                    # MIT License
 ├── pyproject.toml             # Project configuration and dependencies
-├── README.md                  # Project overview and reviewer-facing documentation
+├── README.md                  # Project overview and reviewer-facing documentation (Japanese)
+├── README.en.md               # English README
 └── uv.lock                    # uv lockfile (strict version locking)
 
 ```
@@ -158,6 +171,10 @@ cd PYTHON-WEB-ANALYZER
 # (a virtual environment is created automatically)
 uv sync
 
+# (Optional) Install Chromium for Playwright to enable JS rendering.
+# The app works without it, but detection accuracy on JS-rendered sites drops.
+uv run playwright install chromium
+
 ```
 
 ---
@@ -167,7 +184,14 @@ uv sync
 ```bash
 uv run streamlit run src/web_analyzer/main.py
 
+# or, equivalently (extra arguments are passed through to streamlit)
+uv run web-analyzer
+
 ```
+
+The app starts on port `8502` as configured in `.streamlit/config.toml` (open `http://localhost:8502`). When opened in a Dev Container / GitHub Codespaces, `uv sync` and app startup run automatically.
+
+At runtime, `data/jobs.db` (SQLite), `temp/` (uploaded and exported Excel files), and `logs/` (log files) are created automatically under the current directory (the project root).
 
 ---
 
@@ -199,26 +223,14 @@ uv run mypy src tests
 
 ## GitHub Actions (CI)
 
-A CI pipeline is set up using GitHub Actions.
+A CI pipeline is set up using GitHub Actions (`.github/workflows/ci.yml`).
 
-Jobs are split into two stages, so that tests only run once static analysis (lint/type check) has succeeded.
+On every push and pull request, a single job, `lint-and-test`, runs the following steps in order. The job stops at the first failing step, so tests are not run if static analysis fails.
 
-### 1. Lint Job
-
-* Ruff
-* Mypy
-
-### 2. Test Job
-
-* Pytest
-
-```yaml
-test:
-  needs: lint
-
-```
-
-This means that if a lint error occurs, the (unnecessary) test run is skipped, saving CI execution resources.
+1. Ruff (lint): `uv run ruff check .`
+2. Ruff (format check): `uv run ruff format --check .`
+3. Mypy (type check): `uv run mypy src`
+4. Pytest: `uv run pytest`
 
 ---
 
@@ -233,11 +245,15 @@ To ensure robustness, core logic is thoroughly covered by unit tests using `pyte
 
 #### 2. Excel Import/Export Service (ExcelService)
 
-* **Row-order preservation and round-trip guarantees**: I/O tests confirming that the row order and structure of the imported Excel sheet are fully preserved while merging in the analysis date (M/D format) and each status field on export. Also verifies that page counts of 100 or more are safely converted to the string `"100以上"` ("100+") on export, along with correct handling of illegal control characters (stripped without raising an exception).
+* **Import/export correctness**: Verifies that import reads domains from column B (falling back to column A when empty) and skips header-like rows such as `サイト名`; that export writes each field to the correct cell under the fixed A–O column headers, outputs lower-bound notations like `"100以上"` ("100+") as-is, and leaves page count / depth blank when they are 0; and that illegal control characters are stripped without raising an exception.
 
 #### 3. Security Auditing Module (SslChecker)
 
 * **SSL connection & redirect verification correctness**: Validates the initial connection parameters (a 10-second request timeout by default), the fallback to a direct `https://` connection when `http://` itself fails, the branch that retries against a `www.`-prefixed domain only on a certificate hostname mismatch, and the handling all the way from a normal HTTPS connection through to exception handling (returning `None, None` when the result is undeterminable). All of this is verified purely at the logic level, without any real network traffic, by mocking `requests.Session` with a `FakeSession`.
+
+#### 4. Server Lookup (ReverseDnsChecker)
+
+* **Reverse DNS / RDAP assembly**: With `socket` and `httpx` mocked, verifies that the IP organization name is extracted from the RDAP response in priority order (`fn` of the `registrant` entity → first `remarks` entry → network name), that an empty string is returned on network failure or an invalid response, that only the hostname is extracted from a URL for forward lookup, the output format when only one of hostname / organization is available, and that no further lookups are made when the domain can't be resolved.
 
 ---
 
