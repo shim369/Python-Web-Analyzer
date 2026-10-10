@@ -18,9 +18,10 @@ ICON_PATH = os.path.join("docs", "images", "cursor_icon.ico")
 # 1. ページ設定を最初に行う
 # favicon引数にアイコンファイルのパスを渡します
 st.set_page_config(
-    page_title="My AI Web Analyzer",  # ブラウザのタブに表示されるタイトル
+    page_title="Web Site Analyzer",  # ブラウザのタブに表示されるタイトル
     page_icon=ICON_PATH,  # ここでアイコンを指定
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 logger = logging.getLogger(__name__)
@@ -44,13 +45,6 @@ def get_scraper_service() -> SiteScraperService:
     if interrupted_job_ids:
         logger.warning(f"前回異常終了した中断ジョブを検知しました: {interrupted_job_ids}")
     return SiteScraperService(repository=repository)
-
-
-st.set_page_config(
-    page_title="Web Site Analyzer",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
 
 
 # UIスタイリング

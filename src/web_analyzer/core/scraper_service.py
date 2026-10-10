@@ -167,6 +167,7 @@ class SiteScraperService:
         # タイムアウト等で途中終了したか(False)。例外発生時は実際には不明なため、
         # 保守的にFalse(＝クロール失敗とみなし「要確認」判定を維持)扱いにしておく。
         queue_exhausted_raw: bool = False
+        subsystem_note_raw: str = ""
 
         # 1. SSL判定の実行
         try:
