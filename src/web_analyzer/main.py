@@ -272,26 +272,17 @@ if job_id:
         col1, col2, col3 = st.columns(3)
         with col1:
             st.markdown(
-                '<div class="metric-card" style="margin-bottom:1rem;">'
-                '<p style="margin:0;color:#666;font-size:0.9rem;">総ドメイン数</p>'
-                f'<h2 style="margin:5px 0;color:#1F4E78;font-weight:700;">{total} 件</h2>'
-                "</div>",
+                f'<div class="metric-card" style="margin-bottom:1rem;"><p style="margin:0;color:#666;font-size:0.9rem;">総ドメイン数</p><h2 style="margin:5px 0;color:#1F4E78;font-weight:700;">{total} 件</h2></div>',
                 unsafe_allow_html=True,
             )
         with col2:
             st.markdown(
-                '<div class="metric-card" style="margin-bottom:1rem;">'
-                '<p style="margin:0;color:#666;font-size:0.9rem;">解析完了</p>'
-                f'<h2 style="margin:5px 0;color:#2e7d32;font-weight:700;">{completed} 件</h2>'
-                "</div>",
+                f'<div class="metric-card" style="margin-bottom:1rem;"><p style="margin:0;color:#666;font-size:0.9rem;">解析完了</p><h2 style="margin:5px 0;color:#2e7d32;font-weight:700;">{completed} 件</h2></div>',
                 unsafe_allow_html=True,
             )
         with col3:
             st.markdown(
-                '<div class="metric-card" style="margin-bottom:1rem;">'
-                '<p style="margin:0;color:#666;font-size:0.9rem;">現在の進捗率</p>'
-                f'<h2 style="margin:5px 0;color:#333;font-weight:700;">{percent} %</h2>'
-                "</div>",
+                f'<div class="metric-card" style="margin-bottom:1rem;"><p style="margin:0;color:#666;font-size:0.9rem;">現在の進捗率</p><h2 style="margin:5px 0;color:#333;font-weight:700;">{percent} %</h2></div>',
                 unsafe_allow_html=True,
             )
 

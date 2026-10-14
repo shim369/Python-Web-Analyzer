@@ -2113,8 +2113,7 @@ class WebCrawler:
     _NETWORK_BLOCK_SIGNATURES: list[tuple[list[str], str]] = [
         (
             ["fortinet webfilter"],
-            "Fortinet Webfilter（ネットワーク側のセキュリティ機器）によりアクセスがブロックされたため、"
-            "実際のサイト内容を取得できませんでした。別ネットワークからの再調査、または手動確認をお願いします。",
+            "Fortinet Webfilter（ネットワーク側のセキュリティ機器）によりアクセスがブロックされたため、実際のサイト内容を取得できませんでした。別ネットワークからの再調査、または手動確認をお願いします。",
         ),
         (
             ["this connection is invalid", "ssl certificate"],
@@ -2275,11 +2274,7 @@ class WebCrawler:
             "tlsv1_alert",
         ]
         if any(k in err_text for k in ssl_error_keywords):
-            return (
-                "SSL証明書関連のエラー（期限切れ・不正な証明書等）により接続できませんでした。"
-                "Fortinet等のネットワーク機器によるSSLインスペクション/ブロックの可能性もあるため、"
-                "別ネットワークからの再調査、または手動確認をお願いします。"
-            )
+            return "SSL証明書関連のエラー（期限切れ・不正な証明書等）により接続できませんでした。Fortinet等のネットワーク機器によるSSLインスペクション/ブロックの可能性もあるため、別ネットワークからの再調査、または手動確認をお願いします。"
         return ""
 
     def _extract_fortinet_category(self, html: str) -> str:
@@ -2342,11 +2337,7 @@ class WebCrawler:
             if all(k in html_lower for k in keywords):
                 category = self._extract_fortinet_category(html)
                 if category:
-                    return (
-                        f"ネットワーク側のセキュリティ機器（Fortinet等）により「{category}」に該当するとして"
-                        "アクセスがブロックされました。実際のサイト内容を取得できませんでした。"
-                        "別ネットワークからの再調査、または手動確認をお願いします。"
-                    )
+                    return f"ネットワーク側のセキュリティ機器（Fortinet等）により「{category}」に該当するとしてアクセスがブロックされました。実際のサイト内容を取得できませんでした。別ネットワークからの再調査、または手動確認をお願いします。"
                 return reason
 
         return ""
@@ -3113,11 +3104,7 @@ class WebCrawler:
                                 else:
                                     main_ul = cast(
                                         Tag | None,
-                                        (
-                                            target_area.find("ul", class_=re.compile(r"nav|menu|gnav|gmenu", re.I))
-                                            or target_area.find("ul", id=re.compile(r"nav|menu|gnav|gmenu", re.I))
-                                            or target_area.find("ul")
-                                        ),
+                                        (target_area.find("ul", class_=re.compile(r"nav|menu|gnav|gmenu", re.I)) or target_area.find("ul", id=re.compile(r"nav|menu|gnav|gmenu", re.I)) or target_area.find("ul")),
                                     )
 
                                 if isinstance(main_ul, Tag):
@@ -3206,14 +3193,7 @@ class WebCrawler:
                         # 無いことがある(実際に確認済み)。Playwrightでのレンダリングは
                         # 通常トップページにしか行わないため、お問い合わせページに限り
                         # レンダリングし直してフォームを探す。
-                        if (
-                            is_contact_url
-                            and not contact_fields
-                            and self.render_js
-                            and contact_page_renders < self.MAX_CONTACT_PAGE_RENDERS
-                            and not soup.find(["input", "textarea", "select"])
-                            and self._detect_js_framework(current_html)
-                        ):
+                        if is_contact_url and not contact_fields and self.render_js and contact_page_renders < self.MAX_CONTACT_PAGE_RENDERS and not soup.find(["input", "textarea", "select"]) and self._detect_js_framework(current_html):
                             contact_page_renders += 1
                             rendered_contact_html, _rendered_url, _rendered_status, _nav_error = self._fetch_rendered_html(resolved_url)
                             if rendered_contact_html:
