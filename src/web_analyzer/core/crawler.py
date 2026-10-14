@@ -1452,6 +1452,48 @@ class WebCrawler:
         parts = [str(c) for c in el.contents if isinstance(c, NavigableString)]
         return "".join(parts).strip()
 
+    def _contains_fillable_field(self, el: Tag) -> bool:
+        """利用者が入力する項目(hidden等を除く)を内包するか判定する。
+
+        <div class="head_box"><p>お名前</p><input type="hidden" name="info[your_name][head]"></div>
+        のように、ラベル用の要素に項目名を送信するためのhidden inputが同居している
+        フォームがある。hiddenまで「入力欄を含む」と数えるとラベル候補から外れてしまい、
+        探索が上位へ進んで無関係な文字列(下記の非表示要素等)を拾ってしまう。
+        """
+        return any(self._is_fillable_field(inp) for inp in el.find_all(["input", "textarea", "select"]))
+
+    @staticmethod
+    def _is_hidden_element(el: Tag) -> bool:
+        """style="display:none"やhidden属性で画面に表示されない要素か判定する。
+
+        例: yubinbango.js用の<span class="p-country-name" style="display:none;">Japan</span>
+        がフォーム先頭にあり、これを問合せ項目として拾ってしまっていた。
+        """
+        if el.has_attr("hidden") or str(el.get("aria-hidden", "")).lower() == "true":
+            return True
+        style = re.sub(r"\s+", "", str(el.get("style", ""))).lower()
+        return "display:none" in style or "visibility:hidden" in style
+
+    def _choice_group_container(self, inp: Tag, form: Tag) -> Tag | None:
+        """radio/checkboxについて、同じnameの選択肢をすべて含む最も内側の祖先要素を返す。
+
+        選択肢がさらに小見出し(<h3>特別養護老人ホーム</h3>等)でグループ分けされている
+        場合、個々の選択肢から探索すると小見出しの方を項目名として拾ってしまう。
+        グループ全体の容器から探索を始めることで、本来の項目名(「事業選択」等)に届く。
+        """
+        name = inp.get("name")
+        if not name:
+            return None
+        siblings = [el for el in form.find_all("input", attrs={"name": name}) if el is not inp]
+        if not siblings:
+            return None
+        for ancestor in inp.parents:
+            if ancestor is form or not isinstance(ancestor, Tag):
+                return None
+            if all(ancestor in sib.parents for sib in siblings):
+                return ancestor
+        return None
+
     def _get_label_for_input(self, inp: Tag, form: Tag, soup: BeautifulSoup) -> str:
         """input要素に対応する厳格なラベル（W3C標準仕様）を解決する。"""
         # 1. aria-labelledby
@@ -1916,6 +1958,12 @@ class WebCrawler:
                             break
                         parent_chain.append(p)
 
+                    # radio/checkboxは選択肢グループ全体の容器から探索する
+                    if is_choice_input:
+                        group = self._choice_group_container(inp, form)
+                        if group is not None and group in parent_chain:
+                            parent_chain = parent_chain[parent_chain.index(group) :]
+
                     # (a) dt/dd, th/td
                     for parent in parent_chain:
                         if parent.name == "dd":
@@ -1938,7 +1986,7 @@ class WebCrawler:
                             # ラベル用の<td>は入力欄を含まないはずなので、それを条件に
                             # 別の項目の入力セルを誤って拾わないようにする。
                             prev_tds = [t for t in parent.find_previous_siblings("td") if isinstance(t, Tag)]
-                            if prev_tds and not prev_tds[0].find(["input", "textarea", "select"]) and not self._looks_like_hint_element(prev_tds[0]) and not self._looks_like_navigation(prev_tds[0]):
+                            if prev_tds and not self._contains_fillable_field(prev_tds[0]) and not self._is_hidden_element(prev_tds[0]) and not self._looks_like_hint_element(prev_tds[0]) and not self._looks_like_navigation(prev_tds[0]):
                                 # t = self._remove_required_marks(prev_tds[0].get_text(strip=True))
                                 t = self._get_clean_element_text(prev_tds[0])
                                 if t and len(t) < 50 and re.search(r"[A-Za-zぁ-んァ-ヶー一-龠々]", t):
@@ -1951,7 +1999,7 @@ class WebCrawler:
                             own_siblings = inp.find_previous_siblings(["p", "label", "span", "div", "dt", "th"])
                             if own_siblings and isinstance(own_siblings[0], Tag):
                                 candidate = own_siblings[0]
-                                if not candidate.find(["input", "textarea", "select"]) and not self._looks_like_hint_element(candidate) and not self._looks_like_navigation(candidate):
+                                if not self._contains_fillable_field(candidate) and not self._is_hidden_element(candidate) and not self._looks_like_hint_element(candidate) and not self._looks_like_navigation(candidate):
                                     t = self._get_clean_element_text(candidate)
                                     if t and len(t) < 50 and re.search(r"[A-Za-zぁ-んァ-ヶー一-龠々]", t):
                                         resolved_text = t
@@ -1997,11 +2045,11 @@ class WebCrawler:
                             siblings = [
                                 sib
                                 for sib in parent.find_previous_siblings(["div", "span", "label", "dt", "th", "p", "table", "h2", "h3", "h4", "h5", "h6"])
-                                if isinstance(sib, Tag) and (sib.get_text(strip=True) or sib.find(["input", "textarea", "select"]))
+                                if isinstance(sib, Tag) and (sib.get_text(strip=True) or self._contains_fillable_field(sib))
                             ]
                             if siblings:
                                 candidate = siblings[0]
-                                if not candidate.find(["input", "textarea", "select"]) and not self._looks_like_hint_element(candidate) and not self._looks_like_navigation(candidate):
+                                if not self._contains_fillable_field(candidate) and not self._is_hidden_element(candidate) and not self._looks_like_hint_element(candidate) and not self._looks_like_navigation(candidate):
                                     # t = self._remove_required_marks(candidate.get_text(strip=True))
                                     t = self._get_clean_element_text(candidate)
                                     if t and len(t) < 50 and re.search(r"[A-Za-zぁ-んァ-ヶー一-龠々]", t):
