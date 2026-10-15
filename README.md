@@ -43,6 +43,8 @@ Python学習およびポートフォリオ作成を目的として開発した�
   * **接続不能時の安全なフォールバック**: DNSエラーやタイムアウト等の例外発生時もシステムをクラッシュさせず判定不能として安全にキャッチ。`https://`（ドメイン名のみの入力時の既定）→`http://`→`www.`付きの順に初回アクセスを試み、すべて失敗した場合は「ページ数 0」として結果を引き継ぎ、最終結果を最優先で『要確認』に分類する堅牢性を担保（ベーシック認証が原因と判明している場合は『×』）。
   * **ブラウザ欺瞞（User-Agent）と通信偽装**: プレーンなPythonスクレイパーを即座にブロックする防御壁を突破するため、最新のWebブラウザ（Chrome）のヘッダー情報を模倣。
   * **無限リンクトラップの検知**: カレンダーページ等が生成する単純な繰り返しパスに加え、JS遷移リンクの誤解決等によって生じる複数セグメント単位の繰り返しパターンも検知し、無限巡回を未然に防止。
+  * **ページ数カウント専用の追加巡回**: 本巡回（150秒）が時間切れになり、100ページ未満のまま未訪問リンクが残った場合に限り、CMS判定・フォーム解析等を省いてリンク抽出だけを行う追加巡回（最大120秒・3並列・1リクエスト20秒）でページ数を確定させる。本巡回でタイムアウトしたページもここで取り直すため、応答の遅いサイトでも「36以上」のような下限値で終わりにくく、実行ごとのページ数のぶれも抑えられる。
+  * **無駄なリクエストの削減**: 「/about → /about/」の末尾スラッシュ補完リダイレクトを一度観測したサイトでは以降最初から末尾スラッシュ付きでリクエストする（404なら元のURLで取り直す）。また、`href="privacy/"` のような素の相対リンクが別階層の実ページへリダイレクトされるパターンを学習し、同じ誤解決URLを以降の巡回候補から外す。
 
 * **主要CMSおよびサイト構成の高精度な動的検出**
   * 静的なHTML構文解析だけでなく、`wp-content` / `wp-includes` 資産などのHTMLソース内のシグネチャから、WordPress（出力上は`WP`）、baserCMS、EC-CUBE、Movable Type、Concrete CMS、Shopify、Wixなど約30種の国内外CMSを多角的に判定。非CMSサイトは空欄と自動識別。
@@ -54,6 +56,12 @@ Python学習およびポートフォリオ作成を目的として開発した�
   * ページ数超過、3階層以上の深いサイト構成、ログイン／マイページ機能、お問い合わせフォームの添付機能、ベーシック認証（401 Unauthorized、初回アクセス時に加えクロール中の各ページ取得時にも検知）、多言語切り替え機能に加え、フォームの画像認証（Captcha）、カレンダー機能、サイト内検索・絞り込み検索、チャットボット導入、動画（videoタグ／YouTube・Vimeo埋め込み）、フローティングボタン、アコーディオン、タブ切り替え、モーダルウィンドウ、Lightbox等のギャラリー機能、GSAP等のスクロールアニメーションの有無まで検出し、判定理由として自動的に列挙。アコーディオン／タブ／モーダル／フローティングボタンの検知は、通常のハンバーガーメニュー等にも使われる汎用属性（`data-toggle`/`aria-expanded`）を避け、機能ごとに独立したCSSセレクタ・クラス名判定で誤検知を抑えている。
   * Google Map埋め込みのみ、ほぼすべてのコーポレートサイトのアクセスページに存在し単独では判定基準として機能しにくいため、意図的に対象外としている。
   * 階層数が極端に深く自動計測が信頼できない場合（10階層超）は、無理に数値化・判定せず「要確認」として人手での確認に委ねる設計。
+
+* **Geminiによる用途（K列）の補完（別画面）**
+  * サイドバーの「機能」で「用途(K列)の補完」を選ぶと、完成した調査結果Excelをアップロードし、K列「用途」が空欄・40文字未満・社名やキーワードを区切り記号で並べただけの行について、サイトを取り直してGemini APIで100文字前後のサイト概要に要約し、K列を書き換えたExcelをダウンロードできる（オプションで全行を要約し直すことも可能）。
+  * トップページに加え、リンクテキスト・URLから会社概要・事業内容らしいページ（最大2ページ）を探して要約の材料にする。JSフレームワーク製サイトはPlaywrightで描画し直す。
+  * 調査本体とは切り離して実行するため、調査の速度やGeminiの無料枠のレート上限の影響を受けない。全スレッド共通でリクエスト間隔（既定6秒）を空け、429が続いた場合は10分間要約を停止する。要約できた行は淡い黄色、できなかった行は淡いピンクでK列を塗り分け、出力ファイルに再度かければ残りの行だけが対象になる。
+  * 元のExcelの書式はそのまま残し、書き換えたセルの値と行の高さだけを更新する。
 
 * **セッションステートを用いた堅牢なリアルタイムUI**
   * Streamlitのステートフル（`st.session_state`）な設計。URLクエリパラメータにも`job_id`を保持することで、ブラウザが完全にリロードされ新しいセッションになった場合でも進行中のジョブを追跡し続けられる。
@@ -87,6 +95,7 @@ Python学習およびポートフォリオ作成を目的として開発した�
 | Scraping & Parsing | HTTPX, BeautifulSoup4（`lxml`パーサー優先、Playwrightによるオプショナルなレンダリング対応） |
 | SSL Verification | Requests |
 | Server Lookup | socket（正引き・PTR逆引き）, RDAP（`rdap.org`、HTTPX経由） |
+| AI Summarization | Gemini API（`generateContent`、HTTPX経由。既定モデル `gemini-3.5-flash-lite`） |
 | Persistence | SQLite（WALモード） |
 | Data Processing | OpenPyXL (Excel import / export, 列幅・行高の自動調整) |
 | Testing | Pytest |
@@ -103,6 +112,7 @@ PYTHON-WEB-ANALYZER/
 ├── .devcontainer/             # Dev Container / Codespaces 設定
 ├── .github/workflows/ci.yml   # GitHub Actions CI定義
 ├── .streamlit/config.toml     # Streamlitサーバー設定（ポート8502等）
+├── .streamlit/secrets.toml    # （任意・Git管理外）GEMINI_API_KEY の設定
 ├── docs/                      # ドキュメント関連ファイル
 │   ├── images/                # スクリーンショット・アイコン
 │   ├── model_design.md        # クラス設計・モデル設計
@@ -112,10 +122,12 @@ PYTHON-WEB-ANALYZER/
 │   └── web_analyzer/          # アプリケーションソースコード
 │       ├── core/              # コアロジック
 │       │   ├── crawler.py         # クローラー（Web探索・取得・ブロック検知・移転検知）
+│       │   ├── description_enricher.py # 調査結果ExcelのK列（用途）補完
 │       │   ├── evaluator.py       # 評価・判定ロジック
 │       │   ├── excel_service.py   # Excel出力・フォーマット調整
 │       │   ├── job_repository.py  # SQLiteへのジョブ・調査結果の永続化
 │       │   ├── scraper_service.py # 並列スクレイピングオーケストレーション（ThreadPoolExecutor）
+│       │   ├── site_summarizer.py # Gemini APIによるサイト概要の要約
 │       │   ├── ssl_checker.py     # SSL/TLS証明書・リダイレクト検証
 │       │   └── reverse_dns_checker.py # 逆引き・RDAPによるサーバー情報の取得（移転先URL用）
 │       ├── utils/             # 共通ユーティリティ関数
@@ -189,6 +201,17 @@ uv run web-analyzer
 ```
 
 `.streamlit/config.toml` によりポート `8502` で起動します（ブラウザで `http://localhost:8502` を開く）。Dev Container / GitHub Codespaces で開いた場合は、`uv sync` とアプリ起動が自動で実行されます。
+
+### Gemini APIキーの設定（用途(K列)の補完を使う場合のみ）
+
+`.streamlit/secrets.toml` に記載するか、環境変数 `GEMINI_API_KEY` を設定します（`secrets.toml` → 環境変数の順に参照）。Windowsの `setx` で設定した環境変数は、設定前から開いていたターミナル（VS Codeの内蔵ターミナルはVS Code自体の再起動まで）から起動したアプリには反映されないため、`secrets.toml` での設定を推奨します。
+
+```toml
+# .streamlit/secrets.toml
+GEMINI_API_KEY = "your-api-key"
+```
+
+任意で、環境変数 `GEMINI_MODEL`（使用モデル）、`GEMINI_MIN_INTERVAL_SEC`（リクエスト間隔の秒数。既定6秒＝最大10RPM）で調整できます。
 
 実行時には、カレントディレクトリ（プロジェクトルート）配下に `data/jobs.db`（SQLite）、`temp/`（アップロード・出力Excel）、`logs/`（ログファイル）が自動作成されます。
 
