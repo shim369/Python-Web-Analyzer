@@ -5,6 +5,7 @@ import re
 import time
 import warnings
 from collections import deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import cast
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse
 
@@ -77,6 +78,28 @@ class WebCrawler:
     SITEMAP_FALLBACK_MAX_PAGES = 2
     # サイトマップインデックスから読む子サイトマップの最大数
     MAX_CHILD_SITEMAPS = 5
+
+    # 本巡回が時間切れ(self.timeout)で打ち切られ、100ページ未満のまま未訪問の
+    # リンクが残った場合に限り、ページ数を確定させるためだけの追加巡回を行う。
+    # 追加巡回ではCMS判定・フォーム解析等を一切行わずリンク抽出だけに絞り、
+    # 複数ページを並列取得する。本巡回は1ページずつ解析しながら進むため、
+    # 応答の遅いサイトでは150秒で数十ページしか進まず「36以上」のような
+    # 下限値しか出せず、他ツールでページ数を調べ直す手間が発生していた。
+    # 時間予算を本巡回のtimeoutごと延ばすと、並列ワーカー枠を重いサイトが
+    # 長時間占有して全体のスループットが落ちる(scraper_service.py参照)ため、
+    # 時間切れになったサイトにだけ追加予算を与える。
+    # 実測では、ページ数が確定しなかった16サイトの追加巡回は最大75秒で
+    # 終わった(末尾スラッシュ補完・誤った相対リンクの学習を入れた後の値)。
+    # 余裕を見て120秒とする。
+    COUNT_ONLY_EXTRA_TIMEOUT = 120.0
+    # 応答の遅いサーバーにはリクエストを1件ずつしか処理しないものがあり
+    # (実際に確認済み: 単発なら1件約2秒だが、4並列では各リクエストが約7秒、
+    # 8並列では約14秒待たされ、合計の処理時間は並列数によらず変わらなかった)、
+    # 並列数を上げても速くならないうえ、待ち時間が本巡回のpage_timeout(8秒)を
+    # 超えてページを取りこぼし、実行のたびにページ数がぶれる原因になっていた。
+    # 並列数は控えめにし、追加巡回のリクエストに限りタイムアウトを長めに取る。
+    COUNT_ONLY_WORKERS = 3
+    COUNT_ONLY_PAGE_TIMEOUT = 20.0
 
     # お問い合わせフォームもmailtoリンクも見つからなかった場合にL列(問合せ項目)に出す文言
     NO_CONTACT_FORM_TEXT = "問い合わせフォームなし"
@@ -1157,6 +1180,28 @@ class WebCrawler:
             return "ブラウザでのページ表示に失敗したため、実際のサイト内容を取得できませんでした。手動確認をお願いします。"
 
         return ""
+
+    def _collect_link_candidates(self, soup: BeautifulSoup, html: str, resolved_url: str) -> list[str]:
+        """ページ内から巡回候補となるhref(未検証・未解決のまま)を集める。
+
+        本巡回とページ数カウント専用の追加巡回とで、拾うリンクの範囲を揃えるために共通化している。
+        """
+        candidate_hrefs = [link["href"] for link in soup.find_all("a", href=True)]
+        candidate_hrefs.extend([f.get("src") for f in soup.find_all("frame") if f.get("src")])
+        candidate_hrefs.extend(self._extract_js_links(html))
+
+        # meta refresh/JSタイマーによる遷移先が同一ドメイン内の場合、
+        # 通常のリンクと同様に巡回対象へ加える。
+        # (実際に確認済み: トップページがPC/モバイル振り分け等の
+        # 目的で同一ドメイン内の実コンテンツURLへ即座にmeta refresh
+        # するだけの薄いページになっていることがあり、この遷移先を
+        # 無視すると<a href>が1件も無いページとして扱われ、
+        # 実際には多数のページを持つサイトが「1階層1ページ」という
+        # 誤った結果になっていた)
+        delayed_redirect_target = self._extract_delayed_redirect_target(html, resolved_url)
+        if delayed_redirect_target:
+            candidate_hrefs.append(delayed_redirect_target)
+        return candidate_hrefs
 
     # ------------------------------------------------------------------
     # JS遷移リンクの検知
@@ -2455,6 +2500,8 @@ class WebCrawler:
         canonical_visited: set[str] = set()
         queued_urls: set[str] = set()
         queue: deque[tuple[str, int]] = deque()
+        # 本巡回でタイムアウトしたページ(追加巡回で取り直す)
+        timed_out_urls: list[str] = []
         is_over_100 = False
 
         max_depth = 0
@@ -2549,9 +2596,51 @@ class WebCrawler:
                 netloc = re.sub(r"^www\.", "", base_domain_clean, flags=re.IGNORECASE)
             return p._replace(scheme=scheme, netloc=netloc).geturl()
 
-        def enqueue(url: str, path_depth: int, priority: bool) -> None:
+        # ナビゲーション等のリンクが href="privacy/" のような素の相対パスで書かれた
+        # サイトでは、ページを開くたびに "/elements/privacy/", "/company/privacy/"...
+        # という実在しないURLが生まれ、WordPressの「近いスラッグへの自動リダイレクト」で
+        # 結局 "/privacy/" に着地する(実際に確認済み: リクエストの4割以上がこの
+        # リダイレクトで、応答の遅いサーバーでは時間予算を使い切ってページ数が
+        # 確定しなかった)。着地先は既訪問として数えられないため集計結果は正しいが、
+        # 1ページごとにナビ項目の数だけ無駄なリクエストが発生する。
+        # 着地先はルート直下とは限らず、"/contact/forged_steel_valves/" が
+        # "/product_introduction/forged_steel_valves/" のように別階層の実ページへ
+        # 転送されることもある(実際に確認済み: ナビ約25項目がすべて素の相対リンクの
+        # サイトで、追加巡回に600秒かけてもページ数が確定しなかった)。
+        # 「最後のパス要素が同じまま別のパスへ転送された」リダイレクトを一度観測したら、
+        # 最後のパス要素がそれと同じで、着地先とは異なるパスのURLはそれ以降巡回候補にしない。
+        # ただし対象は href="privacy/" のような素の相対リンク(先頭が"/"でもスキームでも
+        # ないもの)から生まれたURLに限る。"/contact-shinko/industry" のように別階層に
+        # 同名の実ページがあるサイトで、"/"始まりや絶対URLで書かれた正規のリンクまで
+        # 除外してしまい、ページ数を過少に数えていた(実際に確認済み)。
+        misresolved_segments: dict[str, str] = {}  # 最後のパス要素 -> 着地先のパス
+        # 素の相対リンクから生まれたURLと、それ以外("/"始まり・絶対URL等)のリンクから
+        # 見つかったURL(いずれも_dedup_keyの値)。後者でも見つかったURLは正規の
+        # リンク先とみなし、除外しない。
+        bare_relative_keys: set[str] = set()
+        explicit_link_keys: set[str] = set()
+
+        def _is_misresolved_relative_link(url: str) -> bool:
             key = _dedup_key(url)
+            if key not in bare_relative_keys or key in explicit_link_keys:
+                return False
+            path = urlparse(url).path.rstrip("/")
+            last_segment = path.rsplit("/", 1)[-1]
+            landing_path = misresolved_segments.get(last_segment)
+            return landing_path is not None and path != landing_path
+
+        def _is_bare_relative_href(href: str) -> bool:
+            return not re.match(r"^\s*(/|[a-zA-Z][a-zA-Z0-9+.-]*:|#|\?)", href)
+
+        def enqueue(url: str, path_depth: int, priority: bool, bare_relative: bool = False) -> None:
+            key = _dedup_key(url)
+            if bare_relative:
+                bare_relative_keys.add(key)
+            else:
+                explicit_link_keys.add(key)
             if key in visited or key in queued_urls or len(canonical_visited) >= 100:
+                return
+            if _is_misresolved_relative_link(url):
                 return
             queued_urls.add(key)
             if priority:
@@ -2758,6 +2847,37 @@ class WebCrawler:
                     except httpx.RequestError:
                         pass
 
+                # normalize_url()は末尾スラッシュを削るため、WordPress等の「/about →
+                # /about/ へ301」するサイトでは全ページで301→200の2往復が発生し、
+                # 応答の遅いサーバーでは巡回時間の約半分をリダイレクトに費やしていた
+                # (実際に確認済み: 186リクエスト中94件が末尾スラッシュ補完の301)。
+                # 一度でもそのリダイレクトを観測したサイトでは、以降は拡張子の無い
+                # パスに最初から末尾スラッシュを付けてリクエストする。付けた結果
+                # 404になった場合は元のURLで取り直す。リクエストするURLを変える
+                # だけで、重複判定・ページ数の数え方(normalize_url/_dedup_key)は変えない。
+                prefers_trailing_slash = False
+
+                def _get_page(url: str, headers: dict[str, str] | None = None, timeout: float | None = None) -> httpx.Response:
+                    nonlocal prefers_trailing_slash
+                    target = url
+                    parsed = urlparse(url)
+                    if prefers_trailing_slash and parsed.path and not parsed.path.endswith("/") and "." not in parsed.path.rsplit("/", 1)[-1]:
+                        target = parsed._replace(path=parsed.path + "/").geturl()
+                    response = client.get(target, headers=headers, timeout=timeout or self.page_timeout)
+                    if target != url and response.status_code == 404:
+                        response = client.get(url, headers=headers, timeout=timeout or self.page_timeout)
+                    if response.history:
+                        final = urlparse(str(response.url))
+                        if not prefers_trailing_slash and final.path == parsed.path + "/" and final.query == parsed.query:
+                            prefers_trailing_slash = True
+                        # 素の相対リンクの誤解決(misresolved_segmentsのコメント参照)の学習
+                        requested_path = parsed.path.rstrip("/")
+                        final_path = final.path.rstrip("/")
+                        last_segment = final_path.rsplit("/", 1)[-1]
+                        if last_segment and requested_path != final_path and requested_path.rsplit("/", 1)[-1] == last_segment:
+                            misresolved_segments.setdefault(last_segment, final_path)
+                    return response
+
                 queue.append((first_url, 0))
                 queued_urls.add(_dedup_key(first_url))
 
@@ -2796,7 +2916,7 @@ class WebCrawler:
                     queued_urls.discard(_dedup_key(current_url))
                     norm_current = normalize_url(current_url)
 
-                    if _dedup_key(norm_current) in visited:
+                    if _dedup_key(norm_current) in visited or _is_misresolved_relative_link(norm_current):
                         continue
 
                     try:
@@ -2816,7 +2936,7 @@ class WebCrawler:
                             resolved_url = first_url
                         else:
                             try:
-                                response = client.get(current_url, headers=req_headers)
+                                response = _get_page(current_url, req_headers)
                             except httpx.RequestError:
                                 # https接続自体が失敗した(SSL証明書不備・ハンドシェイク
                                 # 失敗等)場合、トップページ自体はhttpsで200が返っていても、
@@ -2832,7 +2952,7 @@ class WebCrawler:
                                 if not current_url.startswith("https://"):
                                     raise
                                 current_url = "http://" + current_url[len("https://") :]
-                                response = client.get(current_url, headers=req_headers)
+                                response = _get_page(current_url, req_headers)
                             if response.status_code == 401:
                                 has_basic_auth = True
                             if response.status_code != 200:
@@ -3225,22 +3345,8 @@ class WebCrawler:
 
                         # 内部リンク巡回
                         anchor_tags = soup.find_all("a", href=True)
-                        candidate_hrefs = [link["href"] for link in anchor_tags]
                         contact_text_hrefs = {link["href"] for link in anchor_tags if self.CONTACT_LINK_TEXT_RE.search(link.get_text(" ", strip=True))}
-                        candidate_hrefs.extend([f.get("src") for f in soup.find_all("frame") if f.get("src")])
-                        candidate_hrefs.extend(self._extract_js_links(current_html))
-
-                        # meta refresh/JSタイマーによる遷移先が同一ドメイン内の場合、
-                        # 通常のリンクと同様に巡回対象へ加える。
-                        # (実際に確認済み: トップページがPC/モバイル振り分け等の
-                        # 目的で同一ドメイン内の実コンテンツURLへ即座にmeta refresh
-                        # するだけの薄いページになっていることがあり、この遷移先を
-                        # 無視すると<a href>が1件も無いページとして扱われ、
-                        # 実際には多数のページを持つサイトが「1階層1ページ」という
-                        # 誤った結果になっていた)
-                        delayed_redirect_target = self._extract_delayed_redirect_target(current_html, resolved_url)
-                        if delayed_redirect_target:
-                            candidate_hrefs.append(delayed_redirect_target)
+                        candidate_hrefs = self._collect_link_candidates(soup, current_html, resolved_url)
 
                         for href in candidate_hrefs:
                             if self._is_valid_internal_link(resolved_url, href, base_domain_clean):
@@ -3274,12 +3380,106 @@ class WebCrawler:
                                         "account",
                                     ),
                                 )
-                                enqueue(norm_abs, path_depth, is_priority)
+                                enqueue(norm_abs, path_depth, is_priority, _is_bare_relative_href(href))
 
                         time.sleep(0.04)
 
+                    except httpx.TimeoutException:
+                        timed_out_urls.append(norm_current)
+                        continue
                     except httpx.RequestError:
                         continue
+
+                # 本巡回でpage_timeoutを超えて取得できなかったページは、そのまま
+                # 捨てるとページ数が実行のたびにぶれる(実際に確認済み: 応答の遅い
+                # サーバーで同じサイトが77ページになったり72ページになったりした)。
+                # 未訪問扱いに戻し、タイムアウトを長めに取る追加巡回で取り直す。
+                for timed_out_url in timed_out_urls:
+                    visited.discard(_dedup_key(timed_out_url))
+                    enqueue(timed_out_url, 0, False)
+
+                # 本巡回が時間切れで打ち切られた(100ページ未満のまま未訪問のリンクが
+                # 残っている)場合、ページ数を確定させるためだけの追加巡回を行う。
+                # 重複排除(visited/canonical_visited/_dedup_key)とリンクの採否判定
+                # (_is_valid_internal_link/enqueue)は本巡回と共通のものを使い、
+                # 数え方自体は本巡回と変えない。階層数(max_depth)はここでは更新しない
+                # (後述のdisplay_depthのコメント参照)。
+                if queue and len(canonical_visited) < 100:
+                    count_deadline = time.time() + self.COUNT_ONLY_EXTRA_TIMEOUT
+                    logger.info(
+                        "%dページを数えた時点で未訪問リンクが%d件残っているため、ページ数カウント専用の追加巡回を行います: %s",
+                        len(canonical_visited),
+                        len(queue),
+                        first_url,
+                    )
+
+                    def _fetch_for_count(url: str) -> tuple[str, str] | None:
+                        try:
+                            try:
+                                response = _get_page(url, timeout=self.COUNT_ONLY_PAGE_TIMEOUT)
+                            except httpx.RequestError:
+                                # 本巡回と同様、https接続自体が失敗した場合は1回だけhttpを試す
+                                if not url.startswith("https://"):
+                                    return None
+                                url = "http://" + url[len("https://") :]
+                                response = _get_page(url, timeout=self.COUNT_ONLY_PAGE_TIMEOUT)
+                            if response.status_code != 200:
+                                return None
+                            response = self._retry_if_path_dropped(client, url, response, dict(self.headers))
+                            return str(response.url), self._decode_response(response)
+                        except Exception:
+                            # 1ページの取得失敗で追加巡回全体(ひいてはクロール結果全体)を止めない
+                            return None
+
+                    def _next_count_target() -> str | None:
+                        """キューから次に取得すべきURLを取り出す(既訪問等で読み飛ばしたものは返さない)。"""
+                        while queue:
+                            url, _depth = queue.popleft()
+                            queued_urls.discard(_dedup_key(url))
+                            norm_url = normalize_url(url)
+                            if _dedup_key(norm_url) in visited or _is_misresolved_relative_link(norm_url):
+                                continue
+                            visited.add(_dedup_key(norm_url))
+                            if self._has_repeating_path_pattern(urlparse(norm_url).path):
+                                continue
+                            return url
+                        return None
+
+                    # 数件ずつまとめて取得して全件の完了を待つ方式だと、応答の遅い1件に
+                    # 他のワーカーが待たされるため、1件完了するたびに次のURLを投入する。
+                    # 時間予算を使い切った後は新規投入だけを止め、取得中のものは結果を
+                    # 反映してから終える(取り出し済みのURLの結果を捨てると、キューが
+                    # 空になって「巡回し尽くした」と誤判定されうるため)。
+                    with ThreadPoolExecutor(max_workers=self.COUNT_ONLY_WORKERS) as pool:
+                        in_flight: set[Future[tuple[str, str] | None]] = set()
+                        while True:
+                            while len(in_flight) < self.COUNT_ONLY_WORKERS and len(canonical_visited) < 100 and time.time() < count_deadline:
+                                next_url = _next_count_target()
+                                if next_url is None:
+                                    break
+                                in_flight.add(pool.submit(_fetch_for_count, next_url))
+                            if not in_flight:
+                                break
+                            done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+                            for future in done:
+                                result = future.result()
+                                if result is None or len(canonical_visited) >= 100:
+                                    continue
+                                resolved_url, page_html = result
+                                resolved_key = _dedup_key(normalize_url(resolved_url))
+                                if resolved_key in canonical_visited:
+                                    continue
+                                canonical_visited.add(resolved_key)
+
+                                page_soup = BeautifulSoup(page_html, HTML_PARSER)
+                                for href in self._collect_link_candidates(page_soup, page_html, resolved_url):
+                                    if self._is_valid_internal_link(resolved_url, href, base_domain_clean):
+                                        norm_abs = normalize_url(urljoin(resolved_url, href))
+                                        path_depth = len([p for p in urlparse(norm_abs).path.split("/") if p])
+                                        enqueue(norm_abs, path_depth, False, _is_bare_relative_href(href))
+
+                    if len(canonical_visited) >= 100:
+                        is_over_100 = True
 
                 # サイト内でお問い合わせフォームが見つからなかった場合、別ドメインに
                 # あるお問い合わせページ(例: 共用SSLホストのcontact.html)のフォームを拾う。
