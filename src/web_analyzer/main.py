@@ -6,9 +6,11 @@ from pathlib import Path
 
 import streamlit as st
 
+from web_analyzer.core.description_enricher import DescriptionEnricher
 from web_analyzer.core.excel_service import ExcelService
 from web_analyzer.core.job_repository import JobRepository
 from web_analyzer.core.scraper_service import SiteScraperService
+from web_analyzer.core.site_summarizer import SiteSummarizer
 from web_analyzer.models import ScrapingJob
 from web_analyzer.utils.logger import setup_logger
 
@@ -45,6 +47,126 @@ def get_scraper_service() -> SiteScraperService:
     if interrupted_job_ids:
         logger.warning(f"前回異常終了した中断ジョブを検知しました: {interrupted_job_ids}")
     return SiteScraperService(repository=repository)
+
+
+def resolve_gemini_api_key() -> str:
+    """GeminiのAPIキーを .streamlit/secrets.toml → 環境変数 の順に探す。
+
+    Windowsの setx で設定した環境変数は、設定より前から開いていたターミナル
+    (VS Codeの内蔵ターミナルはVS Code自体を再起動するまで)から起動したアプリには
+    反映されない。起動方法に左右されずに設定できるよう、secrets.toml も見る。
+    """
+    try:
+        key = str(st.secrets.get("GEMINI_API_KEY", ""))
+    except FileNotFoundError:  # secrets.toml が無い場合(StreamlitSecretNotFoundError)
+        key = ""
+    return (key or os.environ.get("GEMINI_API_KEY", "")).strip()
+
+
+@st.cache_resource(show_spinner=False)
+def get_description_enricher(api_key: str) -> DescriptionEnricher:
+    """K列補完の処理とジョブ状態を、調査サービスと同様にプロセス全体で共有する。
+
+    APIキーを引数に取ることで、キーを後から設定・変更した場合は
+    キャッシュ済みの(キー無しの)インスタンスではなく新しいものが作られる。
+    """
+    return DescriptionEnricher(summarizer=SiteSummarizer(api_key=api_key))
+
+
+MODE_SCRAPE = "サイト調査"
+MODE_ENRICH = "用途(K列)の補完"
+
+
+def render_enrichment_page() -> None:
+    """完成した調査結果Excelに対して、K列「用途」をGeminiの要約で補完する画面。"""
+    enricher = get_description_enricher(resolve_gemini_api_key())
+
+    st.markdown('<div class="main-title">用途(K列)の補完</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="sub-title">調査結果Excelのうち、K列「用途」が社名だけなど内容の分かりにくい行について、サイトを取り直してGeminiで100文字前後のサイト概要に要約し、K列を書き換えます。</div>',
+        unsafe_allow_html=True,
+    )
+
+    if not enricher.summarizer.enabled:
+        st.error("GeminiのAPIキーが見つかりません。.streamlit/secrets.toml に GEMINI_API_KEY を記載するか、環境変数 GEMINI_API_KEY を設定してください（環境変数の場合は、設定後に開き直したターミナルからアプリを起動する必要があります）。")
+        return
+
+    if "enrich_job_id" not in st.session_state:
+        st.session_state.enrich_job_id = st.query_params.get("enrich_job_id")
+
+    enrich_job_id = st.session_state.enrich_job_id
+    job = enricher.get_job(enrich_job_id) if enrich_job_id else None
+
+    def clear_enrich_job() -> None:
+        st.session_state.enrich_job_id = None
+        if "enrich_job_id" in st.query_params:
+            del st.query_params["enrich_job_id"]
+        st.rerun()
+
+    if job is None:
+        uploaded = st.file_uploader(
+            "調査結果Excel（このツールで出力したファイル）を選択、またはドラッグ＆ドロップしてください",
+            type=["xlsx"],
+            key=f"enrich_uploader_{st.session_state.get('enrich_uploader_key', 0)}",
+        )
+        force_all = st.checkbox(
+            "全行を要約し直す（文体をそろえたい場合）",
+            value=False,
+            help=f"オフの場合は、K列が空欄・{DescriptionEnricher.MIN_DESCRIPTION_CHARS}文字未満・社名やキーワードを区切り記号で並べただけの行のみ要約します。",
+        )
+        if uploaded and st.button("K列の補完を開始する", use_container_width=True, type="primary"):
+            # 同名ファイルを同時・連続で処理しても衝突しないよう、実行ごとに専用フォルダを切る
+            work_dir = Path("temp") / f"enrich_{datetime.now().strftime('%Y%m%d%H%M%S_%f')}"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            input_path = work_dir / "input.xlsx"
+            input_path.write_bytes(uploaded.getbuffer())
+            # 補完済みファイルに再度かけた場合に「_用途補完_用途補完」と重ならないようにする
+            base_name = Path(uploaded.name).stem.removesuffix("_用途補完")
+            output_path = work_dir / f"{base_name}_用途補完.xlsx"
+
+            new_job = enricher.start_background_job(input_path, output_path, force_all=force_all)
+            st.session_state.enrich_job_id = new_job.id
+            st.query_params["enrich_job_id"] = new_job.id
+            st.session_state.enrich_uploader_key = st.session_state.get("enrich_uploader_key", 0) + 1
+            st.rerun()
+        return
+
+    st.markdown("---")
+    percent = int(job.done / job.total * 100) if job.total else 0
+    st.progress(percent if job.status == "processing" else 100)
+
+    if job.status == "processing":
+        st.info(f"要約中... ({job.done}/{job.total} 件完了)")
+        time.sleep(1.5)
+        st.rerun()
+
+    elif job.status == "completed" and job.result and job.result.output_path:
+        result = job.result
+        result_path: Path = job.result.output_path
+        st.success(f"K列の補完が完了しました。（全 {result.total_rows}件中、対象 {result.target_rows}件 / 要約 {result.summarized}件）")
+        if result.failed_domains:
+            st.warning(f"{len(result.failed_domains)}件は要約できなかったため、元の値のままです（サイトに接続できない、またはGeminiの利用上限に達した可能性があります）。出力したファイルにもう一度かけると、残りの行だけが対象になります。")
+            with st.expander("要約できなかったサイト"):
+                st.write("\n".join(f"- {d}" for d in result.failed_domains))
+
+        d_col1, d_col2 = st.columns([2, 1])
+        with d_col1:
+            st.download_button(
+                label="補完済みExcelをダウンロード",
+                data=result_path.read_bytes(),
+                file_name=result_path.name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                type="primary",
+            )
+        with d_col2:
+            if st.button("結果表示をクリア", use_container_width=True, key="clear_btn_enrich", type="secondary"):
+                clear_enrich_job()
+
+    else:
+        st.error(f"K列の補完中にエラーが発生しました: {job.error}")
+        if st.button("画面をクリアしてやり直す", key="clear_btn_enrich_failed", type="secondary"):
+            clear_enrich_job()
 
 
 # UIスタイリング
@@ -139,6 +261,9 @@ if "current_job_id" not in st.session_state:
 
 # 3. サイドバーの設定
 with st.sidebar:
+    mode = st.radio("機能", [MODE_SCRAPE, MODE_ENRICH], key="app_mode")
+    st.markdown("---")
+
     st.markdown("### 解析設定")
     st.write("担当者名を設定してください。")
 
@@ -176,6 +301,11 @@ with st.sidebar:
         * アニメーション
         """
     )
+
+# K列補完はサイト調査とは独立した画面として表示する(調査ジョブはその間もバックグラウンドで継続する)
+if mode == MODE_ENRICH:
+    render_enrichment_page()
+    st.stop()
 
 # 4. メインコンテンツエリア
 st.markdown('<div class="main-title">Web Site Analyzer</div>', unsafe_allow_html=True)

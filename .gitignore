@@ -19,3 +19,6 @@ logs/
 temp/
 
 data/
+
+# Streamlit secrets (GEMINI_API_KEY etc.)
+.streamlit/secrets.toml
