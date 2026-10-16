@@ -86,9 +86,13 @@ Python学習およびポートフォリオ作成を目的として開発した�
 
 ## Screenshots
 
-### Main Window
+### サイト調査
 
-![Web Site Analyzer](docs/images/main.png)
+![サイト調査](docs/images/main1.png)
+
+### 用途・構成のAI補完
+
+![用途・構成のAI補完](docs/images/main2.png)
 
 ---
 

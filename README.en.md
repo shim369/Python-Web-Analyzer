@@ -86,9 +86,13 @@ The frontend is built with Streamlit. By coordinating `st.rerun()` with a backgr
 
 ## Screenshots
 
-### Main Window
+### Site Survey
 
-![Web Site Analyzer](docs/images/main.png)
+![Site Survey](docs/images/main1.png)
+
+### AI Enrichment of Purpose and Structure
+
+![AI Enrichment of Purpose and Structure](docs/images/main2.png)
 
 ---
 
