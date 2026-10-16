@@ -31,7 +31,7 @@ Excelの1行分の解析・調査結果を保持するミュータブル（可�
 * `is_always_ssl`: SSL常時 (E列 - `http://` から `https://` への自動リダイレクトが確認できれば **`◯`**、そうでなければ **`×`**、判定不能時は空欄)
 * `max_depth`: 階層数 (F列 - `int | None` 型。ただし実際にクローラーから返る値は `int` または文字列 **`"要確認"`**（階層10超過時）であるため、この列には数値以外の文字列が入り得る点に注意)
 * `svcmd`: svcmd (G列 - 常に**空欄**を維持)
-* `site_structure`: 構成 (H列 - 自動検出したグローバルナビゲーションのメニューテキストを最大10件、**改行区切り**で格納。多言語切り替えメニュー等は除外)
+* `site_structure`: 構成 (H列 - `WebCrawler._extract_global_nav_menus()`で自動検出したグローバルナビゲーションのメニューテキストを最大10件、**改行区切り**で格納。多言語切り替えメニュー等は除外。取り損ねた値は出力後のExcelに対して`DescriptionEnricher`（3.4節）でAIに選ばせたメニューに書き換えられる)
 * `total_pages`: ページ数 (I列 - `int | None` 型。巡回できた総ページ数。接続失敗時は `0`（Excelでは空欄）。※クロール中に100ページへ到達した場合はクローラーが `"100以上"`、時間切れで途中終了した場合は確認できた件数の下限値として `"36以上"` のような `"{数値}以上"` 形式の文字列を返す。`SiteScraperService`は判定には`parse_lower_bound()`で数値化した値を使いつつ、`total_pages`には`"{数値}以上"`の文字列をそのまま格納する（型ヒント上は`int | None`のため`# type: ignore`で代入している）)
 * `cms_name`: 使用CMS (J列 - HTMLシグネチャから幅広い国内外CMSを多角的に判定。WordPress, baserCMS, EC-CUBE, Movable Type, MODX, Drupal, Joomla!, TYPO3, Concrete CMS（旧concrete5）, DNN (DotNetNuke), XOOPS, NetCommons, PowerCMS, Craft CMS, Sitecore, Kentico, SilverStripe, Jimdo, Wix, Shopify, ColorMe Shop, MakeShop, futureshop, a-blog cms, RCMS, HeartCore, BlueMonkey, BiNDup 等の約30種を検知し、非CMSなら空文字列。WordPressは`"WP"`として出力される)
 * `description`: 用途 (K列 - メタディスクリプション ➔ `<title>` ➔ `<h1>` の優先度順で抽出したWebサイトの概要文。**現状のコードには文字数の切り詰め処理はなく、抽出した文字列がそのまま格納される**。社名だけ等で内容の分かりにくい値は、出力後のExcelに対して`DescriptionEnricher`（3.4節）でGeminiの要約に書き換えられる。調査本体の処理では書き換えない）
@@ -170,24 +170,32 @@ Google Map埋め込みは、ほぼすべてのコーポレートサイトのア�
 * `socket.gethostbyaddr()`によるPTR逆引きのホスト名（例: `sv14061.xserver.jp`）と、RDAP（`https://rdap.org/ip/{ip}`。管轄レジストリへリダイレクトされる）によるIPアドレスの管理組織名を取得する。管理組織名は`registrant`ロールのエンティティの`fn`、無ければ`remarks`の先頭（JPNIC配下）、それも無ければネットワーク名で代用する。
 * 戻り値は`"{ホスト名}（{組織名}）"`形式。片方しか取れなければ取れた方だけ、どちらも取れなければ空文字列を返す（呼び出し元で「取得できませんでした」に読み替える）。判定結果（C列）には一切影響せず、備考欄への付加情報にとどまる。
 
-### 3.4. `DescriptionEnricher`（K列「用途」の補完）
+### 3.4. `DescriptionEnricher`（用途・構成のAI補完とページ数の再計測）
 
-完成した調査結果Excelに対して、K列「用途」が社名だけ等で内容の分かりにくい行を`SiteSummarizer`の要約で書き換える。調査本体（`SiteScraperService`）とは独立しており、`main.py`の「用途(K列)の補完」画面から`st.cache_resource`（APIキーを引数に取り、キー変更時は新しいインスタンスを生成）で共有されたインスタンスが呼ばれる。
+完成した調査結果Excelに対して、K列「用途」が社名だけ等で内容の分かりにくい行を`SiteSummarizer`の要約で書き換え、H列「構成」がグローバルナビを取り損ねた行をAIに選ばせたメニューで埋め、I列「ページ数」が時間切れで確定しなかった行を再計測する。調査本体（`SiteScraperService`）とは独立しており、`main.py`の「用途・構成のAI補完」画面から`st.cache_resource`（APIキーを引数に取り、キー変更時は新しいインスタンスを生成）で共有されたインスタンスが呼ばれる。
 
 * `needs_summary(text)`: 空欄・`MIN_DESCRIPTION_CHARS`（40）文字未満、または句点（`。`）が無く`|`/`｜`/`／`/`/`/` - `等の区切り記号を含む「名前・キーワードの羅列」を要約対象と判定する。
-* `find_targets(ws, force_all)`: ヘッダー行の「サイト名」「用途」から列を特定し（見つからなければB列/K列）、(データ行数, 対象行のリスト)を返す。`force_all=True`なら全行が対象。
-* `enrich_file(input_path, output_path, force_all, progress_callback)`: `ThreadPoolExecutor`（`MAX_WORKERS = 5`）で対象行のサイトを並列に取り直して要約し、元のワークブックの書式を保ったまま値と行の高さ（縮めはしない）だけを更新して保存する。要約できたセルは淡い黄色（`FFF2CC`）、できなかったセルは淡いピンク（`FFE5EC`）で塗る。要約済みの行は判定条件に引っかからないため、出力ファイルに再度かければ失敗した行だけが対象になる。
+* `needs_structure(text)`: 改行区切りの項目が`MIN_STRUCTURE_ITEMS`（3）未満、または`SUSPICIOUS_STRUCTURE_RE`（電話番号・`@`・`↗`・コピーライト表記）にマッチする項目を含む場合に構成の補完対象と判定する。
+* `needs_page_recount(value)`: `RenewalEvaluator.parse_lower_bound()`で「{数値}以上」かつ0より大きく`PAGE_COUNT_CAP`（100）未満の値を再計測対象と判定する。
+* `find_targets(ws, force_all, fill_purpose, fill_structure, recount_pages)`: ヘッダー行の「サイト名」「用途」「構成」「ページ数」「調査結果」「不可の理由」「備考」から列を特定し（見つからなければB/K/H/I/C/M/N列）、(データ行数, `EnrichmentTarget`のリスト)を返す。各`EnrichmentTarget`は`needs_purpose`/`needs_structure`/`needs_pages`で列ごとの対象かどうかを持つ。`force_all=True`なら用途・構成は全行が対象（ページ数は「{数値}以上」の行のみ）。M列が`ALREADY_RENEWED_REASON`（すでにリニューアル済）を含む行は常に対象外。
+* `count_targets(source)`: アップロード直後の画面表示用に、列ごとの対象件数（`TargetCounts`）を数える。
+* `enrich_file(input_path, output_path, force_all, progress_callback, fill_purpose, fill_structure, recount_pages)`: `ThreadPoolExecutor`（`MAX_WORKERS = 5`）で対象行を並列に処理し、元のワークブックの書式を保ったまま値と行の高さ（縮めはしない）だけを更新して保存する。補完できたセルは淡い黄色（`FFF2CC`）、できなかったセルは淡いピンク（`FFE5EC`）で塗る。補完済みの行は判定条件に引っかからないため、出力ファイルに再度かければ失敗した行だけが対象になる。結果は`EnrichmentResult`（列ごとの対象件数・補完件数・失敗サイト、`rate_limited_domains`、`pages_confirmed`、`pages_unconfirmed_domains`、`judgement_updated`）で返す。
+* `enrich_row(target)`: 1行分の処理。構成が対象なら`fetch_site_pages()`を1回だけ呼び、同じHTMLで要約（用途も対象の場合）と`select_structure()`を行う。静的HTMLにメニューの候補が1つも無い場合に限り、`render_top_page()`でPlaywright描画したトップページで判定し直す。処理の前後で`SiteSummarizer.pop_rate_limited()`を呼び、利用上限のためにAIを呼べなかった行を`RowResult.rate_limited`で報告する。
+* `select_structure(domain, top_html)`: `WebCrawler._extract_global_nav_menus()`（調査本体と同じルール）の結果と`WebCrawler.collect_nav_candidates()`（ページ内のメニューのリスト、最大12件）を候補にし、`_clean_structure_items()`で電話番号・SNS等を除いて3項目未満になった候補を捨てた上で、`SiteSummarizer.select_global_nav()`に番号で選ばせる。項目名はサイト上の文字をそのまま使う。API呼び出しに失敗した場合はルールで取れた結果を使い、AIが「該当なし」と答えた場合は空にする。
+* `recount_pages(domain)`: `WebCrawler(render_js=True, timeout=RECOUNT_TIMEOUT(300), page_timeout=RECOUNT_PAGE_TIMEOUT(15))`の`COUNT_ONLY_EXTRA_TIMEOUT`を`RECOUNT_EXTRA_TIMEOUT`（300）に延ばして`crawl_and_analyze()`を呼び、`RenewalEvaluator.decide()`で判定し直した`PageRecount`を返す（ブロック・移転案内・ページ数0の場合は`None`）。`_write_page_recount()`は、時間切れで「要確認」だった行のC/M/N列を判定し直した結果で上書きし、既に「×」の行はページ数が`PAGE_THRESHOLD`（10）を超えたことが新たに分かった場合だけM列に「ページ数が多いため」を追記する。
 * `fetch_site_pages(domain)`: `https://`→`http://`→（`www.`無しの入力なら）`www.`付きの順でトップページを取得し、JSフレームワーク／空のSPAシェルを検知した場合は`WebCrawler._fetch_rendered_html()`で描画し直す。`_find_profile_links()`でリンクテキスト（「会社概要」「事業内容」等）優先、次いで同一サイト内のURL（`about`/`company`等）で会社概要らしいページを最大`MAX_PROFILE_PAGES`（2）件探して取得する。リンクテキストが明確に会社情報を指す場合に限り別ドメイン（例: 製品サイトから企業サイト）も辿る。
 * `start_background_job()` / `get_job()`: デーモンスレッドで`enrich_file`を実行し、`EnrichmentJob`（`status`: `processing`/`completed`/`failed`、`done`/`total`、`EnrichmentResult`）を`threading.Lock`配下で更新する。ジョブ状態はメモリ上のみで、SQLiteには永続化しない。
 
-### 3.5. `SiteSummarizer`（Gemini APIによる要約）
+### 3.5. `SiteSummarizer`（Gemini APIによる要約・グローバルナビの選択）
 
-トップページ・会社概要ページのHTMLから本文を抜き出し、Gemini API（`generateContent`、HTTPXで直接呼び出し）で100文字前後の「サイト概要」に要約する。
+トップページ・会社概要ページのHTMLから本文を抜き出し、Gemini API（`generateContent`、HTTPXで直接呼び出し）で100文字前後の「サイト概要」に要約する。あわせて、構成列の補完のためにグローバルナビにあたるメニューのリストを選ばせる。
 
 * APIキーはコンストラクタ引数、無ければ環境変数`GEMINI_API_KEY`（`main.py`は`.streamlit/secrets.toml`→環境変数の順に探したキーを渡す）。モデルは環境変数`GEMINI_MODEL`（既定`gemini-3.5-flash-lite`）。キーが無い場合は`enabled == False`となり、画面側でエラーを表示する。
 * `build_source_text()`: 各ページから`script`/`style`/`nav`/`header`/`footer`/`form`等を除いた本文を1ページ最大1500文字抜き出し、`<title>`/`<h1>`の見出しと合わせて連結する。プロンプトには現在のK列の値も手がかりとして渡す。
 * レート制御: クラス変数のロックで全スレッド共通に、前回リクエストから`GEMINI_MIN_INTERVAL_SEC`（既定6秒＝最大10RPM）以上空ける。429は20秒待って最大2回再試行し、それでも429なら`QUOTA_COOLDOWN_SEC`（600秒）のあいだ要約をスキップする（1日の上限到達時に無駄な待ち時間で処理全体を遅らせないため）。
 * 失敗時は例外を投げず空文字を返し、呼び出し側（`DescriptionEnricher`）は元の値を残す。出力からは改行・前後の引用符を除去する。
+* `select_global_nav(domain, candidates)`: 番号付きのメニューのリストを渡し、`NAV_SELECT_INSTRUCTION`（外部リンク集・SNS・記事一覧・製品名だけの一覧・規約類だけのリスト・パンくずを選ばず、補助的な小さなメニューよりメインのメニューを選ぶ等）に従って番号だけを答えさせる。戻り値は候補の添字（0始まり）、AIが「0」（該当なし）と答えた場合は`NO_GLOBAL_NAV`（-1）、API呼び出しの失敗・解釈できない回答・範囲外の番号は`None`。`_generate()`はシステム指示を引数で切り替える（既定は要約用の`SUMMARY_INSTRUCTION`）。
+* `pop_rate_limited()`: 利用上限（429が続いた・クールダウン中）のためにAPIを呼べなかったことを`threading.local`でスレッドごとに記録しておき、呼び出し側が確認して記録を消す。`summarize()`等は失敗しても空文字を返すだけのため、失敗の原因が上限かどうかを区別するのに使う。
 
 ## 4. ユーティリティ層 (`utils/`)
 
