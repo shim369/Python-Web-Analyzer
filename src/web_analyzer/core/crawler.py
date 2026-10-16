@@ -3065,6 +3065,86 @@ class WebCrawler:
             landing_path = misresolved_segments.get(last_segment)
             return landing_path is not None and path != landing_path
 
+        def _slugify_path(path: str) -> str:
+            """WordPressがスラッグを作るときと同様に、英数字以外を"-"に寄せたパスを返す。
+
+            静的サイトからWordPressへ移行したサイトでは、旧URLの"privacy.html"が
+            スラッグ"privacy-html"のページになっている(実際に確認済み)。
+            """
+            segments = [re.sub(r"[^a-z0-9%]+", "-", s.lower()).strip("-") for s in path.split("/") if s]
+            return "/" + "/".join(segments)
+
+        # サイトの引っ越しで残った旧ディレクトリへのリンク("/wp/flow/" → "/flow/",
+        # "/cs2020/services/" → "/services/" 等)は、毎回リダイレクトで既訪問の
+        # ページに着地するだけだが、応答の遅いサーバーでは1件ごとに数秒を費やし、
+        # 時間予算を使い切ってページ数が確定しない原因になっていた(実際に確認済み:
+        # 86リクエスト中23件がこの種のリダイレクト)。「パス末尾は同じまま先頭の
+        # ディレクトリだけが置き換わる」リダイレクトを一度観測したら、以降は同じ
+        # 旧ディレクトリ配下のURLの転送先を推定し、それが既訪問・巡回予定であれば
+        # リクエスト自体を省く。転送先が未知のURLは従来どおり取得する(ページ数の
+        # 数え方は変えない)。
+        redirect_prefix_aliases: dict[str, str] = {}  # 旧ディレクトリ -> 転送先ディレクトリ
+
+        def _learn_redirect_prefix(requested_path: str, final_path: str) -> None:
+            requested_segments = [s for s in requested_path.split("/") if s]
+            final_segments = [s for s in final_path.split("/") if s]
+            common = 0
+            while common < min(len(requested_segments), len(final_segments)) and requested_segments[-1 - common] == final_segments[-1 - common]:
+                common += 1
+            if common == 0:
+                return
+            old_prefix = requested_segments[: len(requested_segments) - common]
+            new_prefix = final_segments[: len(final_segments) - common]
+            # 旧ディレクトリが無い("/satei/" → "/services/satei/")場合に学習すると、
+            # 全URLが転送対象と誤認されるため対象外
+            if not old_prefix or old_prefix == new_prefix:
+                return
+            redirect_prefix_aliases.setdefault("/" + "/".join(old_prefix), "/" + "/".join(new_prefix) if new_prefix else "")
+
+        def _is_known_redirect_alias(url: str) -> bool:
+            parsed = urlparse(url)
+            path = parsed.path
+            for old_prefix, new_prefix in redirect_prefix_aliases.items():
+                if not path.startswith(old_prefix + "/"):
+                    continue
+                rest = path[len(old_prefix) :]
+                if rest.strip("/") == "":
+                    continue
+                alias_key = _dedup_key(normalize_url(parsed._replace(path=new_prefix + rest).geturl()))
+                if alias_key in visited or alias_key in queued_urls or alias_key in canonical_visited:
+                    return True
+            return False
+
+        canonical_link_re = re.compile(r"<link\b[^>]*\brel=[\"']?canonical\b[^>]*>", re.IGNORECASE)
+        href_attr_re = re.compile(r"\bhref=[\"']([^\"']+)[\"']", re.IGNORECASE)
+
+        def _page_count_key(page_html: str, resolved_url: str) -> str:
+            """ページ数の集計(canonical_visited)に使うキーを返す。
+
+            WordPressは"/privacy.html/"と"/privacy-html/"のようにスラッグの表記揺れを
+            両方とも200で表示し、rel=canonicalで後者を正規URLとして示すことがある
+            (実際に確認済み)。canonicalがスラッグ表記揺れだけの違いを示している
+            場合に限り、canonical側のURLで数えて二重カウントを防ぐ。全ページの
+            canonicalがトップページを指すような設定ミスのサイトもあるため、それ以外の
+            canonicalは使わない。
+            """
+            resolved_key = _dedup_key(normalize_url(resolved_url))
+            link_match = canonical_link_re.search(page_html)
+            href_match = href_attr_re.search(link_match.group(0)) if link_match else None
+            if not href_match:
+                return resolved_key
+            canonical_url = normalize_url(urljoin(resolved_url, html_lib.unescape(href_match.group(1).strip())))
+            canonical_key = _dedup_key(canonical_url)
+            if canonical_key == resolved_key:
+                return resolved_key
+            if urlparse(canonical_key).netloc != urlparse(resolved_key).netloc:
+                return resolved_key
+            if _slugify_path(urlparse(canonical_key).path) != _slugify_path(urlparse(resolved_key).path):
+                return resolved_key
+            # 正規URL側は取得しなくてよい(取得しても同じページ)
+            visited.add(canonical_key)
+            return canonical_key
+
         def _is_bare_relative_href(href: str) -> bool:
             return not re.match(r"^\s*(/|[a-zA-Z][a-zA-Z0-9+.-]*:|#|\?)", href)
 
@@ -3076,7 +3156,7 @@ class WebCrawler:
                 explicit_link_keys.add(key)
             if key in visited or key in queued_urls or len(canonical_visited) >= 100:
                 return
-            if _is_misresolved_relative_link(url):
+            if _is_misresolved_relative_link(url) or _is_known_redirect_alias(url):
                 return
             queued_urls.add(key)
             if priority:
@@ -3291,27 +3371,45 @@ class WebCrawler:
                 # パスに最初から末尾スラッシュを付けてリクエストする。付けた結果
                 # 404になった場合は元のURLで取り直す。リクエストするURLを変える
                 # だけで、重複判定・ページ数の数え方(normalize_url/_dedup_key)は変えない。
-                prefers_trailing_slash = False
+                #
+                # ただし、サイト内の一部(例: 別システムの"/global/"配下)だけが末尾スラッシュ付きで、
+                # 他は逆に"/torachan/" → "/torachan"へ末尾スラッシュを外す301を返すサイトもある
+                # (実際に確認済み: 一度の観測で全ページにスラッシュを付け続けたため、以降の
+                # ほぼ全リクエストが301→200の2往復になり、時間切れでページ数が確定しなかった)。
+                # 付ける/外すの両方向のリダイレクトを数え、付ける方が多い間だけ付ける。
+                trailing_slash_votes = 0
 
                 def _get_page(url: str, headers: dict[str, str] | None = None, timeout: float | None = None) -> httpx.Response:
-                    nonlocal prefers_trailing_slash
+                    nonlocal trailing_slash_votes
                     target = url
                     parsed = urlparse(url)
-                    if prefers_trailing_slash and parsed.path and not parsed.path.endswith("/") and "." not in parsed.path.rsplit("/", 1)[-1]:
+                    if trailing_slash_votes > 0 and parsed.path and not parsed.path.endswith("/") and "." not in parsed.path.rsplit("/", 1)[-1]:
                         target = parsed._replace(path=parsed.path + "/").geturl()
                     response = client.get(target, headers=headers, timeout=timeout or self.page_timeout)
                     if target != url and response.status_code == 404:
                         response = client.get(url, headers=headers, timeout=timeout or self.page_timeout)
                     if response.history:
                         final = urlparse(str(response.url))
-                        if not prefers_trailing_slash and final.path == parsed.path + "/" and final.query == parsed.query:
-                            prefers_trailing_slash = True
+                        if final.query == parsed.query:
+                            if final.path == parsed.path + "/":
+                                trailing_slash_votes += 1
+                            elif target != url and final.path == parsed.path:
+                                # こちらで付けた末尾スラッシュを、サーバーが外して転送してきた
+                                trailing_slash_votes -= 1
                         # 素の相対リンクの誤解決(misresolved_segmentsのコメント参照)の学習
                         requested_path = parsed.path.rstrip("/")
                         final_path = final.path.rstrip("/")
                         last_segment = final_path.rsplit("/", 1)[-1]
-                        if last_segment and requested_path != final_path and requested_path.rsplit("/", 1)[-1] == last_segment:
-                            misresolved_segments.setdefault(last_segment, final_path)
+                        requested_last_segment = requested_path.rsplit("/", 1)[-1]
+                        # "/contact-html/privacy.html" → "/privacy-html/" のように、着地先で
+                        # スラッグ化されて最後のパス要素の表記が変わる場合も同じ誤解決とみなす
+                        # (_slugify_pathのコメント参照。この学習が無いと、ページを開くたびに
+                        # "/<各ページ>/<各ナビ項目>.html"の組み合わせが生まれ続け、キューが
+                        # 空にならずページ数が確定しなかった)
+                        if last_segment and requested_path != final_path and _slugify_path(requested_last_segment) == _slugify_path(last_segment):
+                            misresolved_segments.setdefault(requested_last_segment, final_path)
+                        if _dedup_key(final._replace(path="", query="", fragment="").geturl()) == _dedup_key(parsed._replace(path="", query="", fragment="").geturl()) and final.query == parsed.query:
+                            _learn_redirect_prefix(requested_path, final_path)
                     return response
 
                 queue.append((first_url, 0))
@@ -3352,7 +3450,7 @@ class WebCrawler:
                     queued_urls.discard(_dedup_key(current_url))
                     norm_current = normalize_url(current_url)
 
-                    if _dedup_key(norm_current) in visited or _is_misresolved_relative_link(norm_current):
+                    if _dedup_key(norm_current) in visited or _is_misresolved_relative_link(norm_current) or _is_known_redirect_alias(norm_current):
                         continue
 
                     try:
@@ -3418,7 +3516,7 @@ class WebCrawler:
                         # 重大な回帰になることがあったため)。そのため重複判定専用の
                         # _dedup_key()でのみスキーム・www有無を揃える。
                         norm_resolved = normalize_url(resolved_url)
-                        resolved_key = _dedup_key(norm_resolved)
+                        resolved_key = _page_count_key(current_html, norm_resolved)
                         if resolved_key in canonical_visited and resolved_key != _dedup_key(norm_current):
                             continue
                         canonical_visited.add(resolved_key)
@@ -3688,7 +3786,7 @@ class WebCrawler:
                             url, _depth = queue.popleft()
                             queued_urls.discard(_dedup_key(url))
                             norm_url = normalize_url(url)
-                            if _dedup_key(norm_url) in visited or _is_misresolved_relative_link(norm_url):
+                            if _dedup_key(norm_url) in visited or _is_misresolved_relative_link(norm_url) or _is_known_redirect_alias(norm_url):
                                 continue
                             visited.add(_dedup_key(norm_url))
                             if self._has_repeating_path_pattern(urlparse(norm_url).path):
@@ -3717,7 +3815,7 @@ class WebCrawler:
                                 if result is None or len(canonical_visited) >= 100:
                                     continue
                                 resolved_url, page_html = result
-                                resolved_key = _dedup_key(normalize_url(resolved_url))
+                                resolved_key = _page_count_key(page_html, resolved_url)
                                 if resolved_key in canonical_visited:
                                     continue
                                 canonical_visited.add(resolved_key)
