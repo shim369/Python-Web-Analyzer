@@ -6,7 +6,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from web_analyzer.core.description_enricher import DescriptionEnricher
+from web_analyzer.core.description_enricher import DescriptionEnricher, TargetCounts
 from web_analyzer.core.excel_service import ExcelService
 from web_analyzer.core.job_repository import JobRepository
 from web_analyzer.core.scraper_service import SiteScraperService
@@ -65,7 +65,7 @@ def resolve_gemini_api_key() -> str:
 
 @st.cache_resource(show_spinner=False)
 def get_description_enricher(api_key: str) -> DescriptionEnricher:
-    """K列補完の処理とジョブ状態を、調査サービスと同様にプロセス全体で共有する。
+    """AI補完(用途・構成)の処理とジョブ状態を、調査サービスと同様にプロセス全体で共有する。
 
     APIキーを引数に取ることで、キーを後から設定・変更した場合は
     キャッシュ済みの(キー無しの)インスタンスではなく新しいものが作られる。
@@ -74,28 +74,144 @@ def get_description_enricher(api_key: str) -> DescriptionEnricher:
 
 
 MODE_SCRAPE = "サイト調査"
-MODE_ENRICH = "用途(K列)の補完"
+MODE_ENRICH = "用途・構成のAI補完"
+
+# 補完済みファイルの名前に付ける接尾辞。過去の名前("_用途補完")で出力したファイルに
+# 再度かけた場合も「_AI補完_用途補完」のように重ならないよう、両方を取り除いてから付ける。
+ENRICHED_SUFFIX = "_AI補完"
+LEGACY_ENRICHED_SUFFIXES = ("_用途補完",)
+
+
+def render_metric_cards(cards: list[tuple[str, str, str]]) -> None:
+    """実行状況の数値カード(ラベル, 値, 値の文字色)を横並びで表示する。サイト調査・AI補完で共通。"""
+    for col, (label, value, color) in zip(st.columns(len(cards)), cards, strict=True):
+        with col:
+            st.markdown(
+                '<div class="metric-card" style="margin-bottom:1rem;">'
+                f'<p style="margin:0;color:#666;font-size:0.9rem;">{label}</p>'
+                f'<h2 style="margin:5px 0;color:{color};font-weight:700;">{value}</h2>'
+                "</div>",
+                unsafe_allow_html=True,
+            )
 
 
 def render_enrichment_page() -> None:
-    """完成した調査結果Excelに対して、K列「用途」をGeminiの要約で補完する画面。"""
+    """完成した調査結果Excelに対して、K列「用途」・H列「構成」をGeminiで補完する画面。
+
+    画面の構成(アップロード → 件数の確認 → 開始 → リアルタイム実行状況 → ダウンロード)は
+    サイト調査の画面にそろえている。
+    """
     enricher = get_description_enricher(resolve_gemini_api_key())
 
-    st.markdown('<div class="main-title">用途(K列)の補完</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-title">用途・構成のAI補完</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="sub-title">調査結果Excelのうち、K列「用途」が社名だけなど内容の分かりにくい行について、サイトを取り直してGeminiで100文字前後のサイト概要に要約し、K列を書き換えます。</div>',
+        '<div class="sub-title">調査結果Excelのうち、K列「用途」が社名だけなど内容の分かりにくい行、H列「構成」が空欄・3項目未満など'
+        "グローバルナビを取り損ねた行について、サイトを取り直してGeminiで補完します。"
+        "用途は100文字前後のサイト概要に要約し、構成はページ内のメニューの中からグローバルナビをAIに選ばせて、サイト上の項目名をそのまま入れます。"
+        "あわせて、I列「ページ数」が時間切れで「〇〇以上」になった行を、時間予算を延ばして再計測できます。</div>",
         unsafe_allow_html=True,
     )
 
     if not enricher.summarizer.enabled:
-        st.error("GeminiのAPIキーが見つかりません。.streamlit/secrets.toml に GEMINI_API_KEY を記載するか、環境変数 GEMINI_API_KEY を設定してください（環境変数の場合は、設定後に開き直したターミナルからアプリを起動する必要があります）。")
+        st.error(
+            "GeminiのAPIキーが見つかりません。.streamlit/secrets.toml に GEMINI_API_KEY を記載するか、"
+            "環境変数 GEMINI_API_KEY を設定してください（環境変数の場合は、設定後に開き直したターミナルからアプリを起動する必要があります）。"
+        )
         return
 
     if "enrich_job_id" not in st.session_state:
         st.session_state.enrich_job_id = st.query_params.get("enrich_job_id")
 
+    uploaded = st.file_uploader(
+        "調査結果Excel（このツールで出力したファイル）を選択、またはドラッグ＆ドロップしてください",
+        type=["xlsx"],
+        key=f"enrich_uploader_{st.session_state.get('enrich_uploader_key', 0)}",
+    )
+
+    # サイト調査の画面と同様、ポーリングのrerunのたびにExcelを読み直さないよう、
+    # 新しいファイルが選択されたときだけ件数を数える
+    fingerprint = (uploaded.name, uploaded.size) if uploaded else None
+    if uploaded and fingerprint != st.session_state.get("enrich_file_fingerprint"):
+        st.session_state.enrich_file_fingerprint = fingerprint
+        try:
+            st.session_state.enrich_pending_counts = enricher.count_targets(uploaded)
+        except Exception as e:
+            st.session_state.enrich_pending_counts = None
+            st.error(f"ファイルの読み込み中にエラーが発生しました: {e}")
+
+    pending_counts: TargetCounts | None = st.session_state.get("enrich_pending_counts") if uploaded else None
+    if uploaded and pending_counts:
+        c_col1, c_col2, c_col3 = st.columns(3)
+        with c_col1:
+            fill_purpose = st.checkbox(
+                "用途（K列）を補完する",
+                value=True,
+                help=f"K列が空欄・{DescriptionEnricher.MIN_DESCRIPTION_CHARS}文字未満・社名やキーワードを区切り記号で並べただけの行を要約します。",
+            )
+        with c_col2:
+            fill_structure = st.checkbox(
+                "構成（H列）を補完する",
+                value=True,
+                help=f"H列が空欄・{DescriptionEnricher.MIN_STRUCTURE_ITEMS}項目未満、または電話番号・メールアドレス・外部リンク(↗)・コピーライト表記が混ざった行を補完します。",
+            )
+        with c_col3:
+            recount_pages = st.checkbox(
+                "ページ数（I列）を再計測する",
+                value=True,
+                help=(
+                    "I列が「〇〇以上」（100未満）で、時間切れによりページ数が確定しなかった行を、時間予算を延ばして巡回し直します"
+                    "（1件あたり最大10分ほどかかります。Geminiは使いません）。時間切れで「要確認」になっていた行は、調査結果（C・M・N列）も判定し直します。"
+                    "「全行をやり直す」をオンにしても、確定済みのページ数は再計測しません。"
+                ),
+            )
+        force_all = st.checkbox(
+            "全行をやり直す（文体・取り方をそろえたい場合）",
+            value=False,
+            help="オンの場合は、上でチェックした列を全行補完し直します。M列が「すでにリニューアル済のため」の行は、オン・オフにかかわらず補完しません（空欄のまま）。",
+        )
+
+        purpose_rows = pending_counts.eligible_rows if force_all else pending_counts.purpose_rows
+        structure_rows = pending_counts.eligible_rows if force_all else pending_counts.structure_rows
+        breakdown = []
+        if fill_purpose:
+            breakdown.append(f"用途の補完対象: {purpose_rows}件")
+        if fill_structure:
+            breakdown.append(f"構成の補完対象: {structure_rows}件")
+        if recount_pages:
+            breakdown.append(f"ページ数の再計測対象: {pending_counts.pages_rows}件")
+        st.success(f"ファイルを正常に読み込みました。 (対象ドメイン数: {pending_counts.total_rows}件" + "".join(f" / {b}" for b in breakdown) + ")")
+
+        if not fill_purpose and not fill_structure and not recount_pages:
+            st.warning("補完する列を1つ以上チェックしてください。")
+        elif st.button("AI補完を開始する", use_container_width=True):
+            # 同名ファイルを同時・連続で処理しても衝突しないよう、実行ごとに専用フォルダを切る
+            work_dir = Path("temp") / f"enrich_{datetime.now().strftime('%Y%m%d%H%M%S_%f')}"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            input_path = work_dir / "input.xlsx"
+            input_path.write_bytes(uploaded.getbuffer())
+            base_name = Path(uploaded.name).stem
+            for suffix in (ENRICHED_SUFFIX, *LEGACY_ENRICHED_SUFFIXES):
+                base_name = base_name.removesuffix(suffix)
+            output_path = work_dir / f"{base_name}{ENRICHED_SUFFIX}.xlsx"
+
+            new_job = enricher.start_background_job(
+                input_path,
+                output_path,
+                force_all=force_all,
+                fill_purpose=fill_purpose,
+                fill_structure=fill_structure,
+                recount_pages=recount_pages,
+            )
+            st.session_state.enrich_job_id = new_job.id
+            st.query_params["enrich_job_id"] = new_job.id
+            st.session_state.enrich_uploader_key = st.session_state.get("enrich_uploader_key", 0) + 1
+            st.session_state.enrich_file_fingerprint = None
+            st.session_state.enrich_pending_counts = None
+            st.rerun()
+
     enrich_job_id = st.session_state.enrich_job_id
-    job = enricher.get_job(enrich_job_id) if enrich_job_id else None
+    if not enrich_job_id:
+        return
 
     def clear_enrich_job() -> None:
         st.session_state.enrich_job_id = None
@@ -103,51 +219,72 @@ def render_enrichment_page() -> None:
             del st.query_params["enrich_job_id"]
         st.rerun()
 
-    if job is None:
-        uploaded = st.file_uploader(
-            "調査結果Excel（このツールで出力したファイル）を選択、またはドラッグ＆ドロップしてください",
-            type=["xlsx"],
-            key=f"enrich_uploader_{st.session_state.get('enrich_uploader_key', 0)}",
-        )
-        force_all = st.checkbox(
-            "全行を要約し直す（文体をそろえたい場合）",
-            value=False,
-            help=f"オフの場合は、K列が空欄・{DescriptionEnricher.MIN_DESCRIPTION_CHARS}文字未満・社名やキーワードを区切り記号で並べただけの行のみ要約します。",
-        )
-        if uploaded and st.button("K列の補完を開始する", use_container_width=True, type="primary"):
-            # 同名ファイルを同時・連続で処理しても衝突しないよう、実行ごとに専用フォルダを切る
-            work_dir = Path("temp") / f"enrich_{datetime.now().strftime('%Y%m%d%H%M%S_%f')}"
-            work_dir.mkdir(parents=True, exist_ok=True)
-            input_path = work_dir / "input.xlsx"
-            input_path.write_bytes(uploaded.getbuffer())
-            # 補完済みファイルに再度かけた場合に「_用途補完_用途補完」と重ならないようにする
-            base_name = Path(uploaded.name).stem.removesuffix("_用途補完")
-            output_path = work_dir / f"{base_name}_用途補完.xlsx"
+    st.markdown("---")
+    st.markdown("### リアルタイム実行状況")
 
-            new_job = enricher.start_background_job(input_path, output_path, force_all=force_all)
-            st.session_state.enrich_job_id = new_job.id
-            st.query_params["enrich_job_id"] = new_job.id
-            st.session_state.enrich_uploader_key = st.session_state.get("enrich_uploader_key", 0) + 1
-            st.rerun()
+    job = enricher.get_job(enrich_job_id)
+    if job is None:
+        # AI補完のジョブはメモリ上にしか持たないため、アプリを再起動すると消える
+        st.warning("前回の処理はアプリの再起動（Ctrl+C等による停止を含む）により中断されました。お手数ですが、再度Excelをアップロードして最初からやり直してください。")
+        if st.button("画面をクリア", key="clear_btn_enrich_interrupted", type="secondary"):
+            clear_enrich_job()
         return
 
-    st.markdown("---")
     percent = int(job.done / job.total * 100) if job.total else 0
-    st.progress(percent if job.status == "processing" else 100)
+    if job.status != "processing":
+        percent = 100
+    st.progress(percent)
+    render_metric_cards(
+        [
+            ("補完対象数", f"{job.total} 件", "#1F4E78"),
+            ("補完完了", f"{job.done} 件", "#2e7d32"),
+            ("現在の進捗率", f"{percent} %", "#333"),
+        ]
+    )
 
     if job.status == "processing":
-        st.info(f"要約中... ({job.done}/{job.total} 件完了)")
+        st.info(f"処理実行中... ({job.done}/{job.total} 件完了)")
         time.sleep(1.5)
         st.rerun()
 
     elif job.status == "completed" and job.result and job.result.output_path:
         result = job.result
         result_path: Path = job.result.output_path
-        st.success(f"K列の補完が完了しました。（全 {result.total_rows}件中、対象 {result.target_rows}件 / 要約 {result.summarized}件）")
-        if result.failed_domains:
-            st.warning(f"{len(result.failed_domains)}件は要約できなかったため、元の値のままです（サイトに接続できない、またはGeminiの利用上限に達した可能性があります）。出力したファイルにもう一度かけると、残りの行だけが対象になります。")
-            with st.expander("要約できなかったサイト"):
-                st.write("\n".join(f"- {d}" for d in result.failed_domains))
+        summary_parts = []
+        if result.target_rows:
+            summary_parts.append(f"用途: 対象 {result.target_rows}件 / 要約 {result.summarized}件")
+        if result.structure_target_rows:
+            summary_parts.append(f"構成: 対象 {result.structure_target_rows}件 / 補完 {result.structure_filled}件")
+        if result.pages_target_rows:
+            summary_parts.append(f"ページ数: 対象 {result.pages_target_rows}件 / 確定 {result.pages_confirmed}件 / 判定の更新 {result.judgement_updated}件")
+        st.success(f"AI補完が完了しました。（全 {result.total_rows}件中、" + "、".join(summary_parts or ["補完対象なし"]) + "）")
+
+        if result.rate_limited_domains:
+            st.error(
+                f"Geminiの利用上限に達したため、{len(result.rate_limited_domains)}件は用途・構成をAIで判定していません。"
+                "用途は元の値のまま（ピンク）です。構成は、ルールで取れたメニューがあればそれを入れています（AIでは未確認）。"
+                "時間をおいて（1日の上限の場合は翌日以降に）、出力したファイルにもう一度かけてください。"
+            )
+            with st.expander("Geminiの利用上限で判定できなかったサイト"):
+                st.write("\n".join(f"- {d}" for d in result.rate_limited_domains))
+
+        failures = [
+            ("用途", result.failed_domains, "サイトに接続できない、またはGeminiの利用上限に達した可能性があります"),
+            ("構成", result.structure_failed_domains, "メニューがJavaScriptで描画される、またはグローバルナビらしいメニューが見つからなかった可能性があります"),
+        ]
+        for label, domains, reason in failures:
+            if not domains:
+                continue
+            st.warning(f"{label}は{len(domains)}件を補完できなかったため、元の値のまま（セルはピンク色）です（{reason}）。出力したファイルにもう一度かけると、残りの行だけが対象になります。")
+            with st.expander(f"{label}を補完できなかったサイト"):
+                st.write("\n".join(f"- {d}" for d in domains))
+        if result.pages_unconfirmed_domains:
+            st.warning(
+                f"ページ数は{len(result.pages_unconfirmed_domains)}件が再計測しても確定しませんでした（セルはピンク色。件数が増えた行は値を更新しています）。"
+                "応答の非常に遅いサイト、またはページ数が非常に多いサイトの可能性があります。"
+            )
+            with st.expander("ページ数が確定しなかったサイト"):
+                st.write("\n".join(f"- {d}" for d in result.pages_unconfirmed_domains))
 
         d_col1, d_col2 = st.columns([2, 1])
         with d_col1:
@@ -164,7 +301,7 @@ def render_enrichment_page() -> None:
                 clear_enrich_job()
 
     else:
-        st.error(f"K列の補完中にエラーが発生しました: {job.error}")
+        st.error(f"AI補完中にエラーが発生しました: {job.error}")
         if st.button("画面をクリアしてやり直す", key="clear_btn_enrich_failed", type="secondary"):
             clear_enrich_job()
 
@@ -302,7 +439,7 @@ with st.sidebar:
         """
     )
 
-# K列補完はサイト調査とは独立した画面として表示する(調査ジョブはその間もバックグラウンドで継続する)
+# AI補完はサイト調査とは独立した画面として表示する(調査ジョブはその間もバックグラウンドで継続する)
 if mode == MODE_ENRICH:
     render_enrichment_page()
     st.stop()
@@ -399,22 +536,13 @@ if job_id:
         percent = int((completed / total) * 100) if total > 0 else 0
         st.progress(percent)
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.markdown(
-                f'<div class="metric-card" style="margin-bottom:1rem;"><p style="margin:0;color:#666;font-size:0.9rem;">総ドメイン数</p><h2 style="margin:5px 0;color:#1F4E78;font-weight:700;">{total} 件</h2></div>',
-                unsafe_allow_html=True,
-            )
-        with col2:
-            st.markdown(
-                f'<div class="metric-card" style="margin-bottom:1rem;"><p style="margin:0;color:#666;font-size:0.9rem;">解析完了</p><h2 style="margin:5px 0;color:#2e7d32;font-weight:700;">{completed} 件</h2></div>',
-                unsafe_allow_html=True,
-            )
-        with col3:
-            st.markdown(
-                f'<div class="metric-card" style="margin-bottom:1rem;"><p style="margin:0;color:#666;font-size:0.9rem;">現在の進捗率</p><h2 style="margin:5px 0;color:#333;font-weight:700;">{percent} %</h2></div>',
-                unsafe_allow_html=True,
-            )
+        render_metric_cards(
+            [
+                ("総ドメイン数", f"{total} 件", "#1F4E78"),
+                ("解析完了", f"{completed} 件", "#2e7d32"),
+                ("現在の進捗率", f"{percent} %", "#333"),
+            ]
+        )
 
         # リセット処理を共通化するためのヘルパー関数/ボタン処理
         def clear_current_job() -> None:

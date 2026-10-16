@@ -47,6 +47,10 @@ class SiteSummarizer:
     _rate_lock = threading.Lock()
     _last_request_at = 0.0
     _cooldown_until = 0.0
+    # 利用上限(429)のためにAPIを呼べなかったことを、呼び出したスレッドごとに記録する。
+    # summarize()等は失敗しても空文字を返すだけのため、呼び出し側が「上限が原因か」を
+    # 知るにはpop_rate_limited()で確認する(1行分の処理は1つのスレッドで完結する)。
+    _thread_state = threading.local()
 
     def __init__(self, api_key: str | None = None, model: str | None = None, timeout: float = 30.0) -> None:
         self.api_key = api_key if api_key is not None else os.environ.get("GEMINI_API_KEY", "")
@@ -60,6 +64,12 @@ class SiteSummarizer:
     @property
     def enabled(self) -> bool:
         return bool(self.api_key)
+
+    def pop_rate_limited(self) -> bool:
+        """このスレッドで、前回の呼び出し以降に利用上限のためAPIを呼べなかったことがあるかを返し、記録を消す。"""
+        limited = bool(getattr(SiteSummarizer._thread_state, "rate_limited", False))
+        SiteSummarizer._thread_state.rate_limited = False
+        return limited
 
     def summarize(self, domain: str, top_html: str, profile_htmls: list[str] | None = None, current_description: str = "") -> str:
         """サイト概要(100文字前後)を返す。要約できなかった場合は空文字。
@@ -120,21 +130,59 @@ class SiteSummarizer:
         text = re.sub(r"\s+", " ", body.get_text(" ", strip=True)).strip()
         return heading, text[: self.MAX_CHARS_PER_PAGE]
 
-    def _generate(self, prompt: str) -> str:
+    SUMMARY_INSTRUCTION = (
+        "あなたはWebサイトの調査担当者です。与えられたサイト本文から、"
+        "そのサイトを運営する会社・団体の名称と事業内容(何をしている会社か)を、"
+        "日本語で100文字前後の1〜2文に要約してください。"
+        "「〇〇株式会社のコーポレートサイト。〜を手がける。」のような体言止め中心の簡潔な文体にしてください。"
+        "本文から読み取れない事実は書かず、前置き・引用符・改行は付けず要約文だけを出力してください。"
+    )
+
+    NAV_SELECT_INSTRUCTION = (
+        "あなたはWebサイトの調査担当者です。Webページ内にあるメニューのリストが番号付きで与えられます。"
+        "このうち、サイトのグローバルナビゲーション(PC表示でページ上部やサイドに常に表示される、"
+        "サイトの主要なページへのメニュー)にあたるリストを1つ選び、その番号だけを半角数字で出力してください。"
+        "外部サイトへのリンク集、SNSリンク、お知らせ・ブログ記事の一覧、商品やカテゴリの一覧、"
+        "利用規約・プライバシーポリシー等だけを並べたリスト、パンくずリストは選ばないでください。"
+        "会社概要・事業内容・製品情報・採用情報・お問い合わせ等、サイトの主要ページへのリンクを複数含むリストがあれば、"
+        "項目名が画像の代替テキスト由来で素朴なものでもそれを選んでください。"
+        "ヘッダーには、サイトの主要なセクション(事業内容・製品情報・サービス・会社案内等)を並べたメインのメニューとは別に、"
+        "右上などに「会社概要・採用情報・お問い合わせ・アクセス」のような補助的な項目を3〜4個だけ並べた小さなメニューが"
+        "置かれていることがあります。両方ある場合は、項目の多いメインのメニューを選んでください。"
+        "ただし、個々の製品名・商品名・カテゴリ名だけを並べたリストは、メインのメニューではありません。"
+        "どれも明らかにグローバルナビではない場合に限り0を出力してください。説明や前置きは不要です。"
+    )
+
+    # select_global_nav()で、AIが「該当するリストが無い」と判定した場合の戻り値
+    NO_GLOBAL_NAV = -1
+
+    def select_global_nav(self, domain: str, candidates: list[list[str]]) -> int | None:
+        """候補のメニューのリストのうち、グローバルナビにあたるものの添字(0始まり)を返す。
+
+        AIが該当なしと判定した場合はNO_GLOBAL_NAV、API呼び出しに失敗した・回答を
+        解釈できなかった場合はNone。AIには番号だけを答えさせ、項目名は候補
+        (サイト上の文字そのまま)を使うことで、言い換えや存在しない項目の混入を防ぐ。
+        """
+        if not self.enabled or not candidates:
+            return None
+        listing = "\n".join(f"{i}. " + " / ".join(menus) for i, menus in enumerate(candidates, start=1))
+        prompt = f"URL: {domain}\n\n--- メニューのリスト ---\n{listing}"
+        try:
+            raw = self._generate(prompt, self.NAV_SELECT_INSTRUCTION)
+        except Exception as e:
+            logger.warning(f"[{domain}] Geminiによるグローバルナビの判定に失敗しました: {e}")
+            return None
+        match = re.search(r"\d+", raw)
+        if not match:
+            return None
+        number = int(match.group())
+        if number == 0:
+            return self.NO_GLOBAL_NAV
+        return number - 1 if number <= len(candidates) else None
+
+    def _generate(self, prompt: str, system_instruction: str | None = None) -> str:
         payload = {
-            "systemInstruction": {
-                "parts": [
-                    {
-                        "text": (
-                            "あなたはWebサイトの調査担当者です。与えられたサイト本文から、"
-                            "そのサイトを運営する会社・団体の名称と事業内容(何をしている会社か)を、"
-                            "日本語で100文字前後の1〜2文に要約してください。"
-                            "「〇〇株式会社のコーポレートサイト。〜を手がける。」のような体言止め中心の簡潔な文体にしてください。"
-                            "本文から読み取れない事実は書かず、前置き・引用符・改行は付けず要約文だけを出力してください。"
-                        )
-                    }
-                ]
-            },
+            "systemInstruction": {"parts": [{"text": system_instruction or self.SUMMARY_INSTRUCTION}]},
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.2},
         }
@@ -142,7 +190,11 @@ class SiteSummarizer:
         headers = {"x-goog-api-key": self.api_key, "Content-Type": "application/json"}
 
         for attempt in range(self.MAX_RETRIES + 1):
-            self._wait_for_rate_limit()
+            try:
+                self._wait_for_rate_limit()
+            except RuntimeError:
+                SiteSummarizer._thread_state.rate_limited = True
+                raise
             response = httpx.post(url, json=payload, headers=headers, timeout=self.timeout)
             if response.status_code == 429 and attempt < self.MAX_RETRIES:
                 logger.info(f"Gemini APIのレート制限に達したため {self.RETRY_WAIT_SEC:.0f}秒待って再試行します")
@@ -151,6 +203,7 @@ class SiteSummarizer:
             if response.status_code == 429:
                 with SiteSummarizer._rate_lock:
                     SiteSummarizer._cooldown_until = time.monotonic() + self.QUOTA_COOLDOWN_SEC
+                SiteSummarizer._thread_state.rate_limited = True
                 logger.warning(f"Gemini APIのレート制限が続くため、{self.QUOTA_COOLDOWN_SEC / 60:.0f}分間サイト概要の要約を停止します(1日の上限到達の可能性があります)")
             response.raise_for_status()
             break

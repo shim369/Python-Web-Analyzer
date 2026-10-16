@@ -6,6 +6,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import BinaryIO
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -16,6 +17,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from web_analyzer.core.crawler import WebCrawler
+from web_analyzer.core.evaluator import RenewalEvaluator
 from web_analyzer.core.excel_service import _estimate_wrapped_line_count
 from web_analyzer.core.site_summarizer import SiteSummarizer
 
@@ -29,6 +31,24 @@ class EnrichmentTarget:
     row: int
     domain: str
     current_description: str
+    needs_purpose: bool = True
+    needs_structure: bool = False
+    current_structure: str = ""
+    needs_pages: bool = False
+    current_pages: str = ""
+
+
+@dataclass
+class TargetCounts:
+    """補完対象の件数(画面での事前表示用)。"""
+
+    total_rows: int = 0
+    # M列が「すでにリニューアル済」の行を除いた件数(=全行やり直す場合の対象件数)
+    eligible_rows: int = 0
+    purpose_rows: int = 0
+    structure_rows: int = 0
+    # ページ数が「〇〇以上」(100未満)で確定していない行数(全行やり直す場合も同じ)
+    pages_rows: int = 0
 
 
 @dataclass
@@ -37,6 +57,18 @@ class EnrichmentResult:
     target_rows: int = 0
     summarized: int = 0
     failed_domains: list[str] = field(default_factory=list)
+    structure_target_rows: int = 0
+    structure_filled: int = 0
+    structure_failed_domains: list[str] = field(default_factory=list)
+    pages_target_rows: int = 0
+    # ページ数が確定した件数(件数が増えたが、まだ「〇〇以上」の行は含まない)
+    pages_confirmed: int = 0
+    # 再計測してもページ数が確定しなかったサイト(件数が増えた行を含む)
+    pages_unconfirmed_domains: list[str] = field(default_factory=list)
+    # 再計測の結果、調査結果(C列)の判定を書き換えた件数
+    judgement_updated: int = 0
+    # Geminiの利用上限に達していたため、用途・構成をAIで判定できなかったサイト
+    rate_limited_domains: list[str] = field(default_factory=list)
     output_path: Path | None = None
 
 
@@ -50,19 +82,56 @@ class EnrichmentJob:
     error: str = ""
 
 
+@dataclass
+class PageRecount:
+    """ページ数の再計測結果と、それに基づいてやり直した判定。"""
+
+    total_pages: int | str
+    # ページ数が確定したか(巡回し尽くした、または100ページ以上と分かった)
+    confirmed: bool
+    evaluation_result: str
+    rejection_reason: str
+    remarks: str
+
+
+@dataclass
+class RowResult:
+    summary: str = ""
+    structure: str = ""
+    pages: PageRecount | None = None
+    # Geminiの利用上限に達していたため、AIでの判定を飛ばしたか
+    rate_limited: bool = False
+
+
+@dataclass
+class _Columns:
+    domain: int
+    purpose: int
+    rejection: int
+    structure: int
+    result: int
+    pages: int
+    remarks: int
+
+
 class DescriptionEnricher:
-    """完成した調査結果Excelに対して、K列「用途」が社名だけ等で内容の分かりにくい行を
-    Geminiの要約(サイト概要)で書き換える「K列補完」処理。
+    """完成した調査結果Excelに対して、K列「用途」とH列「構成」をAI(Gemini)で補完する処理。
+
+    - K列「用途」: 社名だけ等で内容の分かりにくい行を、サイト概要の要約で書き換える
+    - H列「構成」: 空欄・3項目未満・電話番号等が混ざった行を、グローバルナビの
+      メニュー項目で埋める。AIにはページ内のメニューのリスト(候補)から番号で
+      選ばせるだけにし、項目名はサイト上の文字をそのまま使う
 
     スクレイピング本体とは切り離して実行するため、
       - 調査処理の速度やGemini側の制限(無料枠のレート上限等)の影響を受けない
       - 過去に出力したExcelにも後からかけられる
-      - 1日の上限で途中までしか要約できなかった場合も、同じファイルに再度かければ
-        残りの行だけが対象になる(要約済みの行は判定条件に引っかからないため)
+      - 1日の上限で途中までしか補完できなかった場合も、同じファイルに再度かければ
+        残りの行だけが対象になる(補完済みの行は判定条件に引っかからないため)
     という運用ができる。
 
     Excelにはページの中身が残っていないため、対象行のサイトだけトップページと
-    会社概要・事業内容らしいページ(最大2ページ)を取り直して要約に使う。
+    会社概要・事業内容らしいページ(最大2ページ)を取り直して使う。用途と構成の
+    両方が対象の行でも、取り直しは1回で済ませる。
     """
 
     # これ未満の文字数は「社名・サイト名だけ」とみなして要約対象にする
@@ -72,6 +141,15 @@ class DescriptionEnricher:
     # ような名前・キーワードの羅列とみなして要約対象にする
     NAME_LIST_SEPARATOR_RE = re.compile(r"[|｜／/]|\s[-–—]\s|[-–—]{2,}")
 
+    # 構成列がこれ未満の項目数なら、グローバルナビを取り損ねたとみなして補完対象にする
+    MIN_STRUCTURE_ITEMS = 3
+    # 構成列にこれらが含まれる場合は、ナビ以外(連絡先・外部リンク集・コピーライト等)を
+    # 拾ったとみなして補完対象にする
+    SUSPICIOUS_STRUCTURE_RE = re.compile(r"\d{2,4}-\d{2,4}-\d{3,4}|@|↗|copyright|©|all rights reserved", re.I)
+    MAX_STRUCTURE_ITEMS = 10  # 調査本体(crawler.py)のsite_structureと同じ上限
+    # SNSへのリンクだけの項目(構成の候補からは取り除く)
+    SNS_ITEM_RE = re.compile(r"^(twitter|x|facebook|instagram|youtube|line|tiktok|note|linkedin|pinterest)(page|公式)?$", re.I)
+
     # 会社概要・事業内容が書かれていそうなページへのリンクの目印(リンクテキスト/URL)
     PROFILE_LINK_TEXT_RE = re.compile(r"会社概要|企業情報|会社案内|会社情報|事業内容|事業紹介|業務内容|私たちについて|当社について|about", re.I)
     PROFILE_LINK_HREF_RE = re.compile(r"about|company|corporate|profile|gaiyou|gaiyo|outline|business|jigyou|jigyo", re.I)
@@ -79,8 +157,22 @@ class DescriptionEnricher:
 
     DOMAIN_HEADER = "サイト名"
     PURPOSE_HEADER = "用途"
+    REJECTION_HEADER = "不可の理由"
+    STRUCTURE_HEADER = "構成"
+    RESULT_HEADER = "調査結果"
+    PAGES_HEADER = "ページ数"
+    REMARKS_HEADER = "備考"
     DEFAULT_DOMAIN_COLUMN = 2  # B列
+    DEFAULT_STRUCTURE_COLUMN = 8  # H列
     DEFAULT_PURPOSE_COLUMN = 11  # K列
+    DEFAULT_REJECTION_COLUMN = 13  # M列
+    DEFAULT_RESULT_COLUMN = 3  # C列
+    DEFAULT_PAGES_COLUMN = 9  # I列
+    DEFAULT_REMARKS_COLUMN = 14  # N列
+    # M列(不可の理由)がこれを含む行は、移転案内ページ等で既にリニューアル済みのサイトで
+    # 用途・構成を書く必要が無いため、補完せず空欄のままにする
+    # (「全行をやり直す」場合も対象外。scraper_service.pyの判定文言と合わせる)
+    ALREADY_RENEWED_REASON = "すでにリニューアル済"
 
     # サイトの取り直しは並列で行い、Geminiへの送信間隔(SiteSummarizer側で制御)の
     # 待ち時間とページ取得の時間を重ねる。Playwrightでのレンダリングも走りうるため
@@ -88,10 +180,22 @@ class DescriptionEnricher:
     MAX_WORKERS = 5
     PAGE_TIMEOUT = 10.0
 
-    # 補完の結果をK列のセル背景で見分けられるようにする。
+    # ページ数の再計測では、調査本体(本巡回150秒 + ページ数カウント専用の追加巡回120秒、
+    # 1リクエスト8秒)より時間予算を延ばす。対象は時間切れで「〇〇以上」になった行だけなので、
+    # 1件あたり最大10分程度かかっても全体への影響は小さい。
+    RECOUNT_TIMEOUT = 300.0
+    RECOUNT_EXTRA_TIMEOUT = 300.0
+    RECOUNT_PAGE_TIMEOUT = 15.0
+    # ページ数がこの値以上なら「100以上」で確定扱い(crawler.pyの上限と同じ)
+    PAGE_COUNT_CAP = 100
+    # 調査結果(C列)の判定に使うページ数のしきい値(RenewalEvaluator.evaluate()の既定値と同じ)
+    PAGE_THRESHOLD = 10
+    PAGE_COUNT_REASON = "ページ数が多いため"
+
+    # 補完の結果をセル背景で見分けられるようにする。
     # 失敗した行は、出力ファイルに再度かけて成功すれば黄色に塗り替わる。
-    SUMMARIZED_FILL_COLOR = "FFF2CC"  # 淡い黄色: 要約で書き換えた
-    FAILED_FILL_COLOR = "FFE5EC"  # 淡いピンク: 要約できず元の値のまま
+    SUMMARIZED_FILL_COLOR = "FFF2CC"  # 淡い黄色: 補完で書き換えた
+    FAILED_FILL_COLOR = "FFE5EC"  # 淡いピンク: 補完できず元の値のまま
 
     def __init__(self, summarizer: SiteSummarizer | None = None) -> None:
         self.summarizer = summarizer or SiteSummarizer()
@@ -110,37 +214,122 @@ class DescriptionEnricher:
             return True
         return "。" not in stripped and bool(cls.NAME_LIST_SEPARATOR_RE.search(stripped))
 
-    def find_targets(self, ws: Worksheet, force_all: bool = False) -> tuple[int, list[EnrichmentTarget]]:
-        """(データ行数, 要約対象行のリスト)を返す。"""
-        domain_col, purpose_col = self._locate_columns(ws)
+    @classmethod
+    def needs_structure(cls, text: str) -> bool:
+        """H列の文字列が、グローバルナビを取り損ねたものかどうか。"""
+        items = [line for line in (text or "").splitlines() if line.strip()]
+        if len(items) < cls.MIN_STRUCTURE_ITEMS:
+            return True
+        return any(cls.SUSPICIOUS_STRUCTURE_RE.search(item) for item in items)
+
+    @classmethod
+    def needs_page_recount(cls, value: object) -> bool:
+        """I列の値が、時間切れで確定しなかったページ数(「〇〇以上」で100未満)かどうか。"""
+        if value is None:
+            return False
+        count, is_lower_bound = RenewalEvaluator.parse_lower_bound(str(value).strip())
+        return is_lower_bound and 0 < count < cls.PAGE_COUNT_CAP
+
+    def find_targets(
+        self,
+        ws: Worksheet,
+        force_all: bool = False,
+        fill_purpose: bool = True,
+        fill_structure: bool = False,
+        recount_pages: bool = False,
+    ) -> tuple[int, list[EnrichmentTarget]]:
+        """(データ行数, 補完対象行のリスト)を返す。
+
+        ページ数の再計測は、全行やり直す(force_all)場合も「〇〇以上」の行だけを対象にする
+        (確定済みのページ数を測り直す意味は無く、1件あたりの時間もかかるため)。
+        """
+        cols = self._locate_columns(ws)
         total_rows = 0
         targets: list[EnrichmentTarget] = []
 
         for row in range(2, ws.max_row + 1):
-            domain_value = ws.cell(row=row, column=domain_col).value
+            domain_value = ws.cell(row=row, column=cols.domain).value
             domain = str(domain_value).strip() if domain_value is not None else ""
             if not domain:
                 continue
             total_rows += 1
 
-            purpose_value = ws.cell(row=row, column=purpose_col).value
+            rejection_value = ws.cell(row=row, column=cols.rejection).value
+            if rejection_value is not None and self.ALREADY_RENEWED_REASON in str(rejection_value):
+                continue
+
+            purpose_value = ws.cell(row=row, column=cols.purpose).value
             current = str(purpose_value).strip() if purpose_value is not None else ""
-            if force_all or self.needs_summary(current):
-                targets.append(EnrichmentTarget(row=row, domain=domain, current_description=current))
+            structure_value = ws.cell(row=row, column=cols.structure).value
+            current_structure = str(structure_value).strip() if structure_value is not None else ""
+
+            pages_value = ws.cell(row=row, column=cols.pages).value
+            current_pages = str(pages_value).strip() if pages_value is not None else ""
+
+            needs_purpose = fill_purpose and (force_all or self.needs_summary(current))
+            needs_structure = fill_structure and (force_all or self.needs_structure(current_structure))
+            needs_pages = recount_pages and self.needs_page_recount(current_pages)
+            if needs_purpose or needs_structure or needs_pages:
+                targets.append(
+                    EnrichmentTarget(
+                        row=row,
+                        domain=domain,
+                        current_description=current,
+                        needs_purpose=needs_purpose,
+                        needs_structure=needs_structure,
+                        current_structure=current_structure,
+                        needs_pages=needs_pages,
+                        current_pages=current_pages,
+                    )
+                )
 
         return total_rows, targets
 
-    def _locate_columns(self, ws: Worksheet) -> tuple[int, int]:
-        """ヘッダー行から「サイト名」「用途」の列を探す。見つからなければB列/K列とみなす。"""
-        domain_col = self.DEFAULT_DOMAIN_COLUMN
-        purpose_col = self.DEFAULT_PURPOSE_COLUMN
+    def count_targets(self, source: Path | BinaryIO) -> TargetCounts:
+        """用途・構成・ページ数それぞれの補完対象件数(全行やり直さない場合)を数える。画面での事前表示用。"""
+        wb = load_workbook(source)
+        ws = wb.active
+        assert isinstance(ws, Worksheet)
+        total_rows, eligible = self.find_targets(ws, force_all=True)
+        _, targets = self.find_targets(ws, fill_purpose=True, fill_structure=True, recount_pages=True)
+        return TargetCounts(
+            total_rows=total_rows,
+            eligible_rows=len(eligible),
+            purpose_rows=sum(t.needs_purpose for t in targets),
+            structure_rows=sum(t.needs_structure for t in targets),
+            pages_rows=sum(t.needs_pages for t in targets),
+        )
+
+    def _locate_columns(self, ws: Worksheet) -> _Columns:
+        """ヘッダー行から各列を探す。見つからなければB列/K列/M列/H列とみなす。"""
+        cols = _Columns(
+            domain=self.DEFAULT_DOMAIN_COLUMN,
+            purpose=self.DEFAULT_PURPOSE_COLUMN,
+            rejection=self.DEFAULT_REJECTION_COLUMN,
+            structure=self.DEFAULT_STRUCTURE_COLUMN,
+            result=self.DEFAULT_RESULT_COLUMN,
+            pages=self.DEFAULT_PAGES_COLUMN,
+            remarks=self.DEFAULT_REMARKS_COLUMN,
+        )
         for cell in ws[1]:
             header = str(cell.value).strip() if cell.value is not None else ""
-            if header == self.DOMAIN_HEADER and cell.column is not None:
-                domain_col = cell.column
-            elif header == self.PURPOSE_HEADER and cell.column is not None:
-                purpose_col = cell.column
-        return domain_col, purpose_col
+            if cell.column is None:
+                continue
+            if header == self.DOMAIN_HEADER:
+                cols.domain = cell.column
+            elif header == self.PURPOSE_HEADER:
+                cols.purpose = cell.column
+            elif header == self.REJECTION_HEADER:
+                cols.rejection = cell.column
+            elif header == self.STRUCTURE_HEADER:
+                cols.structure = cell.column
+            elif header == self.RESULT_HEADER:
+                cols.result = cell.column
+            elif header == self.PAGES_HEADER:
+                cols.pages = cell.column
+            elif header == self.REMARKS_HEADER:
+                cols.remarks = cell.column
+        return cols
 
     # ------------------------------------------------------------------
     # Excel一括処理
@@ -152,8 +341,11 @@ class DescriptionEnricher:
         output_path: Path,
         force_all: bool = False,
         progress_callback: Callable[[int, int], None] | None = None,
+        fill_purpose: bool = True,
+        fill_structure: bool = False,
+        recount_pages: bool = False,
     ) -> EnrichmentResult:
-        """input_pathのExcelのK列を補完し、output_pathに保存する。
+        """input_pathのExcelのK列(用途)・H列(構成)の補完と、I列(ページ数)の再計測を行い、output_pathに保存する。
 
         元のExcelの書式(列幅・罫線・フォント等)はそのまま残し、書き換えた
         セルの値と、その行の高さだけを更新する。
@@ -162,34 +354,50 @@ class DescriptionEnricher:
         ws = wb.active
         assert isinstance(ws, Worksheet)
 
-        total_rows, targets = self.find_targets(ws, force_all=force_all)
-        _, purpose_col = self._locate_columns(ws)
-        result = EnrichmentResult(total_rows=total_rows, target_rows=len(targets))
-        logger.info(f"K列補完を開始します: 対象 {len(targets)}件 / 全 {total_rows}件")
+        total_rows, targets = self.find_targets(
+            ws,
+            force_all=force_all,
+            fill_purpose=fill_purpose,
+            fill_structure=fill_structure,
+            recount_pages=recount_pages,
+        )
+        cols = self._locate_columns(ws)
+        result = EnrichmentResult(
+            total_rows=total_rows,
+            target_rows=sum(t.needs_purpose for t in targets),
+            structure_target_rows=sum(t.needs_structure for t in targets),
+            pages_target_rows=sum(t.needs_pages for t in targets),
+        )
+        logger.info(f"AI補完を開始します: 用途 {result.target_rows}件 / 構成 {result.structure_target_rows}件 / ページ数 {result.pages_target_rows}件 / 全 {total_rows}件")
 
         if progress_callback:
             progress_callback(0, len(targets))
 
         done = 0
         with ThreadPoolExecutor(max_workers=self.MAX_WORKERS, thread_name_prefix="Enricher") as executor:
-            future_to_target = {executor.submit(self.summarize_domain, t.domain, t.current_description): t for t in targets}
+            future_to_target = {executor.submit(self.enrich_row, t): t for t in targets}
             for future in as_completed(future_to_target):
                 target = future_to_target[future]
                 try:
-                    summary = future.result()
+                    row_result = future.result()
                 except Exception as e:
-                    logger.warning(f"[{target.domain}] K列補完中に予期せぬエラーが発生しました: {e}")
-                    summary = ""
+                    logger.warning(f"[{target.domain}] AI補完中に予期せぬエラーが発生しました: {e}")
+                    row_result = RowResult()
 
-                cell = ws.cell(row=target.row, column=purpose_col)
-                if summary:
-                    cell.value = summary
-                    cell.fill = PatternFill(start_color=self.SUMMARIZED_FILL_COLOR, end_color=self.SUMMARIZED_FILL_COLOR, fill_type="solid")
-                    self._fit_row_height(ws, target.row, purpose_col, summary)
-                    result.summarized += 1
-                else:
-                    cell.fill = PatternFill(start_color=self.FAILED_FILL_COLOR, end_color=self.FAILED_FILL_COLOR, fill_type="solid")
-                    result.failed_domains.append(target.domain)
+                if target.needs_purpose:
+                    if self._write_cell(ws, target.row, cols.purpose, row_result.summary):
+                        result.summarized += 1
+                    else:
+                        result.failed_domains.append(target.domain)
+                if target.needs_structure:
+                    if self._write_cell(ws, target.row, cols.structure, row_result.structure):
+                        result.structure_filled += 1
+                    else:
+                        result.structure_failed_domains.append(target.domain)
+                if target.needs_pages:
+                    self._write_page_recount(ws, cols, target, row_result.pages, result)
+                if row_result.rate_limited:
+                    result.rate_limited_domains.append(target.domain)
 
                 done += 1
                 if progress_callback:
@@ -197,12 +405,77 @@ class DescriptionEnricher:
 
         wb.save(str(output_path))
         result.output_path = output_path
-        logger.info(f"K列補完が完了しました: 要約 {result.summarized}件 / 失敗 {len(result.failed_domains)}件")
+        logger.info(
+            f"AI補完が完了しました: 用途 {result.summarized}件(失敗 {len(result.failed_domains)}件) / "
+            f"構成 {result.structure_filled}件(失敗 {len(result.structure_failed_domains)}件) / "
+            f"ページ数 確定 {result.pages_confirmed}件(未確定 {len(result.pages_unconfirmed_domains)}件) / "
+            f"判定の更新 {result.judgement_updated}件"
+        )
         return result
+
+    def _write_page_recount(
+        self,
+        ws: Worksheet,
+        cols: _Columns,
+        target: EnrichmentTarget,
+        recount: PageRecount | None,
+        result: EnrichmentResult,
+    ) -> None:
+        """ページ数の再計測結果をI列に書き込み、必要なら調査結果(C/M/N列)も書き換える。
+
+        - ページ数が確定した(巡回し尽くした・100以上と分かった)場合はI列を黄色に、
+          確定しなかった場合はピンクにする。確定しなくても件数が増えた場合は値を更新する。
+        - 時間切れで「要確認」(判定保留)だった行は、再計測した巡回結果で判定をやり直す。
+        - 既に「×」の行は、ページ数がしきい値を超えたことが新たに分かった場合だけ、
+          不可の理由に「ページ数が多いため」を追記する(他の理由は変えない)。
+        """
+        old_count, _ = RenewalEvaluator.parse_lower_bound(target.current_pages)
+        new_count = RenewalEvaluator.parse_lower_bound(recount.total_pages)[0] if recount else 0
+        if recount is None or (new_count <= old_count and not recount.confirmed):
+            self._write_cell(ws, target.row, cols.pages, "")
+            result.pages_unconfirmed_domains.append(target.domain)
+            return
+
+        pages_cell = ws.cell(row=target.row, column=cols.pages)
+        pages_cell.value = recount.total_pages
+        fill_color = self.SUMMARIZED_FILL_COLOR if recount.confirmed else self.FAILED_FILL_COLOR
+        pages_cell.fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type="solid")
+        if recount.confirmed:
+            result.pages_confirmed += 1
+        else:
+            result.pages_unconfirmed_domains.append(target.domain)
+
+        current_result = str(ws.cell(row=target.row, column=cols.result).value or "").strip()
+        current_rejection = str(ws.cell(row=target.row, column=cols.rejection).value or "").strip()
+        current_remarks = str(ws.cell(row=target.row, column=cols.remarks).value or "").strip()
+
+        if current_result == "要確認" and RenewalEvaluator.PENDING_TIMEOUT_REASON in current_remarks:
+            updated = (recount.evaluation_result, recount.rejection_reason, recount.remarks)
+            if updated == (current_result, current_rejection, current_remarks):
+                return
+            for column, value in zip((cols.result, cols.rejection, cols.remarks), updated, strict=True):
+                ws.cell(row=target.row, column=column).value = value or None
+                if value:
+                    self._write_cell(ws, target.row, column, value)
+            result.judgement_updated += 1
+        elif current_result == "×" and new_count > self.PAGE_THRESHOLD and self.PAGE_COUNT_REASON not in current_rejection:
+            self._write_cell(ws, target.row, cols.rejection, "\n".join(filter(None, [self.PAGE_COUNT_REASON, current_rejection])))
+            result.judgement_updated += 1
+
+    def _write_cell(self, ws: Worksheet, row: int, column: int, value: str) -> bool:
+        """補完結果をセルに書き込み、背景色で結果を示す。書き込めた場合True。"""
+        cell = ws.cell(row=row, column=column)
+        if value:
+            cell.value = value
+            cell.fill = PatternFill(start_color=self.SUMMARIZED_FILL_COLOR, end_color=self.SUMMARIZED_FILL_COLOR, fill_type="solid")
+            self._fit_row_height(ws, row, column, value)
+            return True
+        cell.fill = PatternFill(start_color=self.FAILED_FILL_COLOR, end_color=self.FAILED_FILL_COLOR, fill_type="solid")
+        return False
 
     @staticmethod
     def _fit_row_height(ws: Worksheet, row: int, column: int, text: str) -> None:
-        """要約文が折り返しで見切れないよう、必要なら行の高さを広げる(縮めはしない)。"""
+        """補完した文字列が折り返しで見切れないよう、必要なら行の高さを広げる(縮めはしない)。"""
         width = ws.column_dimensions[get_column_letter(column)].width or 60
         needed = _estimate_wrapped_line_count(text, width) * 15 + 5
         current = ws.row_dimensions[row].height or 20
@@ -212,7 +485,15 @@ class DescriptionEnricher:
     # バックグラウンド実行(Streamlit画面からの呼び出し用)
     # ------------------------------------------------------------------
 
-    def start_background_job(self, input_path: Path, output_path: Path, force_all: bool = False) -> EnrichmentJob:
+    def start_background_job(
+        self,
+        input_path: Path,
+        output_path: Path,
+        force_all: bool = False,
+        fill_purpose: bool = True,
+        fill_structure: bool = False,
+        recount_pages: bool = False,
+    ) -> EnrichmentJob:
         job = EnrichmentJob(id=str(uuid.uuid4()))
         with self._lock:
             self._jobs[job.id] = job
@@ -224,12 +505,20 @@ class DescriptionEnricher:
 
         def run() -> None:
             try:
-                result = self.enrich_file(input_path, output_path, force_all=force_all, progress_callback=progress)
+                result = self.enrich_file(
+                    input_path,
+                    output_path,
+                    force_all=force_all,
+                    progress_callback=progress,
+                    fill_purpose=fill_purpose,
+                    fill_structure=fill_structure,
+                    recount_pages=recount_pages,
+                )
                 with self._lock:
                     job.result = result
                     job.status = "completed"
             except Exception as e:
-                logger.exception(f"K列補完ジョブ {job.id} が失敗しました: {e}")
+                logger.exception(f"AI補完ジョブ {job.id} が失敗しました: {e}")
                 with self._lock:
                     job.error = str(e)
                     job.status = "failed"
@@ -242,8 +531,138 @@ class DescriptionEnricher:
             return self._jobs.get(job_id)
 
     # ------------------------------------------------------------------
-    # 1サイト分の取り直し + 要約
+    # 1サイト分の取り直し + 要約・構成の判定
     # ------------------------------------------------------------------
+
+    def enrich_row(self, target: EnrichmentTarget) -> RowResult:
+        """1行分の補完結果を返す。対象でない列・補完できなかった列は空文字(ページ数はNone)。"""
+        result = RowResult()
+        self.summarizer.pop_rate_limited()
+        if target.needs_structure:
+            top_html, profile_htmls = self.fetch_site_pages(target.domain)
+            if top_html:
+                if target.needs_purpose:
+                    result.summary = self.summarizer.summarize(target.domain, top_html, profile_htmls, target.current_description)
+                result.structure = self.select_structure(target.domain, top_html)
+                if not result.structure and not self._structure_candidates(top_html)[1]:
+                    # ヘッダーをJavaScriptで後から読み込むサイト(<header>が空で、jQueryの
+                    # .load("header.html")等で差し込む)は、静的HTMLにナビが1つも無い。
+                    # JSフレームワークの検知には掛からないため、候補が1つも無い場合に限り
+                    # ブラウザで描画したトップページで判定し直す。
+                    rendered_html = self.render_top_page(target.domain)
+                    if rendered_html and rendered_html != top_html:
+                        result.structure = self.select_structure(target.domain, rendered_html)
+            else:
+                logger.warning(f"[{target.domain}] トップページを取得できなかったため、AI補完をスキップしました")
+        elif target.needs_purpose:
+            result.summary = self.summarize_domain(target.domain, target.current_description)
+        result.rate_limited = self.summarizer.pop_rate_limited()
+
+        if target.needs_pages:
+            result.pages = self.recount_pages(target.domain)
+        return result
+
+    def recount_pages(self, domain: str) -> PageRecount | None:
+        """時間予算を延ばしてサイトを巡回し直し、ページ数と、それに基づく判定をやり直す。
+
+        数え方・判定は調査本体(scraper_service.py)と同じ処理を使い、本巡回・
+        ページ数カウント専用の追加巡回の時間予算だけを延ばす。巡回できなかった
+        (ブロック・移転案内等を含む)場合はNone。
+        """
+        crawler = WebCrawler(render_js=True, timeout=self.RECOUNT_TIMEOUT, page_timeout=self.RECOUNT_PAGE_TIMEOUT)
+        crawler.COUNT_ONLY_EXTRA_TIMEOUT = self.RECOUNT_EXTRA_TIMEOUT
+        try:
+            (
+                total_pages,
+                max_depth,
+                _contact_fields,
+                _site_structure,
+                _site_purpose,
+                html_src,
+                _cms_name,
+                has_attachment,
+                has_login,
+                has_basic_auth,
+                has_multilang,
+                blocked_reason,
+                redirect_target_url,
+                queue_exhausted,
+                _subsystem_note,
+            ) = crawler.crawl_and_analyze(domain)
+        except Exception as e:
+            logger.warning(f"[{domain}] ページ数の再計測中にエラーが発生しました: {e}")
+            return None
+
+        evaluator = RenewalEvaluator()
+        total_pages_int, _ = evaluator.parse_lower_bound(total_pages)
+        if blocked_reason or redirect_target_url or total_pages_int == 0:
+            return None
+
+        eval_result, rejection_reason = evaluator.decide(
+            total_pages=total_pages_int,
+            max_depth=max_depth,
+            has_login=bool(has_login),
+            has_attachment=bool(has_attachment),
+            has_basic_auth=bool(has_basic_auth),
+            has_multilang=bool(has_multilang),
+            html_src=html_src,
+            queue_exhausted=bool(queue_exhausted),
+        )
+        remarks = ""
+        # scraper_service.pyと同様、判定保留・目視確認の注記は不可の理由ではなく備考に出す
+        if rejection_reason in (evaluator.PENDING_TIMEOUT_REASON, evaluator.NO_NG_REASON_NOTE):
+            remarks, rejection_reason = rejection_reason, ""
+
+        return PageRecount(
+            total_pages=f"{total_pages_int}以上" if isinstance(total_pages, str) else total_pages_int,
+            confirmed=not isinstance(total_pages, str) or total_pages_int >= 100,
+            evaluation_result=eval_result,
+            rejection_reason=rejection_reason,
+            remarks=remarks,
+        )
+
+    def select_structure(self, domain: str, top_html: str) -> str:
+        """トップページのHTMLから、構成列に入れるグローバルナビの項目(改行区切り)を決める。
+
+        調査本体と同じルールで取れた結果と、ページ内のメニューのリストを候補にし、
+        AIに番号で選ばせる(候補が1つでも、それがグローバルナビかどうかをAIに判定させる)。
+        AIの呼び出しに失敗した場合は、ルールで取れた結果を使う。各候補からは電話番号・
+        SNS等のナビ以外の項目を取り除き、残りが3項目未満の候補は使わない。
+        決められなかった場合は空文字。
+        """
+        rule_menus, candidates = self._structure_candidates(top_html)
+
+        chosen: list[str] = []
+        if candidates:
+            index = self.summarizer.select_global_nav(domain, candidates)
+            if index is None:
+                # API呼び出しの失敗(上限到達等)。ルールで取れた結果があればそれを使う
+                chosen = rule_menus if rule_menus in candidates else []
+            elif index != SiteSummarizer.NO_GLOBAL_NAV:
+                chosen = candidates[index]
+
+        if not chosen:
+            logger.info(f"[{domain}] 構成(グローバルナビ)を判定できませんでした(候補 {len(candidates)}件)")
+        return "\n".join(chosen)
+
+    def _structure_candidates(self, top_html: str) -> tuple[list[str], list[list[str]]]:
+        """(ルールで取れたナビ項目, AIに選ばせる候補のリスト)を返す。"""
+        crawler = WebCrawler()
+        rule_menus = crawler._extract_global_nav_menus(BeautifulSoup(top_html, HTML_PARSER), crawler._detect_cms(top_html))
+        rule_menus = self._clean_structure_items(rule_menus)
+
+        candidates: list[list[str]] = [rule_menus] if len(rule_menus) >= self.MIN_STRUCTURE_ITEMS else []
+        for menus in crawler.collect_nav_candidates(BeautifulSoup(top_html, HTML_PARSER)):
+            cleaned = self._clean_structure_items(menus)
+            if len(cleaned) >= self.MIN_STRUCTURE_ITEMS and cleaned not in candidates:
+                candidates.append(cleaned)
+        return rule_menus, candidates
+
+    @classmethod
+    def _clean_structure_items(cls, menus: list[str]) -> list[str]:
+        """メニュー項目から、電話番号・メールアドレス・外部リンク・SNS等のナビ以外の項目を除き、上限件数までに切り詰める。"""
+        cleaned = [m for m in menus if not cls.SUSPICIOUS_STRUCTURE_RE.search(m) and not cls.SNS_ITEM_RE.match(m)]
+        return cleaned[: cls.MAX_STRUCTURE_ITEMS]
 
     def summarize_domain(self, domain: str, current_description: str = "") -> str:
         top_html, profile_htmls = self.fetch_site_pages(domain)
@@ -256,24 +675,8 @@ class DescriptionEnricher:
         """(トップページのHTML, 会社概要・事業内容らしいページのHTMLのリスト)を返す。"""
         crawler = WebCrawler(render_js=True, page_timeout=self.PAGE_TIMEOUT)
 
-        if domain.startswith(("http://", "https://")):
-            candidates = [domain]
-        else:
-            candidates = [f"https://{domain}", f"http://{domain}"]
-            if not domain.lower().startswith("www."):
-                candidates += [f"https://www.{domain}", f"http://www.{domain}"]
-
         with httpx.Client(headers=crawler.headers, timeout=self.PAGE_TIMEOUT, follow_redirects=True, verify=False) as client:
-            top_html, top_url = "", ""
-            for url in candidates:
-                try:
-                    response = client.get(url)
-                except httpx.HTTPError:
-                    continue
-                if response.status_code < 400:
-                    top_html, top_url = crawler._decode_response(response), str(response.url)
-                    break
-
+            top_html, top_url = self._fetch_top_page(client, crawler, domain)
             if not top_html:
                 return "", []
 
@@ -300,6 +703,60 @@ class DescriptionEnricher:
                     profile_htmls.append(html)
 
         return top_html, profile_htmls
+
+    def render_top_page(self, domain: str) -> str:
+        """トップページをブラウザ(Playwright)で描画したHTMLを返す。取得できなければ空文字。"""
+        crawler = WebCrawler(render_js=True, page_timeout=self.PAGE_TIMEOUT)
+        with httpx.Client(headers=crawler.headers, timeout=self.PAGE_TIMEOUT, follow_redirects=True, verify=False) as client:
+            _, top_url = self._fetch_top_page(client, crawler, domain)
+        if not top_url:
+            return ""
+        return crawler._fetch_rendered_html(top_url)[0]
+
+    # トップページが同一サイト内の別ページへmeta refresh等で移動するだけの場合に、辿る回数の上限
+    MAX_TOP_PAGE_HOPS = 2
+
+    def _fetch_top_page(self, client: httpx.Client, crawler: WebCrawler, domain: str) -> tuple[str, str]:
+        """(トップページのHTML, そのURL)を返す。取得できなければ("", "")。
+
+        トップページが「自動的に移動します」のように、同一サイト内の実際の
+        トップページへmeta refresh・JavaScriptで移動するだけの薄いページの場合は、
+        移動先のページを辿る(静的取得ではmeta refreshは実行されないため)。
+        別ドメインへの移動(移転案内)は辿らない。
+        """
+        if domain.startswith(("http://", "https://")):
+            candidates = [domain]
+        else:
+            candidates = [f"https://{domain}", f"http://{domain}"]
+            if not domain.lower().startswith("www."):
+                candidates += [f"https://www.{domain}", f"http://www.{domain}"]
+
+        top_html, top_url = "", ""
+        for url in candidates:
+            try:
+                response = client.get(url)
+            except httpx.HTTPError:
+                continue
+            if response.status_code < 400:
+                top_html, top_url = crawler._decode_response(response), str(response.url)
+                break
+
+        for _ in range(self.MAX_TOP_PAGE_HOPS):
+            if not top_html:
+                break
+            target = crawler._extract_delayed_redirect_target(top_html, top_url)
+            if not target or target.split("#")[0] == top_url:
+                break
+            if urlparse(target).netloc.lower().removeprefix("www.") != urlparse(top_url).netloc.lower().removeprefix("www."):
+                break
+            try:
+                response = client.get(target)
+            except httpx.HTTPError:
+                break
+            if response.status_code >= 400:
+                break
+            top_html, top_url = crawler._decode_response(response), str(response.url)
+        return top_html, top_url
 
     def _find_profile_links(self, html: str, page_url: str) -> list[str]:
         """トップページから、会社概要・事業内容らしい同一サイト内のページURLを探す。"""
