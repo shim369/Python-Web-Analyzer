@@ -2031,7 +2031,13 @@ class WebCrawler:
                             # ラベル用の<td>は入力欄を含まないはずなので、それを条件に
                             # 別の項目の入力セルを誤って拾わないようにする。
                             prev_tds = [t for t in parent.find_previous_siblings("td") if isinstance(t, Tag)]
-                            if prev_tds and not self._contains_fillable_field(prev_tds[0]) and not self._is_hidden_element(prev_tds[0]) and not self._looks_like_hint_element(prev_tds[0]) and not self._looks_like_navigation(prev_tds[0]):
+                            if (
+                                prev_tds
+                                and not self._contains_fillable_field(prev_tds[0])
+                                and not self._is_hidden_element(prev_tds[0])
+                                and not self._looks_like_hint_element(prev_tds[0])
+                                and not self._looks_like_navigation(prev_tds[0])
+                            ):
                                 # t = self._remove_required_marks(prev_tds[0].get_text(strip=True))
                                 t = self._get_clean_element_text(prev_tds[0])
                                 if t and len(t) < 50 and re.search(r"[A-Za-zぁ-んァ-ヶー一-龠々]", t):
@@ -2044,7 +2050,12 @@ class WebCrawler:
                             own_siblings = inp.find_previous_siblings(["p", "label", "span", "div", "dt", "th"])
                             if own_siblings and isinstance(own_siblings[0], Tag):
                                 candidate = own_siblings[0]
-                                if not self._contains_fillable_field(candidate) and not self._is_hidden_element(candidate) and not self._looks_like_hint_element(candidate) and not self._looks_like_navigation(candidate):
+                                if (
+                                    not self._contains_fillable_field(candidate)
+                                    and not self._is_hidden_element(candidate)
+                                    and not self._looks_like_hint_element(candidate)
+                                    and not self._looks_like_navigation(candidate)
+                                ):
                                     t = self._get_clean_element_text(candidate)
                                     if t and len(t) < 50 and re.search(r"[A-Za-zぁ-んァ-ヶー一-龠々]", t):
                                         resolved_text = t
@@ -2094,7 +2105,12 @@ class WebCrawler:
                             ]
                             if siblings:
                                 candidate = siblings[0]
-                                if not self._contains_fillable_field(candidate) and not self._is_hidden_element(candidate) and not self._looks_like_hint_element(candidate) and not self._looks_like_navigation(candidate):
+                                if (
+                                    not self._contains_fillable_field(candidate)
+                                    and not self._is_hidden_element(candidate)
+                                    and not self._looks_like_hint_element(candidate)
+                                    and not self._looks_like_navigation(candidate)
+                                ):
                                     # t = self._remove_required_marks(candidate.get_text(strip=True))
                                     t = self._get_clean_element_text(candidate)
                                     if t and len(t) < 50 and re.search(r"[A-Za-zぁ-んァ-ヶー一-龠々]", t):
@@ -2158,7 +2174,8 @@ class WebCrawler:
     _NETWORK_BLOCK_SIGNATURES: list[tuple[list[str], str]] = [
         (
             ["fortinet webfilter"],
-            "Fortinet Webfilter（ネットワーク側のセキュリティ機器）によりアクセスがブロックされたため、実際のサイト内容を取得できませんでした。別ネットワークからの再調査、または手動確認をお願いします。",
+            "Fortinet Webfilter（ネットワーク側のセキュリティ機器）によりアクセスがブロックされたため、"
+            "実際のサイト内容を取得できませんでした。別ネットワークからの再調査、または手動確認をお願いします。",
         ),
         (
             ["this connection is invalid", "ssl certificate"],
@@ -2319,7 +2336,11 @@ class WebCrawler:
             "tlsv1_alert",
         ]
         if any(k in err_text for k in ssl_error_keywords):
-            return "SSL証明書関連のエラー（期限切れ・不正な証明書等）により接続できませんでした。Fortinet等のネットワーク機器によるSSLインスペクション/ブロックの可能性もあるため、別ネットワークからの再調査、または手動確認をお願いします。"
+            return (
+                "SSL証明書関連のエラー（期限切れ・不正な証明書等）により接続できませんでした。"
+                "Fortinet等のネットワーク機器によるSSLインスペクション/ブロックの可能性もあるため、"
+                "別ネットワークからの再調査、または手動確認をお願いします。"
+            )
         return ""
 
     def _extract_fortinet_category(self, html: str) -> str:
@@ -2382,7 +2403,11 @@ class WebCrawler:
             if all(k in html_lower for k in keywords):
                 category = self._extract_fortinet_category(html)
                 if category:
-                    return f"ネットワーク側のセキュリティ機器（Fortinet等）により「{category}」に該当するとしてアクセスがブロックされました。実際のサイト内容を取得できませんでした。別ネットワークからの再調査、または手動確認をお願いします。"
+                    return (
+                        f"ネットワーク側のセキュリティ機器（Fortinet等）により「{category}」に該当するとして"
+                        "アクセスがブロックされました。実際のサイト内容を取得できませんでした。"
+                        "別ネットワークからの再調査、または手動確認をお願いします。"
+                    )
                 return reason
 
         return ""
@@ -3313,7 +3338,14 @@ class WebCrawler:
                         # 無いことがある(実際に確認済み)。Playwrightでのレンダリングは
                         # 通常トップページにしか行わないため、お問い合わせページに限り
                         # レンダリングし直してフォームを探す。
-                        if is_contact_url and not contact_fields and self.render_js and contact_page_renders < self.MAX_CONTACT_PAGE_RENDERS and not soup.find(["input", "textarea", "select"]) and self._detect_js_framework(current_html):
+                        if (
+                            is_contact_url
+                            and not contact_fields
+                            and self.render_js
+                            and contact_page_renders < self.MAX_CONTACT_PAGE_RENDERS
+                            and not soup.find(["input", "textarea", "select"])
+                            and self._detect_js_framework(current_html)
+                        ):
                             contact_page_renders += 1
                             rendered_contact_html, _rendered_url, _rendered_status, _nav_error = self._fetch_rendered_html(resolved_url)
                             if rendered_contact_html:
