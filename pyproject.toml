@@ -12,6 +12,7 @@ dependencies = [
     "playwright>=1.61.0",
     "requests>=2.34.2",
     "streamlit>=1.59.2",
+    "truststore>=0.10.5",
 ]
 
 [dependency-groups]

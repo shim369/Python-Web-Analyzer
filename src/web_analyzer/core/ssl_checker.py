@@ -1,11 +1,33 @@
 import logging
+import ssl
+from typing import Any
 from urllib.parse import urlparse
 
 import requests
+import truststore
+from requests.adapters import HTTPAdapter
 
 from web_analyzer.utils.decorators import measure_time
 
 logger = logging.getLogger(__name__)
+
+
+class _OsTrustStoreAdapter(HTTPAdapter):
+    """証明書の検証をOS(Windowsなど)の仕組みで行うHTTPAdapter。
+
+    requests標準(certifi)の検証では、ブラウザでは問題なく鍵マーク付きで
+    表示されるサイトでも次のケースで失敗し、SSL列が空欄になっていた。
+    - サーバーが中間証明書を送っていない(ブラウザ・OSは証明書に書かれた
+      取得先から中間証明書を自動で補う)
+    - certifiにまだ入っていない新しいルート証明書を使っている
+      (例: SECOM TLS RSA Root CA 2024。OSは必要に応じて取り寄せる)
+    OSの検証はブラウザと同じく、期限切れ・ホスト名不一致・自己署名・
+    信頼されていない発行元はこれまでどおりエラーにする。
+    """
+
+    def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
+        kwargs["ssl_context"] = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        super().init_poolmanager(*args, **kwargs)
 
 
 class SslChecker:
@@ -33,6 +55,7 @@ class SslChecker:
         """Simple Session without unnecessary adapters."""
         session = requests.Session()
         # ConnectionResetErrorやタイムアウト時はすぐに次の判定に進むため、自動リトライは外す
+        session.mount("https://", _OsTrustStoreAdapter())
         return session
 
     def _safe_get(self, session: requests.Session, url: str, allow_redirects: bool = True) -> requests.Response:

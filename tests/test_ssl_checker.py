@@ -4,7 +4,7 @@ import pytest
 import requests
 from _pytest.monkeypatch import MonkeyPatch
 
-from web_analyzer.core.ssl_checker import SslChecker
+from web_analyzer.core.ssl_checker import SslChecker, _OsTrustStoreAdapter
 
 
 class FakeResponse:
@@ -187,3 +187,16 @@ def test_www_domain_input_does_not_trigger_further_retry(
     assert has_ssl is None
     assert is_always_ssl is None
     assert not any("www.www." in url for url in fake.calls)
+
+
+def test_session_verifies_certificates_with_os_trust_store() -> None:
+    """証明書の検証はcertifiではなくOSの仕組み(ブラウザと同じ)で行う。
+
+    中間証明書を送っていないサイトや、certifiに無い新しいルート証明書のサイトでも、
+    ブラウザと同じくSSLありと判定するため。
+    """
+    session = SslChecker()._get_session()
+    try:
+        assert isinstance(session.get_adapter("https://example.com"), _OsTrustStoreAdapter)
+    finally:
+        session.close()
