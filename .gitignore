@@ -20,5 +20,10 @@ temp/
 
 data/
 
+# Environment variables
+.env
+.env.*
+!.env.example
+
 # Streamlit secrets (GEMINI_API_KEY etc.)
 .streamlit/secrets.toml

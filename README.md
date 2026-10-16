@@ -120,6 +120,7 @@ PYTHON-WEB-ANALYZER/
 ├── .github/workflows/ci.yml   # GitHub Actions CI定義
 ├── .streamlit/config.toml     # Streamlitサーバー設定（ポート8502等）
 ├── .streamlit/secrets.toml    # （任意・Git管理外）GEMINI_API_KEY の設定
+├── .streamlit/secrets.toml.example # secrets.toml の雛形
 ├── docs/                      # ドキュメント関連ファイル
 │   ├── images/                # スクリーンショット・アイコン
 │   ├── model_design.md        # クラス設計・モデル設計
@@ -215,6 +216,12 @@ uv run web-analyzer
 ### Gemini APIキーの設定（用途・構成のAI補完を使う場合のみ）
 
 `.streamlit/secrets.toml` に記載するか、環境変数 `GEMINI_API_KEY` を設定します（`secrets.toml` → 環境変数の順に参照）。Windowsの `setx` で設定した環境変数は、設定前から開いていたターミナル（VS Codeの内蔵ターミナルはVS Code自体の再起動まで）から起動したアプリには反映されないため、`secrets.toml` での設定を推奨します。
+
+雛形の `.streamlit/secrets.toml.example` をコピーして作成できます。
+
+```bash
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml
+```
 
 ```toml
 # .streamlit/secrets.toml
