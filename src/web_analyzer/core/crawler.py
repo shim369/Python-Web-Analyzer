@@ -6,8 +6,7 @@ import time
 import warnings
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from typing import cast
-from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup, NavigableString, Tag, XMLParsedAsHTMLWarning
@@ -742,6 +741,412 @@ class WebCrawler:
 
         return ""
 
+    def _extract_global_nav_menus(self, soup: BeautifulSoup, cms_name: str) -> list[str]:
+        """トップページのグローバルナビゲーションのメニュー項目名を、表示順に返す(「構成」列用)。"""
+        menus: list[str] = []
+
+        # --- 1. メインナビ領域の候補をスコア判定で特定 ---
+        def find_main_nav_element(soup: BeautifulSoup) -> Tag | None:
+            nav_pattern = re.compile(
+                r"gnav|rglnav|gmenu|global|main-?menu|navbar-?nav|"
+                r"header-?menu|header__nav|navigation|menu",
+                re.I,
+            )
+
+            candidates: list[Tag] = []
+
+            # nav / header はクラス名に関係なく候補にする
+            candidates.extend(soup.find_all(["nav", "header"]))
+
+            # ul / div はナビらしい class / id を持つものだけ候補にする
+            candidates.extend(
+                soup.find_all(
+                    ["ul", "div"],
+                    class_=nav_pattern,
+                )
+            )
+            candidates.extend(
+                soup.find_all(
+                    ["ul", "div"],
+                    id=re.compile(
+                        r"nav|menu|glnav|gnav|gmenu|lh|header",
+                        re.I,
+                    ),
+                )
+            )
+
+            # 重複除去
+            unique_candidates = []
+            seen_ids = set()
+
+            for tag in candidates:
+                tag_id = id(tag)
+                if tag_id not in seen_ids:
+                    seen_ids.add(tag_id)
+                    unique_candidates.append(tag)
+
+            candidates = unique_candidates
+
+            best_el = None
+            max_score = -100
+
+            for cand in candidates:
+                # WordPressはメニュー名からidを作るため、日本語のメニュー名が
+                # "menu-%e3%83%95%e3%83%83..."(=フッターメニュー)のようにURLエンコード
+                # されたidになる。デコードしてから判定しないと"フッター"を見落とす。
+                attr_str = unquote(f"{cand.get('id', '')} {' '.join(cand.get('class', []))}").lower()
+
+                # メニュー項目(li)の中にある要素は、ドロップダウンの子メニューであって
+                # グローバルナビ本体ではない(class名に"menu"を含むため高得点になりやすい)。
+                # フッター内のメニューも同様に対象外
+                if cand.find_parent("li") is not None or self._is_in_page_footer(cand) or "フッター" in attr_str:
+                    continue
+
+                if any(
+                    k in attr_str
+                    for k in [
+                        "footer",
+                        "side",
+                        "widget",
+                        "search",
+                        "drawer",
+                        "modal",
+                        "news",
+                        "page",
+                        "content",
+                    ]
+                ):
+                    continue
+
+                score = 0
+
+                # nav は強く優先
+                if cand.name == "nav":
+                    score += 30
+                elif cand.name == "header":
+                    score += 5
+
+                # class / id にナビ関連語があれば加点
+                if nav_pattern.search(attr_str):
+                    score += 50
+                elif re.search(r"menu|nav|lh", attr_str):
+                    score += 20
+
+                # リンク数。メニューのリストがある場合はトップレベルの項目数で数える
+                # (ドロップダウン/メガメニューの子リンクまで数えると、本物の
+                # グローバルナビほど30件を超えて減点され、カルーセルの送りボタン等の
+                # 別の領域に負けていた。実際に確認済み)
+                menu_items = self._menu_list_items(cand)
+                a_count = len(menu_items) if len(menu_items) >= 3 else len(cand.find_all("a"))
+
+                if 3 <= a_count <= 25:
+                    score += 30
+                elif a_count > 30:
+                    score -= 40
+
+                # 同点の場合は、メニュー項目(トップレベルのli)の多い方を優先する。
+                # ヘッダー上部の「その他/お問い合わせ」のような小さなボタン群のnavと、
+                # 本来のグローバルナビのnavが同じ点数になり、文書順で先に出てくる
+                # 前者が選ばれていた(実際に確認済み)。
+                score += min(len(menu_items), 12)
+
+                if score > max_score:
+                    max_score = score
+                    best_el = cand
+
+            return best_el if max_score >= 15 else None
+
+        # --- 3. メインナビ領域の確定 ---
+        target_area = find_main_nav_element(soup)
+        wix_menus = self._extract_wix_global_nav(soup) if cms_name == "Wix" else []
+
+        if not target_area and not wix_menus:
+            header_el = soup.find("header") or soup.find("div", id=re.compile(r"header|lh", re.I))
+            if isinstance(header_el, Tag):
+                candidate_nav = header_el.find(
+                    ["ul", "nav"],
+                    class_=re.compile(r"nav|menu|gnav", re.I),
+                ) or header_el.find("nav")
+                target_area = candidate_nav if isinstance(candidate_nav, Tag) else header_el
+
+        if wix_menus:
+            for menu_text in wix_menus:
+                if menu_text in ["×", "閉じる", "MENU", "メニュー", "標準", "拡大", "検索", "メニューを飛ばす"]:
+                    continue
+                if menu_text not in menus:
+                    menus.append(menu_text)
+        elif target_area:
+            menus = self._menu_texts_from_area(target_area)
+
+        # ヘッダーにメニューが無く、サイト全体共通のサイドバー(aside.sidebar等)や
+        # ハンバーガーメニューで開くドロワーにだけグローバルナビを置いているサイトが
+        # ある(実際に確認済み)。ブログのカテゴリ一覧等のサイドバーを誤って拾わない
+        # よう、上記で3項目未満しか取れなかった場合に限り、本文領域の外にある
+        # サイドバー・ドロワーのメニューを探す。
+        if len(menus) < 3 and not wix_menus:
+            sidebar_nav = self._find_sidebar_nav(soup)
+            if sidebar_nav is not None:
+                sidebar_menus = self._menu_texts_from_area(sidebar_nav)
+                if len(sidebar_menus) >= 3:
+                    menus = sidebar_menus
+
+        return menus
+
+    # メニュー名に添えられた英語表記・副題(<span class="en">About</span>等)のclass名。
+    # 以前は部分一致で判定していたため、"menu"や"center"のように"en"を含むだけの
+    # class名でもメニュー名そのものを消してしまい、構成が空欄になっていた
+    # (実際に確認済み: <span class="l-header__menu-bottom-box">製品のご案内</span>)。
+    # class名の区切り("-"/"_")単位か、キャメルケースの語として現れる場合に限る。
+    SUB_LABEL_CLASS_RE = re.compile(r"(?:^|[-_])(?:sub|subtitle|en|eng|english|ruby)(?:$|[-_\d])", re.I)
+    SUB_LABEL_CAMEL_CLASS_RE = re.compile(r"[a-z](?:Sub|En|Eng|English|Ruby)(?:$|[-_A-Z\d])")
+
+    @classmethod
+    def _is_sub_label_class(cls, class_name: str | None) -> bool:
+        if not class_name:
+            return False
+        return bool(cls.SUB_LABEL_CLASS_RE.search(class_name) or cls.SUB_LABEL_CAMEL_CLASS_RE.search(class_name))
+
+    # メニュー項目として扱わない文言(ハンバーガーメニューの開閉ボタン、文字サイズ切替等)
+    NON_MENU_TEXTS = frozenset(["×", "閉じる", "MENU", "メニュー", "標準", "拡大", "検索", "メニューを飛ばす"])
+
+    # スマートフォン表示でだけ出すメニュー項目に付けられる典型的なclass名。
+    # PC表示のグローバルナビに無い項目が「構成」に混ざるため除外する。
+    SP_ONLY_CLASS_RE = re.compile(
+        r"^(sp|is-sp|u-sp|sp[-_]?only|only[-_]?sp|show[-_]?sp|sp[-_]?show|visible[-_]?(sp|xs)|"
+        r"(hidden|hide|none)[-_]?pc|pc[-_]?(hidden|hide|none)|d-(md|lg)-none)$",
+        re.I,
+    )
+
+    # <li>項目名<a class="link"></a></li>のような、中身の無いリンクを重ねた項目で、
+    # liの文字列を項目名とみなす最大文字数
+    OVERLAY_LINK_LABEL_MAX_LEN = 20
+
+    def _menu_list_items(self, area: Tag) -> list[Tag]:
+        """ナビ領域内で、グローバルナビ本体とみなすリストのトップレベル項目(li)を返す。
+
+        ナビ領域内に複数のリスト(本体のメニューと「お問い合わせ/WEB見積もり」のような
+        小さなボタン群)がある場合、以前はclass/idに"nav"/"menu"を含むものを
+        優先していたため、id="global"の本体ではなくid="nav-sub"のボタン群を
+        拾っていた(実際に確認済み)。名前ではなく、トップレベルの項目数が
+        最も多いリストを本体とみなす。ドロップダウンの中のリスト(li配下のリスト)は
+        項目数が多くても本体ではないため対象外にする。
+        """
+        lists = [area] if area.name in ("ul", "ol") else []
+        lists += [ul for ul in area.find_all(["ul", "ol"]) if not any(p is not area and p.name == "li" for p in self._ancestors_within(ul, area))]
+
+        best: list[Tag] = []
+        for lst in lists:
+            # <ul><a href="/x/"><li>項目</li></a>…のように、リンクの中にliを置いた
+            # 崩れたマークアップ(実際に確認済み)のliも、リスト直下の項目として数える
+            items = [li for li in lst.find_all("li") if isinstance(li, Tag) and self._is_top_level_item(li, lst)]
+            if not items:
+                # <ul><div><li>...のような崩れたマークアップ
+                first_li = lst.find("li")
+                if isinstance(first_li, Tag) and isinstance(first_li.parent, Tag):
+                    items = [li for li in first_li.parent.find_all("li", recursive=False) if isinstance(li, Tag)]
+            if len(items) > len(best):
+                best = items
+        return best
+
+    @staticmethod
+    def _is_top_level_item(li: Tag, lst: Tag) -> bool:
+        """liがリストlstの直下の項目か(リスト直下のリンクに包まれたliを含む)。"""
+        parent = li.parent
+        if parent is lst:
+            return True
+        return isinstance(parent, Tag) and parent.name == "a" and parent.parent is lst
+
+    @staticmethod
+    def _is_in_page_footer(el: Tag) -> bool:
+        """ページ全体のフッター(<footer>)の中にあるか。
+
+        <section>等の中の<footer>は「そのセクションのフッター」で、ページ上部の
+        ヘッダー領域のセクション内にグローバルナビを置くサイトもあるため対象外。
+        """
+        for footer in el.find_parents("footer"):
+            if footer.find_parent(["section", "article", "aside", "header", "main", "nav"]) is None:
+                return True
+        return False
+
+    @staticmethod
+    def _ancestors_within(el: Tag, area: Tag) -> list[Tag]:
+        """elの祖先のうち、areaより内側(area自身を含む)にあるものを返す。"""
+        result: list[Tag] = []
+        for parent in el.parents:
+            result.append(parent)
+            if parent is area:
+                break
+        return result
+
+    def _is_sp_only_item(self, li: Tag) -> bool:
+        # <a class="sp-only"><li>…</li></a>のように、liを包むリンク側に付いている場合も見る
+        elements = [li, li.parent] if isinstance(li.parent, Tag) and li.parent.name == "a" else [li]
+        for el in elements:
+            classes = el.get("class") or []
+            if any(self.SP_ONLY_CLASS_RE.match(c) for c in classes):
+                return True
+            style = str(el.get("style", "")).replace(" ", "").lower()
+            if "display:none" in style:
+                return True
+        return False
+
+    def _menu_item_label_link(self, li: Tag) -> Tag | None:
+        """メニュー項目(li)の見出しとなる要素を返す。
+
+        ドロップダウンを持つ親項目は、見出し自体がリンクでなく<span>等の場合があり
+        (実際に確認済み: <li><span>各注意事項</span><div class="drop-down">…子リンク…</div></li>)、
+        liの中の最初の<a>を拾うと子メニューのリンク名になってしまう。li直下の
+        子メニュー(リスト・複数リンクを含むパネル)を取り除いた残りから見出しを探し、
+        <a>があればそれを、無ければ残りの要素(見出しテキスト)を返す。
+        """
+        if li.find("a") is None and isinstance(li.parent, Tag) and li.parent.name == "a" and li.parent.get("href"):
+            # <a href="/x/"><li>項目</li></a>のような、リンクの中にliを置いた崩れたマークアップ
+            return li.parent
+        li_copy = BeautifulSoup(str(li), HTML_PARSER).find("li")
+        if not isinstance(li_copy, Tag):
+            return None
+        has_submenu = False
+        # パネルの判定(リンク数)にリスト内のリンクも数えるため、リストより先に除去する
+        for panel in li_copy.find_all(["div", "section"]):
+            if panel.decomposed:
+                continue
+            if len(panel.find_all("a")) >= 2 or panel.find(["ul", "ol"]) is not None:
+                panel.decompose()
+                has_submenu = True
+        for submenu in li_copy.find_all(["ul", "ol"]):
+            submenu.decompose()
+            has_submenu = True
+
+        label_link = next((a for a in li_copy.find_all("a") if a.get_text(strip=True) or a.find("img")), None)
+        if isinstance(label_link, Tag):
+            return label_link
+        # リンクでない見出しを採るのは、子メニューを持つ親項目に限る
+        # (コピーライト表記等、ナビのリスト内にある単なる文字列を拾わないため)
+        if has_submenu and li_copy.get_text(strip=True):
+            return li_copy
+        # <li>特装車<a href="speq.html" class="link"></a></li>のように、項目名はliに書き、
+        # 中身の無いリンクを項目全体に重ねてクリック範囲にしている作り(実際に確認済み)。
+        # 説明文付きのカード(本文の一覧)を拾わないよう、項目名らしい短い文字列に限る
+        if len(li_copy.find_all("a")) == 1 and 0 < len(li_copy.get_text(strip=True)) <= self.OVERLAY_LINK_LABEL_MAX_LEN:
+            return li_copy
+        # 見出しが取れない場合は従来どおりli内の最初のリンク
+        first_a = li.find("a")
+        return first_a if isinstance(first_a, Tag) else None
+
+    def _menu_link_text(self, a_tag: Tag) -> str:
+        """メニューのリンク(または見出し要素)から、英語表記・副題を除いた項目名を取り出す。"""
+        a_copy: BeautifulSoup = BeautifulSoup(str(a_tag), HTML_PARSER)
+
+        for sub in a_copy.find_all(["span", "small", "p", "em", "i"], class_=self._is_sub_label_class):
+            sub.decompose()
+
+        # aタグ内の子要素を含めてリンク文字列を取得
+        raw_text = a_copy.get_text(" ", strip=True)
+
+        if not raw_text:
+            img = a_tag.find("img")
+            if img and isinstance(img, Tag):
+                alt = img.get("alt")
+                title = img.get("title")
+
+                if isinstance(alt, list):
+                    alt = " ".join(alt)
+                if isinstance(title, list):
+                    title = " ".join(title)
+
+                raw_text = alt or title or ""
+
+        return self._clean_menu_text(str(raw_text))
+
+    def collect_nav_candidates(self, soup: BeautifulSoup, max_candidates: int = 12) -> list[list[str]]:
+        """ページ内の「グローバルナビかもしれないメニューのリスト」の項目名を、文書順に返す。
+
+        構成列をAIで補完する際に、AIにはこの候補の中から番号で選ばせる(AIが項目名を
+        言い換えたり、存在しない項目を作ったりしないようにするため)。ドロップダウンの
+        子メニュー(li配下のリスト)とページ全体のフッターは除き、項目が3〜15件の
+        リストに限る。項目名がまったく同じリスト(PC用とスマホ用の重複等)は1つにまとめる。
+        """
+        candidates: list[list[str]] = []
+        for lst in soup.find_all(["ul", "ol"]):
+            if not isinstance(lst, Tag) or lst.find_parent("li") is not None or self._is_in_page_footer(lst):
+                continue
+            if lst.find_parent(["main", "article"]) is not None:
+                continue
+            items = self._menu_list_items(lst)
+            if not 3 <= len(items) <= 15:
+                continue
+            menus = self._menu_texts_from_area(lst)
+            if len(menus) >= 3 and menus not in candidates:
+                candidates.append(menus)
+            if len(candidates) >= max_candidates:
+                return candidates
+
+        # ul/liを使わず、テーブルやdivの中にリンク(画像リンクを含む)を並べただけの
+        # 古い作りのナビもある(実際に確認済み)。リストの外にあるリンクを、最も近い
+        # ブロック要素ごとにまとめて候補にする。
+        groups: dict[int, list[Tag]] = {}
+        for a in soup.find_all("a", href=True):
+            if not isinstance(a, Tag) or a.find_parent(["ul", "ol", "main", "article"]) is not None or self._is_in_page_footer(a):
+                continue
+            container = a.find_parent(["div", "table", "nav", "header", "section", "aside", "p", "center", "body"])
+            if isinstance(container, Tag):
+                groups.setdefault(id(container), []).append(a)
+        for links in groups.values():
+            if not 3 <= len(links) <= 15:
+                continue
+            menus = []
+            for a in links:
+                text = self._menu_link_text(a)
+                if text and text not in self.NON_MENU_TEXTS and text not in menus and not self._is_multilang_element(a, text):
+                    menus.append(text)
+            if len(menus) >= 3 and menus not in candidates:
+                candidates.append(menus)
+            if len(candidates) >= max_candidates:
+                break
+        return candidates
+
+    def _menu_texts_from_area(self, target_area: Tag) -> list[str]:
+        """ナビ領域からメニュー項目名を表示順・重複なしで取り出す。"""
+        target_links: list[Tag] = []
+        items = self._menu_list_items(target_area)
+        if items:
+            for li in items:
+                if self._is_sp_only_item(li):
+                    continue
+                label = self._menu_item_label_link(li)
+                if label is not None:
+                    target_links.append(label)
+        else:
+            target_links = [link for link in target_area.find_all("a") if isinstance(link, Tag)]
+
+        menus: list[str] = []
+        for a_tag in target_links:
+            menu_text = self._menu_link_text(a_tag)
+            if not menu_text or menu_text in self.NON_MENU_TEXTS:
+                continue
+            if self._is_multilang_element(a_tag, menu_text):
+                continue
+            if menu_text not in menus:
+                menus.append(menu_text)
+        return menus
+
+    def _find_sidebar_nav(self, soup: BeautifulSoup) -> Tag | None:
+        """本文領域の外にある、サイト共通のサイドバー・ドロワーのナビ(3〜12項目のリスト)を探す。"""
+        excluded_attr_re = re.compile(r"footer|widget|content|main|article|post|entry|news|blog|archive|categor", re.I)
+        side_attr_re = re.compile(r"side|drawer|hamburger|offcanvas|off-canvas|mobile-?nav|sp-?nav|slide-?menu", re.I)
+        sides = soup.find_all(["aside", "div", "nav"], class_=side_attr_re) + soup.find_all(["div", "nav"], id=side_attr_re) + soup.find_all("aside")
+        for cand in sides:
+            if not isinstance(cand, Tag):
+                continue
+            # <body>のclassにはWordPressが"home blog"等のページ種別を付けるため、body手前までを見る
+            chain = [cand, *(p for p in cand.parents if p.name not in ("body", "html", "[document]"))]
+            if any(isinstance(el, Tag) and (el.name in ("main", "article", "footer") or excluded_attr_re.search(f"{el.get('id', '')} {' '.join(el.get('class') or [])}")) for el in chain):
+                continue
+            items = self._menu_list_items(cand)
+            if 3 <= len(items) <= 12:
+                return cand
+        return None
+
     def _extract_wix_global_nav(self, soup: BeautifulSoup) -> list[str]:
         """Wix製サイト専用のグローバルナビ抽出。
         Wixはビルドごとにclass名がハッシュ化されるため、class名ではなく
@@ -874,6 +1279,12 @@ class WebCrawler:
     def _clean_menu_text(self, text: str) -> str:
         """交通アクセスAccess のような英日混在から不要な英語やスペースを綺麗にする"""
         text = re.sub(r"\s+", "", text)
+        # 行頭の装飾記号(<span>●</span>HOME 等)
+        text = re.sub(r"^[●○■□◆◇▶▷►▸・>＞»›]+", "", text)
+        # 行末の矢印記号(「会社概要→」等。外部リンクの「↗」は構成補完側で判定に使うため残す)
+        text = re.sub(r"[→➔➜]+$", "", text)
+        # Material Iconsのアイコン名(合字で矢印として表示される文字列。例: 企業情報keyboard_arrow_down)
+        text = re.sub(r"(keyboard_arrow_(down|up|left|right)|expand_(more|less)|chevron_(right|left)|arrow_(drop_down|forward|right_alt))$", "", text)
         match = re.match(r"^([ぁ-んァ-ヶー一-龠々]+)[A-Za-z]+$", text)
         if match:
             return match.group(1)
@@ -3102,201 +3513,9 @@ class WebCrawler:
                             # 多言語切り替え機能の有無を検知
                             has_multilang = self._detect_multilang_switcher(soup)
 
-                            # --- 1. メインナビ領域の候補をスコア判定で特定 ---
-                            def find_main_nav_element(soup: BeautifulSoup) -> Tag | None:
-                                nav_pattern = re.compile(
-                                    r"gnav|rglnav|gmenu|global|main-?menu|navbar-?nav|"
-                                    r"header-?menu|header__nav|navigation|menu",
-                                    re.I,
-                                )
-
-                                candidates: list[Tag] = []
-
-                                # nav / header はクラス名に関係なく候補にする
-                                candidates.extend(soup.find_all(["nav", "header"]))
-
-                                # ul / div はナビらしい class / id を持つものだけ候補にする
-                                candidates.extend(
-                                    soup.find_all(
-                                        ["ul", "div"],
-                                        class_=nav_pattern,
-                                    )
-                                )
-                                candidates.extend(
-                                    soup.find_all(
-                                        ["ul", "div"],
-                                        id=re.compile(
-                                            r"nav|menu|glnav|gnav|gmenu|lh|header",
-                                            re.I,
-                                        ),
-                                    )
-                                )
-
-                                # 重複除去
-                                unique_candidates = []
-                                seen_ids = set()
-
-                                for tag in candidates:
-                                    tag_id = id(tag)
-                                    if tag_id not in seen_ids:
-                                        seen_ids.add(tag_id)
-                                        unique_candidates.append(tag)
-
-                                candidates = unique_candidates
-
-                                best_el = None
-                                max_score = -100
-
-                                for cand in candidates:
-                                    attr_str = (f"{cand.get('id', '')} {' '.join(cand.get('class', []))}").lower()
-
-                                    if any(
-                                        k in attr_str
-                                        for k in [
-                                            "footer",
-                                            "side",
-                                            "widget",
-                                            "search",
-                                            "drawer",
-                                            "modal",
-                                            "news",
-                                            "page",
-                                            "content",
-                                        ]
-                                    ):
-                                        continue
-
-                                    score = 0
-
-                                    # nav は強く優先
-                                    if cand.name == "nav":
-                                        score += 30
-                                    elif cand.name == "header":
-                                        score += 5
-
-                                    # class / id にナビ関連語があれば加点
-                                    if nav_pattern.search(attr_str):
-                                        score += 50
-                                    elif re.search(r"menu|nav|lh", attr_str):
-                                        score += 20
-
-                                    # リンク数
-                                    a_count = len(cand.find_all("a"))
-
-                                    if 3 <= a_count <= 25:
-                                        score += 30
-                                    elif a_count > 30:
-                                        score -= 40
-
-                                    if score > max_score:
-                                        max_score = score
-                                        best_el = cand
-
-                                return best_el if max_score >= 15 else None
-
-                            # --- 2. リンクからテキストを抽出 ---
-                            def extract_text_from_link(a_tag: Tag) -> str:
-                                a_copy: BeautifulSoup = BeautifulSoup(str(a_tag), HTML_PARSER)
-
-                                for sub in a_copy.find_all(
-                                    ["span", "small", "p", "em", "i"],
-                                    class_=re.compile(r"sub|subtitle|en|english|ruby", re.I),
-                                ):
-                                    sub.decompose()
-
-                                # aタグ内の子要素を含めてリンク文字列を取得
-                                raw_text = a_copy.get_text(" ", strip=True)
-
-                                if not raw_text:
-                                    img = a_tag.find("img")
-                                    if img and isinstance(img, Tag):
-                                        alt = img.get("alt")
-                                        title = img.get("title")
-
-                                        if isinstance(alt, list):
-                                            alt = " ".join(alt)
-                                        if isinstance(title, list):
-                                            title = " ".join(title)
-
-                                        raw_text = alt or title or ""
-
-                                return self._clean_menu_text(str(raw_text))
-
-                            # --- 3. メインナビ領域の確定 ---
-                            target_area = find_main_nav_element(soup)
-                            wix_menus = self._extract_wix_global_nav(soup) if cms_name == "Wix" else []
-
-                            if not target_area and not wix_menus:
-                                header_el = soup.find("header") or soup.find("div", id=re.compile(r"header|lh", re.I))
-                                if isinstance(header_el, Tag):
-                                    candidate_nav = header_el.find(
-                                        ["ul", "nav"],
-                                        class_=re.compile(r"nav|menu|gnav", re.I),
-                                    ) or header_el.find("nav")
-                                    target_area = candidate_nav if isinstance(candidate_nav, Tag) else header_el
-
-                            if wix_menus:
-                                for menu_text in wix_menus:
-                                    if menu_text in ["×", "閉じる", "MENU", "メニュー", "標準", "拡大", "検索", "メニューを飛ばす"]:
-                                        continue
-                                    if menu_text not in global_nav_menus:
-                                        global_nav_menus.append(menu_text)
-                            elif target_area:
-                                target_links: list[Tag] = []
-
-                                if target_area.name == "ul":
-                                    main_ul: Tag | None = target_area
-                                else:
-                                    main_ul = cast(
-                                        Tag | None,
-                                        (target_area.find("ul", class_=re.compile(r"nav|menu|gnav|gmenu", re.I)) or target_area.find("ul", id=re.compile(r"nav|menu|gnav|gmenu", re.I)) or target_area.find("ul")),
-                                    )
-
-                                if isinstance(main_ul, Tag):
-                                    lis = main_ul.find_all("li", recursive=False)
-
-                                    if not lis:
-                                        first_li_result = main_ul.find("li")
-
-                                        if isinstance(first_li_result, Tag) and isinstance(first_li_result.parent, Tag):
-                                            lis = first_li_result.parent.find_all("li", recursive=False)
-
-                                    for li in lis:
-                                        all_a = li.find_all("a")
-                                        if all_a and isinstance(all_a[0], Tag):
-                                            target_links.append(all_a[0])
-
-                                else:
-                                    target_links = [link for link in target_area.find_all("a") if isinstance(link, Tag)]
-
-                                for a_tag in target_links:
-                                    href = a_tag.get("href", "")
-
-                                    if isinstance(href, list):
-                                        href = href[0] if href else ""
-
-                                    href = str(href).strip().lower()
-
-                                    menu_text = extract_text_from_link(a_tag)
-
-                                    if not menu_text:
-                                        continue
-                                    if menu_text in [
-                                        "×",
-                                        "閉じる",
-                                        "MENU",
-                                        "メニュー",
-                                        "標準",
-                                        "拡大",
-                                        "検索",
-                                        "メニューを飛ばす",
-                                    ]:
-                                        continue
-                                    if self._is_multilang_element(a_tag, menu_text):
-                                        continue
-
-                                    if menu_text not in global_nav_menus:
-                                        global_nav_menus.append(menu_text)
+                            for menu_text in self._extract_global_nav_menus(soup, cms_name):
+                                if menu_text not in global_nav_menus:
+                                    global_nav_menus.append(menu_text)
 
                         # お問い合わせ判定
                         is_contact_url = self._url_has_keyword(resolved_url, self.CONTACT_KEYWORDS)
