@@ -70,8 +70,19 @@ class WebCrawler:
     ]
     _REQUIRED_MARK_RE = re.compile("|".join(REQUIRED_MARK_PATTERNS))
     _TEMPLATE_VAR_RE = re.compile(r"\{\{.*?\}\}")
+    # 「必須」「任意」のマークを囲む括弧の種類
+    _MARK_OPEN = r"[\(（\[［【〔〈《「『｛{<＜]"
+    _MARK_CLOSE = r"[\)）\]］】〕〉》」』｝}>＞]"
+    _MARK_WORDS = r"(?:必須項目|任意項目|必須|任意|required|optional)"
+    # 括弧で囲まれた「必須」「任意」等のマーク(「会社名【任意】」「お名前<必須>」「Company (optional)」等)。
+    # 「任意」は語句の一部(「任意団体名」等)としても使われるため、単独では消さず、括弧で囲まれた
+    # もの・記号付きのもの・項目名の端にあるものに限って消す
+    _BRACKETED_MARK_RE = re.compile(rf"{_MARK_OPEN}\s*{_MARK_WORDS}\s*{_MARK_CLOSE}", re.I)
+    _PREFIXED_OPTIONAL_RE = re.compile(r"[※＊*]\s*(?:任意|optional)", re.I)
+    _TRAILING_OPTIONAL_RE = re.compile(r"[\s :：|｜/／・-]*(?:任意|optional)$", re.I)
+    _LEADING_OPTIONAL_RE = re.compile(r"^(?:任意|optional)(?:[\s ]+|[\s ]*[:：|｜/／][\s ]*)", re.I)
     # 「必須」等を除去した後に残る空の括弧(例: "お名前〔必須〕" → "お名前〔〕")
-    _EMPTY_PARENS_RE = re.compile(r"[\(（]\s*[\)）]|〔\s*〕|【\s*】|［\s*］|\[\s*\]|<\s*>|＜\s*＞")
+    _EMPTY_PARENS_RE = re.compile(rf"{_MARK_OPEN}\s*{_MARK_CLOSE}")
 
     # リンクを辿り尽くして見つかったページ数がこれ以下の場合のみ、sitemap.xmlで補完する
     SITEMAP_FALLBACK_MAX_PAGES = 2
@@ -1850,7 +1861,12 @@ class WebCrawler:
     # ------------------------------------------------------------------
 
     def _remove_required_marks(self, text: str) -> str:
+        text = self._BRACKETED_MARK_RE.sub("", text)
+        text = self._PREFIXED_OPTIONAL_RE.sub("", text)
         text = self._REQUIRED_MARK_RE.sub("", text)
+        text = re.sub(r"^[\s ]+|[\s ]+$", "", text)
+        text = self._TRAILING_OPTIONAL_RE.sub("", text)
+        text = self._LEADING_OPTIONAL_RE.sub("", text)
         text = self._TEMPLATE_VAR_RE.sub("", text)
         text = self._EMPTY_PARENS_RE.sub("", text)
         return re.sub(r"^[\s\xa0\n\r]+|[\s\xa0\n\r]+$", "", text)
@@ -1867,8 +1883,56 @@ class WebCrawler:
         for junk in el_copy.find_all(class_=re.compile(r"error-text|error|help-block|note|hint", re.I)):
             junk.decompose()
 
-        text = el_copy.get_text(strip=True)
-        return self._remove_required_marks(text)
+        # 「必須」「任意」だけのバッジ要素(<p class="bg-blue">任意</p>等)。「任意」は語句としては
+        # 消せない(「任意団体名」等)ため、要素の文字列がマークだけの場合に限って除く
+        for badge in el_copy.find_all(True):
+            if not badge.decomposed and badge.find(True) is None and self._MARK_ONLY_TEXT_RE.fullmatch(badge.get_text(strip=True)):
+                badge.decompose()
+
+        # <br>で改行して並べた複数の項目名(「都道府県<br>市区郡・町村」)は、項目名どうしの場合に限り
+        # 改行区切りで返し、呼び出し側で別々の項目にする。補足(「お名前<br>（全角）」等)は従来どおり連結する
+        for br in el_copy.find_all("br"):
+            br.replace_with(NavigableString(self._LABEL_BREAK))
+        parts = [self._remove_required_marks(p).strip("・･ ") for p in el_copy.get_text(strip=True).split(self._LABEL_BREAK)]
+        parts = [p for p in parts if p]
+        if len(parts) >= 2 and all(self._LABEL_PART_RE.fullmatch(p) for p in parts):
+            return "\n".join(parts)
+        return self._remove_required_marks("".join(parts))
+
+    # 確認用の再入力欄の項目名(「E-mail(確認用)」「メールアドレス（確認）」等)。
+    # 「確認」を含む文字列はボタンの文言(「確認画面へ」等)として除くが、これらは入力項目
+    _CONFIRM_FIELD_TEXT_RE = re.compile(r"(?:メール|mail|アドレス|パスワード|password).*確認|確認.*(?:メール|mail|アドレス|パスワード|password|再入力)", re.I)
+
+    def _looks_like_button_text(self, text: str) -> bool:
+        """抽出したラベルが、入力項目ではなくボタンの文言等か(送信・リセット・確認画面へ等)。"""
+        if any(k in text for k in ("送信", "リセット", "Δ")):
+            return True
+        return "確認" in text and not self._CONFIRM_FIELD_TEXT_RE.search(text)
+
+    # 「必須」「任意」のマークだけの文字列(バッジ要素の判定用)
+    _MARK_ONLY_TEXT_RE = re.compile(rf"[※＊*]?\s*{_MARK_OPEN}?\s*{_MARK_WORDS}\s*{_MARK_CLOSE}?\s*[※＊*]?", re.I)
+
+    def _is_mark_only_element(self, el: Tag) -> bool:
+        """「必須」「任意」のバッジだけの要素か(<td><p class="must">必須</p></td>、<div class="required-badge">必須</div>等)。
+
+        項目名と入力欄の間にこのような要素を挟むフォームでは、入力欄の直前の要素(セル)を
+        項目名とみなすと空になり、探索が外側へ進んでフォーム冒頭の注意書きを全項目の
+        項目名として拾ったり、項目名が取れなかったりしていた(実際に確認済み)。読み飛ばして
+        その手前の要素を項目名の候補にする。
+        """
+        return not self._contains_fillable_field(el) and bool(self._MARK_ONLY_TEXT_RE.fullmatch(el.get_text(strip=True)))
+
+    # ラベル内の<br>の位置を示す目印(テキストに現れない文字)
+    _LABEL_BREAK = "\x00"
+    # <br>で区切られた部分を、それぞれ独立した項目名とみなせる文字列。次のものは除く
+    # (実際に確認済み: 「個人情報の<br>取り扱いについて」「メールアドレス<br>半角英数」「お問い合わせ<br>事項」)
+    # - 括弧・注記で始まる補足、日本語を含まない部分、2文字以下の部分
+    # - 助詞・読点で終わる(文の途中で改行している)部分
+    # - 入力方法の案内(「半角」「〜文字以内」「選択してください」等)
+    _LABEL_PART_RE = re.compile(r"(?![（(\[［【〔※＊*例])(?=.*[ぁ-んァ-ヶ一-龠])(?!.*(?:文字|半角|全角|選択|入力|まで|以内|ください|可))[^\n]{3,15}(?<![のをにはがでと、。,])")
+
+    # 選択内容に応じて表示を切り替える、初期状態で非表示のブロックのclass
+    _HIDDEN_BLOCK_CLASS_RE = re.compile(r"^(?:is-)?(?:hidden|hide)$|^d-none$|^display-none$", re.I)
 
     _HINT_ELEMENT_CLASS_RE = re.compile(r"exam|example|hint|note|annotation|caption|desc(?:ription)?", re.I)
 
@@ -1929,6 +1993,31 @@ class WebCrawler:
             return True
         style = re.sub(r"\s+", "", str(el.get("style", ""))).lower()
         return "display:none" in style or "visibility:hidden" in style
+
+    def _is_in_hidden_block(self, inp: Tag, form: Tag) -> bool:
+        """入力欄が、フォーム内の初期状態で非表示のブロック(style/hidden属性/class="is-hidden"等)の中にあるか。"""
+        for parent in inp.parents:
+            if parent is form or not isinstance(parent, Tag):
+                return False
+            if self._is_hidden_element(parent) or any(self._HIDDEN_BLOCK_CLASS_RE.match(c) for c in parent.get("class") or []):
+                return True
+        return False
+
+    def _choice_option_label_in_shared_cell(self, inp: Tag, cell: Tag, soup: BeautifulSoup) -> str:
+        """セル(td)の見出しを手前のテキスト欄が使っていて、選択肢(radio/checkbox)が見出し無しで
+        同居している場合に、その選択肢自身の名前(<label>の文字列)を返す。該当しなければ空文字。"""
+        # セル内の最初の入力欄がテキスト欄(=見出しはそちらの項目名)の場合に限る
+        fields = [el for el in cell.find_all(["input", "textarea", "select"]) if self._is_fillable_field(el)]
+        if not fields or fields[0] is inp or str(fields[0].get("type", "text")).lower() in ("radio", "checkbox"):
+            return ""
+        label = inp.find_parent("label")
+        if label is None and inp.get("id"):
+            found = soup.find("label", attrs={"for": inp.get("id")})
+            label = found if isinstance(found, Tag) else None
+        if label is None:
+            return ""
+        text = self._remove_required_marks(label.get_text(strip=True))
+        return text if 0 < len(text) < 50 else ""
 
     def _choice_group_container(self, inp: Tag, form: Tag) -> Tag | None:
         """radio/checkboxについて、同じnameの選択肢をすべて含む最も内側の祖先要素を返す。
@@ -2376,6 +2465,11 @@ class WebCrawler:
 
             # ★ 入力欄ごとにループを回し、テキストを抽出した「後」でログを吐く
             for inp in valid_inputs:
+                # 選択内容に応じてJavaScriptで表示を切り替える分岐(<table class="branch is-hidden">等)の
+                # 中の入力欄は、初期表示では見えない。依頼内容ごとの全分岐の項目まで並んでいた(実際に確認済み)
+                if self._is_in_hidden_block(inp, form):
+                    continue
+
                 if inp.name == "input" and str(inp.get("type", "")).lower() == "file":
                     has_attachment = True
 
@@ -2430,10 +2524,14 @@ class WebCrawler:
                                 break
 
                         if parent.name == "td":
-                            prev_ths = [t for t in parent.find_previous_siblings("th") if isinstance(t, Tag)]
+                            prev_ths = [t for t in parent.find_previous_siblings("th") if isinstance(t, Tag) and not self._is_mark_only_element(t)]
                             if prev_ths:
+                                # <td><input name="kana"><div><label><input type="radio">協力会の会員</label>…</div></td>
+                                # のように、見出し(th)をテキスト欄が使い、見出しの無い選択肢が同じセルに
+                                # 同居している場合は、選択肢名そのものを項目にする(実際に確認済み)
+                                option_label = self._choice_option_label_in_shared_cell(inp, parent, soup) if is_choice_input else ""
                                 # resolved_text = self._remove_required_marks(prev_ths[0].get_text(strip=True))
-                                resolved_text = self._get_clean_element_text(prev_ths[0])
+                                resolved_text = option_label or self._get_clean_element_text(prev_ths[0])
                                 break
 
                             # <th>を使わず、同じ行内の手前の<td>をラベルとして使う
@@ -2441,7 +2539,7 @@ class WebCrawler:
                             # (例: <tr><td class="label">氏名</td><td><input ...></td></tr>)。
                             # ラベル用の<td>は入力欄を含まないはずなので、それを条件に
                             # 別の項目の入力セルを誤って拾わないようにする。
-                            prev_tds = [t for t in parent.find_previous_siblings("td") if isinstance(t, Tag)]
+                            prev_tds = [t for t in parent.find_previous_siblings("td") if isinstance(t, Tag) and not self._is_mark_only_element(t)]
                             if (
                                 prev_tds
                                 and not self._contains_fillable_field(prev_tds[0])
@@ -2458,7 +2556,7 @@ class WebCrawler:
                         # (a-2) 入力欄自身の直前の兄弟要素がラベルらしい要素の場合
                         # 例: <div class="contact__item"><p class="contact__label">お名前</p><input ...></div>
                         if not resolved_text:
-                            own_siblings = inp.find_previous_siblings(["p", "label", "span", "div", "dt", "th"])
+                            own_siblings = [sib for sib in inp.find_previous_siblings(["p", "label", "span", "div", "dt", "th"]) if isinstance(sib, Tag) and not self._is_mark_only_element(sib)]
                             if own_siblings and isinstance(own_siblings[0], Tag):
                                 candidate = own_siblings[0]
                                 if (
@@ -2512,7 +2610,7 @@ class WebCrawler:
                             siblings = [
                                 sib
                                 for sib in parent.find_previous_siblings(["div", "span", "label", "dt", "th", "p", "table", "h2", "h3", "h4", "h5", "h6"])
-                                if isinstance(sib, Tag) and (sib.get_text(strip=True) or self._contains_fillable_field(sib))
+                                if isinstance(sib, Tag) and (sib.get_text(strip=True) or self._contains_fillable_field(sib)) and not self._is_mark_only_element(sib)
                             ]
                             if siblings:
                                 candidate = siblings[0]
@@ -2567,9 +2665,11 @@ class WebCrawler:
                 # 表示されないことが多い)。この記号自体を持つinput/textarea/select要素の
                 # ラベルとして誤って抽出されてしまうことがあり、実際の入力項目とは
                 # 無関係なので除外する。
-                if resolved_text and not any(k in resolved_text for k in ["送信", "リセット", "確認", "Δ"]):
-                    if resolved_text not in form_fields:
-                        form_fields.append(resolved_text)
+                if resolved_text and not self._looks_like_button_text(resolved_text):
+                    # 「都道府県<br>市区郡・町村」のように改行で並べた複数の項目名は別々の項目にする
+                    for part in resolved_text.split("\n"):
+                        if part not in form_fields:
+                            form_fields.append(part)
 
             logger.debug("  => フォーム #%d から抽出された項目: %s", i, form_fields)
 
