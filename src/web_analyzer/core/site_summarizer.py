@@ -180,6 +180,42 @@ class SiteSummarizer:
             return self.NO_GLOBAL_NAV
         return number - 1 if number <= len(candidates) else None
 
+    CONTACT_FIELDS_INSTRUCTION = (
+        "あなたはWebサイトの調査担当者です。お問い合わせページの本文が与えられます。"
+        "入力欄は[入力欄]、複数行の入力欄は[複数行入力欄]、選択欄は[選択欄]、チェックボックス・ラジオボタンは[選択肢]と表記しています。"
+        "ページ内のお問い合わせフォームで、利用者が入力・選択する項目の見出し(項目名)を、ページ上の表記のまま、上から順に1行に1つずつ出力してください。"
+        "「必須」「任意」の表示、入力例、注意書き、選択肢の一つ一つ、送信・確認ボタン、サイト内検索やメールマガジン登録の欄は含めないでください。"
+        "ただし、見出しの無いチェックボックス(例: 個人情報の取り扱いに同意する)は、その文言を項目名にしてください。"
+        "お問い合わせフォームが無い(電話番号やメールアドレスの案内だけ等)場合は「なし」とだけ出力してください。説明や前置きは不要です。"
+    )
+
+    def extract_contact_fields(self, domain: str, pages: list[tuple[str, str]]) -> list[str] | None:
+        """お問い合わせページの本文(URL, テキスト)から、フォームの項目名のリストを返す。
+
+        AIがフォームは無いと判定した場合は空リスト、API呼び出しに失敗した・回答を
+        解釈できなかった場合はNone。AIが言い換えた・存在しない項目を混ぜるのを防ぐため、
+        ページ本文に(空白を除いて)そのまま含まれる項目名だけを採用する。
+        """
+        if not self.enabled or not pages:
+            return None
+        listing = "\n\n".join(f"[{url}]\n{text}" for url, text in pages)
+        prompt = f"URL: {domain}\n\n--- お問い合わせページの本文 ---\n{listing}"
+        try:
+            raw = self._generate(prompt, self.CONTACT_FIELDS_INSTRUCTION)
+        except Exception as e:
+            logger.warning(f"[{domain}] Geminiによる問合せ項目の読み取りに失敗しました: {e}")
+            return None
+
+        lines = [re.sub(r"^\s*(?:[-*・●■]|\d+[.)．])\s*", "", line).strip() for line in raw.splitlines()]
+        lines = [line for line in lines if line]
+        if not lines:
+            return None
+        if lines == ["なし"]:
+            return []
+        page_text = re.sub(r"\s+", "", listing)
+        items = list(dict.fromkeys(line for line in lines if re.sub(r"\s+", "", line) in page_text))
+        return items or None
+
     def _generate(self, prompt: str, system_instruction: str | None = None) -> str:
         payload = {
             "systemInstruction": {"parts": [{"text": system_instruction or self.SUMMARY_INSTRUCTION}]},

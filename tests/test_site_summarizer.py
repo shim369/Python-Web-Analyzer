@@ -104,3 +104,21 @@ def test_other_api_errors_are_not_recorded_as_rate_limit(monkeypatch: pytest.Mon
 
     assert summarizer.summarize("example.com", TOP_HTML) == ""
     assert summarizer.pop_rate_limited() is False
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        # ページ本文に無い項目(言い換え・創作)は採用しない
+        ("1. お名前\n・メールアドレス\nご住所\nお問い合わせ内容", ["お名前", "メールアドレス", "お問い合わせ内容"]),
+        ("なし", []),
+        ("", None),
+        ("会社概要", None),
+    ],
+)
+def test_extract_contact_fields_keeps_only_items_on_page(monkeypatch: pytest.MonkeyPatch, answer: str, expected: list[str] | None) -> None:
+    summarizer = SiteSummarizer(api_key="dummy")
+    monkeypatch.setattr(summarizer, "_generate", lambda prompt, instruction=None: answer)
+    page = ("https://example.com/contact/", "お名前 [入力欄] メール アドレス [入力欄] お問い合わせ内容 [複数行入力欄]")
+
+    assert summarizer.extract_contact_fields("example.com", [page]) == expected

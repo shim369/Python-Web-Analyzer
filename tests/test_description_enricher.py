@@ -149,7 +149,7 @@ def test_enrich_file_skips_already_renewed_rows(tmp_path: Path) -> None:
     )
     enricher = _StubEnricher({})
 
-    assert enricher.count_targets(input_path) == TargetCounts(total_rows=3, eligible_rows=2, purpose_rows=2, structure_rows=2)
+    assert enricher.count_targets(input_path) == TargetCounts(total_rows=3, eligible_rows=2, purpose_rows=2, structure_rows=2, contact_rows=2)
     result = enricher.enrich_file(input_path, output_path, force_all=True)
 
     assert sorted(enricher.called) == ["a.example", "b.example"]
@@ -257,6 +257,20 @@ def test_select_structure_drops_phone_and_sns_items() -> None:
     assert enricher.select_structure("a.example", html) == "ホーム\n製品情報\n企業情報"
     # SNSだけのリストは候補にもならない
     assert summarizer.nav_calls == [[["ホーム", "製品情報", "企業情報"]]]
+
+
+def test_select_structure_skips_candidates_over_max_items() -> None:
+    """上限を超えるリスト(子メニューまで展開したスマホ用メニュー等)は、途中で切らずに候補から外す。"""
+    long_items = "".join(f'<li><a href="/p/{i}/">項目{i}</a></li>' for i in range(DescriptionEnricher.MAX_STRUCTURE_ITEMS + 2))
+    html = f"""
+    <nav class="gnav"><ul>{long_items}</ul></nav>
+    <div id="main_btn"><a href="/"><img alt="HOME"></a><a href="/item/"><img alt="製品情報"></a><a href="/company/"><img alt="会社概要"></a></div>
+    """
+    summarizer = _StubSummarizer(nav_index=0)
+    enricher = _StructureStubEnricher(summarizer, html)
+
+    assert enricher.select_structure("a.example", html) == "HOME\n製品情報\n会社概要"
+    assert summarizer.nav_calls == [[["HOME", "製品情報", "会社概要"]]]
 
 
 def test_select_structure_returns_empty_when_no_menu() -> None:
@@ -535,3 +549,244 @@ def test_enrich_file_does_not_report_rate_limit_when_ai_works(tmp_path: Path) ->
     result = enricher.enrich_file(input_path, tmp_path / "out.xlsx", fill_purpose=True, fill_structure=True)
 
     assert result.rate_limited_domains == []
+
+
+@pytest.mark.parametrize(
+    ("value", "pages", "flagged", "expected"),
+    [
+        # 一時期の調査結果では、フォームが見つからなければ空欄にしていた
+        ("", 12, False, True),
+        (None, "100以上", False, True),
+        # 「問い合わせフォームなし」は、取り損ねの疑い(グレー)・補完の失敗(ピンク)の行だけ対象
+        ("問い合わせフォームなし", 12, True, True),
+        ("問い合わせフォームなし", 12, False, False),
+        ("お名前\nメールアドレス", 12, True, False),
+        ("mailto", 12, False, False),
+        # 巡回できなかった行は対象外
+        ("", None, False, False),
+        ("", 0, False, False),
+    ],
+)
+def test_needs_contact(value: object, pages: object, flagged: bool, expected: bool) -> None:
+    assert DescriptionEnricher.needs_contact(value, pages, flagged) is expected
+
+
+class _ContactStubEnricher(DescriptionEnricher):
+    """サイトを取得せず、ドメインごとに決め打ちの問合せ項目を返す。"""
+
+    def __init__(self, contacts: dict[str, str]) -> None:
+        super().__init__(summarizer=SiteSummarizer(api_key="dummy"))
+        self.contacts = contacts
+        self.called: list[str] = []
+
+    def find_contact_fields(self, domain: str) -> str:
+        self.called.append(domain)
+        return self.contacts.get(domain, "")
+
+
+def test_enrich_file_fills_flagged_contact_fields(tmp_path: Path) -> None:
+    from openpyxl.styles import PatternFill
+
+    from web_analyzer.core.excel_service import ExcelService
+
+    input_path = tmp_path / "result.xlsx"
+    output_path = tmp_path / "out.xlsx"
+    domains = ["a.example", "b.example", "c.example", "d.example", "e.example"]
+    _write_result_excel(input_path, [(d, LONG_DESCRIPTION) for d in domains])
+    wb = load_workbook(str(input_path))
+    sheet = wb.active
+    assert isinstance(sheet, Worksheet)
+    gray = PatternFill(start_color=ExcelService.UNKNOWN_FILL_COLOR, end_color=ExcelService.UNKNOWN_FILL_COLOR, fill_type="solid")
+    sheet["L3"] = "問い合わせフォームなし"
+    sheet["L3"].fill = gray
+    sheet["L4"] = "お名前\nメールアドレス"
+    sheet["L5"] = "問い合わせフォームなし"  # 取り損ねの疑いが無い(色なし)
+    sheet["L6"] = "問い合わせフォームなし"
+    sheet["L6"].fill = gray
+    wb.save(str(input_path))
+    enricher = _ContactStubEnricher({"a.example": "お名前\nご用件", "b.example": "問い合わせフォームなし"})
+
+    counts = enricher.count_targets(input_path)
+    result = enricher.enrich_file(input_path, output_path, fill_purpose=False, fill_contact=True, force_all=True)
+
+    assert counts.contact_rows == 3
+    assert sorted(enricher.called) == ["a.example", "b.example", "e.example"]
+    assert (result.contact_target_rows, result.contact_filled, result.contact_failed_domains) == (3, 2, ["e.example"])
+    ws = load_workbook(str(output_path)).active
+    assert isinstance(ws, Worksheet)
+    assert [ws[f"L{r}"].value for r in range(2, 7)] == ["お名前\nご用件", "問い合わせフォームなし", "お名前\nメールアドレス", "問い合わせフォームなし", "問い合わせフォームなし"]
+    assert ws["L3"].fill.fgColor.rgb.endswith(DescriptionEnricher.SUMMARIZED_FILL_COLOR)
+    assert ws["L6"].fill.fgColor.rgb.endswith(DescriptionEnricher.FAILED_FILL_COLOR)
+
+    # 補完で確認済み(黄色)の行は、出力ファイルにもう一度かけても対象にしない。補完できなかった(ピンク)行は対象にする
+    enricher.called.clear()
+    enricher.enrich_file(output_path, tmp_path / "out2.xlsx", fill_purpose=False, fill_contact=True)
+    assert enricher.called == ["e.example"]
+
+
+def test_find_contact_links_and_form_links() -> None:
+    from bs4 import BeautifulSoup
+
+    enricher = DescriptionEnricher(summarizer=SiteSummarizer(api_key="dummy"))
+    top = """
+    <a href="/company/">会社概要</a><a href="/inquiry/">INQUIRY</a>
+    <a href="https://forms.example.net/abc">お問い合わせ</a><a href="mailto:info@a.example">メール</a>
+    """
+    assert enricher._find_contact_links(top, "https://a.example/") == ["https://a.example/inquiry/", "https://forms.example.net/abc"]
+
+    contact = BeautifulSoup(
+        """
+        <p>お電話またはメールフォームからお問い合わせください。</p>
+        <a href="/contact/form/">メールフォーム</a><a href="/cgi-bin/mail2.html">技術相談</a><a href="/access/">アクセス</a>
+        <iframe src="https://docs.google.com/forms/d/e/xxx/viewform"></iframe><iframe src="https://www.google.com/maps/embed?pb=1"></iframe>
+        """,
+        "lxml",
+    )
+    assert enricher._find_form_links(contact, "https://a.example/contact/") == [
+        "https://docs.google.com/forms/d/e/xxx/viewform",
+        "https://a.example/contact/form/",
+        "https://a.example/cgi-bin/mail2.html",
+    ]
+
+
+def test_contact_page_text_marks_form_controls() -> None:
+    from bs4 import BeautifulSoup
+
+    enricher = DescriptionEnricher(summarizer=SiteSummarizer(api_key="dummy"))
+    soup = BeautifulSoup(
+        """
+        <header><form><input type="search" name="s"></form></header>
+        <main><h1>お問い合わせ</h1>
+        <form><input type="hidden" name="token"><div>お名前</div><input type="text" name="n">
+        <div>種別</div><select name="k"><option>見積</option></select>
+        <label><input type="checkbox" name="agree">同意する</label>
+        <div>内容</div><textarea name="b"></textarea><input type="submit" value="送信"></form></main>
+        """,
+        "lxml",
+    )
+    assert enricher._contact_page_text(soup) == "お名前 [入力欄] 種別 [選択欄] [選択肢] 同意する 内容 [複数行入力欄]"
+
+
+class _ContactAISummarizer(SiteSummarizer):
+    def __init__(self, answer: list[str] | None) -> None:
+        super().__init__(api_key="dummy")
+        self.answer = answer
+        self.pages: list[str] = []
+
+    def extract_contact_fields(self, domain: str, pages: list[tuple[str, str]]) -> list[str] | None:
+        self.pages = [url for url, _ in pages]
+        return self.answer
+
+
+CONTACT_SITE = {
+    "https://a.example": '<a href="/contact/">お問い合わせ</a>',
+    # お問い合わせページには電話番号の案内と、フォーム本体のページへのリンクだけがある
+    "https://a.example/contact": '<p>TEL 03-1234-5678</p><a href="/contact/form.html">メールフォームはこちら</a><a href="mailto:info@a.example">info@a.example</a>',
+    "https://a.example/contact/form.html": """
+        <form><table>
+        <tr><th>お名前</th><td><input type="text" name="n"></td></tr>
+        <tr><th>メールアドレス</th><td><input type="email" name="m"></td></tr>
+        <tr><th>お問い合わせ内容</th><td><textarea name="b"></textarea></td></tr>
+        </table></form>""",
+    "https://b.example": '<a href="/contact/">お問い合わせ</a>',
+    "https://b.example/contact": '<p>TEL 03-1234-5678</p><a href="mailto:info@b.example">info@b.example</a>',
+}
+
+
+@pytest.fixture
+def contact_site(monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx
+
+    from web_analyzer.core import description_enricher
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url).rstrip("/")
+        if url in CONTACT_SITE:
+            return httpx.Response(200, text=CONTACT_SITE[url], headers={"content-type": "text/html; charset=utf-8"})
+        return httpx.Response(404)
+
+    real_client = httpx.Client
+    monkeypatch.setattr(description_enricher.httpx, "Client", lambda **kwargs: real_client(transport=httpx.MockTransport(handler), follow_redirects=True))
+    # ブラウザでの描画は行わない
+    monkeypatch.setattr("web_analyzer.core.crawler.WebCrawler._fetch_rendered_html", lambda self, url: ("", "", None, ""))
+
+
+@pytest.mark.usefixtures("contact_site")
+def test_find_contact_fields_follows_link_to_form_page() -> None:
+    """お問い合わせページの先にあるフォーム本体のページまで辿り、ルールで項目を取る(AIは使わない)。"""
+    summarizer = _ContactAISummarizer(answer=None)
+    enricher = DescriptionEnricher(summarizer=summarizer)
+
+    assert enricher.find_contact_fields("a.example") == "お名前\nメールアドレス\nお問い合わせ内容"
+    assert summarizer.pages == []
+
+
+@pytest.mark.usefixtures("contact_site")
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        # AIがフォームは無いと判定した場合は、mailtoリンクの有無で出し分ける
+        ([], "mailto"),
+        (["お名前", "ご用件"], "お名前\nご用件"),
+        # 1項目だけ(同意欄等しか読み取れなかった)・判定できなかった場合は空欄のまま
+        (["プライバシーポリシーに同意する"], ""),
+        (None, ""),
+    ],
+)
+def test_find_contact_fields_asks_ai_when_rules_find_nothing(answer: list[str] | None, expected: str) -> None:
+    summarizer = _ContactAISummarizer(answer=answer)
+    enricher = DescriptionEnricher(summarizer=summarizer)
+
+    assert enricher.find_contact_fields("b.example") == expected
+    assert summarizer.pages == ["https://b.example/contact/"]
+
+
+IFRAME_TOP_HTML = """
+<body><table><tr><td><iframe src="parts/menu.htm"></iframe></td></tr></table>
+<table><tr><td><a href="/x">病院A</a></td><td><a href="/y">病院B</a></td><td><a href="/z">病院C</a></td></tr></table></body>
+"""
+IFRAME_MENU_HTML = """<body><table><tr>
+    <td><a href="https://a.example/" target="_top"><b>トップ(紹介･概要)</b></a></td>
+    <td><a href="../tomo/index.htm" target="_top"><b>友の会･基金</b></a></td>
+    <td><a href="../koukai/index.htm" target="_top"><b>情報公開</b></a></td>
+    <td><a href="../saiyou/index.htm" target="_top"><b>採用情報</b></a></td>
+</tr></table></body>"""
+IFRAME_MENUS = ["トップ(紹介･概要)", "友の会･基金", "情報公開", "採用情報"]
+
+
+def test_fetch_iframe_nav_menus(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ナビをiframeで読み込むサイトは、iframeのページからナビを取る(調査本体と同じ処理)。"""
+    import httpx
+
+    from web_analyzer.core import description_enricher
+
+    pages = {"https://a.example/": IFRAME_TOP_HTML, "https://a.example/parts/menu.htm": IFRAME_MENU_HTML}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        url = url if url in pages else url.rstrip("/") + "/"
+        return httpx.Response(200, text=pages[url], headers={"content-type": "text/html; charset=utf-8"}) if url in pages else httpx.Response(404)
+
+    real_client = httpx.Client
+    monkeypatch.setattr(description_enricher.httpx, "Client", lambda **kwargs: real_client(transport=httpx.MockTransport(handler), follow_redirects=True))
+    enricher = DescriptionEnricher(summarizer=SiteSummarizer(api_key="dummy"))
+
+    assert enricher.fetch_iframe_nav_menus("a.example", IFRAME_TOP_HTML) == IFRAME_MENUS
+    # ナビらしいiframeが無いページは取り直さない
+    assert enricher.fetch_iframe_nav_menus("a.example", NAV_HTML) == []
+
+
+class _IframeStubEnricher(_StructureStubEnricher):
+    def fetch_iframe_nav_menus(self, domain: str, top_html: str) -> list[str]:
+        return IFRAME_MENUS
+
+
+@pytest.mark.parametrize(("nav_index", "expected"), [(0, IFRAME_MENUS), (None, IFRAME_MENUS)])
+def test_structure_prefers_iframe_nav(nav_index: int | None, expected: list[str]) -> None:
+    """iframeのナビを先頭の候補(ルールで取れた結果)にする。AIを呼べなかった場合もそれを使う。"""
+    summarizer = _StubSummarizer(nav_index=nav_index)
+    enricher = _IframeStubEnricher(summarizer, IFRAME_TOP_HTML)
+    target = EnrichmentTarget(row=2, domain="a.example", current_description="", needs_purpose=False, needs_structure=True)
+
+    assert enricher.enrich_row(target).structure == "\n".join(expected)
+    assert summarizer.nav_calls[0][0] == IFRAME_MENUS

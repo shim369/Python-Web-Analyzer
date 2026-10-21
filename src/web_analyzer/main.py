@@ -65,7 +65,7 @@ def resolve_gemini_api_key() -> str:
 
 @st.cache_resource(show_spinner=False)
 def get_description_enricher(api_key: str) -> DescriptionEnricher:
-    """AI補完(用途・構成)の処理とジョブ状態を、調査サービスと同様にプロセス全体で共有する。
+    """AI補完(用途・構成・問合せ項目・ページ数)の処理とジョブ状態を、調査サービスと同様にプロセス全体で共有する。
 
     APIキーを引数に取ることで、キーを後から設定・変更した場合は
     キャッシュ済みの(キー無しの)インスタンスではなく新しいものが作られる。
@@ -74,7 +74,7 @@ def get_description_enricher(api_key: str) -> DescriptionEnricher:
 
 
 MODE_SCRAPE = "サイト調査"
-MODE_ENRICH = "用途・構成のAI補完"
+MODE_ENRICH = "調査結果のAI補完"
 
 # 補完済みファイルの名前に付ける接尾辞。過去の名前("_用途補完")で出力したファイルに
 # 再度かけた場合も「_AI補完_用途補完」のように重ならないよう、両方を取り除いてから付ける。
@@ -103,11 +103,12 @@ def render_enrichment_page() -> None:
     """
     enricher = get_description_enricher(resolve_gemini_api_key())
 
-    st.markdown('<div class="main-title">用途・構成のAI補完</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-title">調査結果のAI補完</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="sub-title">調査結果Excelのうち、K列「用途」が社名だけなど内容の分かりにくい行、H列「構成」が空欄・3項目未満など'
         "グローバルナビを取り損ねた行について、サイトを取り直してGeminiで補完します。"
         "用途は100文字前後のサイト概要に要約し、構成はページ内のメニューの中からグローバルナビをAIに選ばせて、サイト上の項目名をそのまま入れます。"
+        "L列「問合せ項目」が要確認（グレー）の行は、お問い合わせページの先のフォームまで辿り、取れなければAIにページを読ませて補完します。"
         "あわせて、I列「ページ数」が時間切れで「〇〇以上」になった行を、時間予算を延ばして再計測できます。</div>",
         unsafe_allow_html=True,
     )
@@ -141,7 +142,7 @@ def render_enrichment_page() -> None:
 
     pending_counts: TargetCounts | None = st.session_state.get("enrich_pending_counts") if uploaded else None
     if uploaded and pending_counts:
-        c_col1, c_col2, c_col3 = st.columns(3)
+        c_col1, c_col2, c_col3, c_col4 = st.columns(4)
         with c_col1:
             fill_purpose = st.checkbox(
                 "用途（K列）を補完する",
@@ -164,6 +165,17 @@ def render_enrichment_page() -> None:
                     "「全行をやり直す」をオンにしても、確定済みのページ数は再計測しません。"
                 ),
             )
+        with c_col4:
+            fill_contact = st.checkbox(
+                "問合せ項目（L列）を補完する",
+                value=True,
+                help=(
+                    "L列が「問い合わせフォームなし」でセルがグレー（フォームを取り損ねた疑いがある行）、または空欄の行について、"
+                    "お問い合わせページの先のフォームページ・埋め込みフォームまで辿り、取れなければAIにページを読ませて項目を入れます。"
+                    "フォームが無いと確認できた場合は「問い合わせフォームなし」（mailtoリンクがあれば「mailto」）と入れます。"
+                    "グレーでない「問い合わせフォームなし」と、項目が取れている行は、「全行をやり直す」をオンにしても対象にしません。"
+                ),
+            )
         force_all = st.checkbox(
             "全行をやり直す（文体・取り方をそろえたい場合）",
             value=False,
@@ -179,9 +191,11 @@ def render_enrichment_page() -> None:
             breakdown.append(f"構成の補完対象: {structure_rows}件")
         if recount_pages:
             breakdown.append(f"ページ数の再計測対象: {pending_counts.pages_rows}件")
+        if fill_contact:
+            breakdown.append(f"問合せ項目の補完対象: {pending_counts.contact_rows}件")
         st.success(f"ファイルを正常に読み込みました。 (対象ドメイン数: {pending_counts.total_rows}件" + "".join(f" / {b}" for b in breakdown) + ")")
 
-        if not fill_purpose and not fill_structure and not recount_pages:
+        if not fill_purpose and not fill_structure and not recount_pages and not fill_contact:
             st.warning("補完する列を1つ以上チェックしてください。")
         elif st.button("AI補完を開始する", use_container_width=True):
             # 同名ファイルを同時・連続で処理しても衝突しないよう、実行ごとに専用フォルダを切る
@@ -201,6 +215,7 @@ def render_enrichment_page() -> None:
                 fill_purpose=fill_purpose,
                 fill_structure=fill_structure,
                 recount_pages=recount_pages,
+                fill_contact=fill_contact,
             )
             st.session_state.enrich_job_id = new_job.id
             st.query_params["enrich_job_id"] = new_job.id
@@ -255,14 +270,17 @@ def render_enrichment_page() -> None:
             summary_parts.append(f"用途: 対象 {result.target_rows}件 / 要約 {result.summarized}件")
         if result.structure_target_rows:
             summary_parts.append(f"構成: 対象 {result.structure_target_rows}件 / 補完 {result.structure_filled}件")
+        if result.contact_target_rows:
+            summary_parts.append(f"問合せ項目: 対象 {result.contact_target_rows}件 / 補完 {result.contact_filled}件")
         if result.pages_target_rows:
             summary_parts.append(f"ページ数: 対象 {result.pages_target_rows}件 / 確定 {result.pages_confirmed}件 / 判定の更新 {result.judgement_updated}件")
         st.success(f"AI補完が完了しました。（全 {result.total_rows}件中、" + "、".join(summary_parts or ["補完対象なし"]) + "）")
 
         if result.rate_limited_domains:
             st.error(
-                f"Geminiの利用上限に達したため、{len(result.rate_limited_domains)}件は用途・構成をAIで判定していません。"
+                f"Geminiの利用上限に達したため、{len(result.rate_limited_domains)}件は用途・構成・問合せ項目をAIで判定していません。"
                 "用途は元の値のまま（ピンク）です。構成は、ルールで取れたメニューがあればそれを入れています（AIでは未確認）。"
+                "問合せ項目は、ルールで取れた場合のみ入れています（取れなければ空欄のままピンク）。"
                 "時間をおいて（1日の上限の場合は翌日以降に）、出力したファイルにもう一度かけてください。"
             )
             with st.expander("Geminiの利用上限で判定できなかったサイト"):
@@ -271,6 +289,7 @@ def render_enrichment_page() -> None:
         failures = [
             ("用途", result.failed_domains, "サイトに接続できない、またはGeminiの利用上限に達した可能性があります"),
             ("構成", result.structure_failed_domains, "メニューがJavaScriptで描画される、またはグローバルナビらしいメニューが見つからなかった可能性があります"),
+            ("問合せ項目", result.contact_failed_domains, "お問い合わせページへのリンクが見つからない、またはフォームをAIでも判定できなかった可能性があります"),
         ]
         for label, domains, reason in failures:
             if not domains:
