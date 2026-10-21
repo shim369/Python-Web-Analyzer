@@ -304,8 +304,10 @@ class SiteScraperService:
 
             if total_pages_int == 0:
                 item.contact_fields = ""
+                item.contact_uncertain = False
             else:
                 item.contact_fields = contact_fields or ""
+                item.contact_uncertain = crawler.contact_form_uncertain and item.contact_fields == WebCrawler.NO_CONTACT_FORM_TEXT
 
             item.site_structure = site_structure
             item.cms_name = cms_name

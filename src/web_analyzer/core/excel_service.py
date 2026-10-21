@@ -53,6 +53,14 @@ class ExcelService:
     _WRAP_TEXT_COLUMNS = {2, 7, 8, 10, 11, 12, 13, 14}
     _MAX_WRAP_COLUMN_WIDTH = 60
 
+    # 巡回できたのに構成(H列)が空欄の行と、問合せ項目(L列)の「問い合わせフォームなし」に
+    # 取り損ねの疑いがある行は、要確認と分かるよう背景色を付ける。
+    # AI補完ではこの色の行を対象にし、補完結果の色(黄/ピンク)に塗り替わる
+    _STRUCTURE_COLUMN = 8
+    _CONTACT_COLUMN = 12
+    UNKNOWN_FILL_COLOR = "EDEDED"
+    _UNKNOWN_FILL = PatternFill(start_color=UNKNOWN_FILL_COLOR, end_color=UNKNOWN_FILL_COLOR, fill_type="solid")
+
     @staticmethod
     def import_excel(
         file_path: Path,
@@ -202,6 +210,12 @@ class ExcelService:
                     cell.alignment = Alignment(horizontal="center", vertical="top")
                 else:
                     cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+            if item.total_pages:
+                if not item.site_structure:
+                    ws.cell(row=current_row, column=ExcelService._STRUCTURE_COLUMN).fill = ExcelService._UNKNOWN_FILL
+                if not item.contact_fields or item.contact_uncertain:
+                    ws.cell(row=current_row, column=ExcelService._CONTACT_COLUMN).fill = ExcelService._UNKNOWN_FILL
 
         # --- 【自動調整】各列の幅をコンテンツの最大長に合わせて調整する ---
         # (ただし長文が入りうる列は _MAX_WRAP_COLUMN_WIDTH で頭打ちにする)

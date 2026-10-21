@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS assessments (
     rejection_reason TEXT DEFAULT '',
     remarks TEXT DEFAULT '',
     operator_name TEXT DEFAULT '',
+    contact_uncertain INTEGER DEFAULT 0,
     FOREIGN KEY (job_id) REFERENCES jobs(id)
 );
 
@@ -90,6 +91,10 @@ class JobRepository:
         self._conn.execute("PRAGMA foreign_keys=ON;")
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            # 列を追加する前に作ったDBにも、後から追加した列を足す
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(assessments)")}
+            if "contact_uncertain" not in columns:
+                self._conn.execute("ALTER TABLE assessments ADD COLUMN contact_uncertain INTEGER DEFAULT 0")
             self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -186,6 +191,7 @@ class JobRepository:
                     cms_name = ?,
                     description = ?,
                     contact_fields = ?,
+                    contact_uncertain = ?,
                     rejection_reason = ?,
                     remarks = ?
                 WHERE id = ?
@@ -200,6 +206,7 @@ class JobRepository:
                     item.cms_name,
                     item.description,
                     item.contact_fields,
+                    int(item.contact_uncertain),
                     item.rejection_reason,
                     item.remarks,
                     item.id,
@@ -214,7 +221,7 @@ class JobRepository:
                 SELECT id, job_id, date_str, domain_name, evaluation_result,
                        has_ssl, is_always_ssl, max_depth, svcmd, site_structure,
                        total_pages, cms_name, description, contact_fields,
-                       rejection_reason, remarks, operator_name
+                       rejection_reason, remarks, operator_name, contact_uncertain
                 FROM assessments WHERE job_id = ?
                 """,
                 (job_id,),
@@ -264,6 +271,7 @@ class JobRepository:
             rejection_reason=r[14],
             remarks=r[15],
             operator_name=r[16],
+            contact_uncertain=bool(r[17]),
         )
 
     # ------------------------------------------------------------------

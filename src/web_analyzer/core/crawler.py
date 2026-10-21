@@ -111,8 +111,21 @@ class WebCrawler:
     COUNT_ONLY_WORKERS = 3
     COUNT_ONLY_PAGE_TIMEOUT = 20.0
 
-    # お問い合わせフォームもmailtoリンクも見つからなかった場合にL列(問合せ項目)に出す文言
+    # お問い合わせフォームもmailtoリンクも見つからなかった場合にL列(問合せ項目)に出す文言。
+    # フォームを取り損ねた疑いがある場合は、巡回後にcontact_form_uncertainをTrueにする
+    # (Excelでは背景色を付け、AI補完の対象にする)
     NO_CONTACT_FORM_TEXT = "問い合わせフォームなし"
+
+    # お問い合わせページ・メールフォームらしいURLのパス(巡回が届いたかの判定用)
+    CONTACT_PAGE_PATH_RE = re.compile(r"contact|inquiry|toiawase|otoiawase|mail-?form", re.I)
+
+    # 外部のフォーム作成サービスのURL(リンク先・埋め込み)。サイト内でフォームが取れず、
+    # これへのリンクがある場合は、フォームを取り損ねた疑いがあるとみなす
+    FORM_SERVICE_URL_RE = re.compile(
+        r"docs\.google\.com/forms|forms\.gle|forms\.office\.com|form\.run|hsforms|tayori\.com/form|"
+        r"form-mailer\.jp|formzu|typeform\.com|jotform|questant",
+        re.I,
+    )
 
     # メールアドレスが設定されたmailtoリンク(<a href="mailto:info@example.com">)。
     # 宛先の無い"mailto:"だけのリンクは対象外。
@@ -312,6 +325,10 @@ class WebCrawler:
         self.verify_ssl = verify_ssl
         self.max_iframe_depth = max_iframe_depth
         self.render_js = render_js
+        # 直前のcrawl_and_analyze()で「問い合わせフォームなし」とした結果に、取り損ねの疑いがあるか
+        # (お問い合わせページに入力欄があるのに項目を取れなかった・お問い合わせページまで
+        # 巡回が届かなかった・外部のフォームサービスへのリンクがある)
+        self.contact_form_uncertain = False
 
         self.headers = {
             "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
@@ -1394,6 +1411,16 @@ class WebCrawler:
         headers = [h for h in soup.find_all("header") + soup.find_all(id=re.compile(r"^header$", re.I)) if isinstance(h, Tag)]
         page_headers = [h for h in headers if h.find_parent(["main", "article", "section"]) is None]
         return bool(page_headers) and all(h.find(["a", "img"]) is None and not h.get_text(strip=True) for h in page_headers)
+
+    @staticmethod
+    def _has_form_like_controls(soup: BeautifulSoup) -> bool:
+        """フォームらしい入力欄があるか(サイト内検索欄だけのページは無いとみなす)。"""
+        if soup.find("textarea"):
+            return True
+        controls = [
+            tag for tag in soup.find_all(["input", "select"]) if isinstance(tag, Tag) and str(tag.get("type", "text")).lower() not in ("hidden", "submit", "button", "image", "reset", "search")
+        ]
+        return len(controls) >= 3
 
     def _looks_like_empty_js_shell(self, html: str) -> bool:
         """<body>の可視テキストがほぼ空で、外部スクリプトの読み込みだけがある
@@ -3222,6 +3249,11 @@ class WebCrawler:
         contact_page_renders = 0
         # 別ドメイン(フォーム専用サービス・共用SSL等)にあるお問い合わせページのURL
         external_contact_urls: list[str] = []
+        # 「問い合わせフォームなし」と断定できない手がかり(contact_form_uncertainの判定用)
+        contact_unread_pages: list[str] = []
+        contact_link_keys: set[str] = set()
+        has_form_service_link = False
+        self.contact_form_uncertain = False
         has_attachment = False
         has_login = False
         has_basic_auth = False
@@ -3955,6 +3987,17 @@ class WebCrawler:
                                 rendered_soup = BeautifulSoup(rendered_contact_html, HTML_PARSER)
                                 if self._looks_like_genuine_contact_form(rendered_soup, candidate_fields, is_contact_page=True):
                                     contact_fields, has_attachment = candidate_fields, candidate_attachment
+                                elif self._has_form_like_controls(rendered_soup):
+                                    contact_unread_pages.append(resolved_url)
+
+                        # お問い合わせページに入力欄があるのに項目を取れなかった(項目名が
+                        # 画像・placeholderだけ等)場合は、フォームが無いとは断定できない。
+                        # is_contact_urlは"support"/"help"等も含む広い判定で、Q&Aページの絞り込み
+                        # 検索欄に反応していた(実際に確認済み)ため、URLがお問い合わせページらしいものに限る
+                        if not contact_fields and self.CONTACT_PAGE_PATH_RE.search(urlparse(resolved_url).path) and self._has_form_like_controls(soup) and resolved_url not in contact_unread_pages:
+                            contact_unread_pages.append(resolved_url)
+                        if not has_form_service_link and any(self.FORM_SERVICE_URL_RE.search(str(tag.get("href") or tag.get("src") or "")) for tag in soup.find_all(["a", "iframe"])):
+                            has_form_service_link = True
 
                         # メールアドレスへのmailtoリンクの有無(フォームが無い場合の代替の問い合わせ手段)
                         if not has_mailto_link and soup.find("a", href=self.MAILTO_HREF_PATTERN):
@@ -4010,6 +4053,8 @@ class WebCrawler:
                                     ),
                                 )
                                 enqueue(norm_abs, path_depth, is_priority, _is_bare_relative_href(href))
+                                if href in contact_text_hrefs or self.CONTACT_PAGE_PATH_RE.search(parsed_abs.path):
+                                    contact_link_keys.add(_dedup_key(norm_abs))
 
                         time.sleep(0.04)
 
@@ -4146,10 +4191,34 @@ class WebCrawler:
 
         # お問い合わせフォームが見つからず、メールアドレスにmailtoリンクが
         # 設定されている場合は、問い合わせ手段としてL列に"mailto"と出す。
-        # mailtoも無い場合(お問い合わせページに電話番号やメールアドレスの
-        # 記載しか無い場合を含む)は「問い合わせフォームなし」と出す。
+        # mailtoも無い場合は「問い合わせフォームなし」と出す。ただし、フォームが別ページ・
+        # 外部サービス・JavaScript描画で取れなかっただけのサイトも混ざる(実際に確認済み)ため、
+        # その疑いがある場合はcontact_form_uncertainをTrueにし、Excelで背景色を付けて
+        # AI補完の対象にする。疑いの無い場合(お問い合わせページが電話番号の案内だけ等)は
+        # 「なし」が妥当なことが多い(実際に確認済み)ため、色は付けない
         if not contact_fields:
-            contact_fields = "mailto" if has_mailto_link else self.NO_CONTACT_FORM_TEXT
+            if has_mailto_link:
+                contact_fields = "mailto"
+            else:
+                contact_fields = self.NO_CONTACT_FORM_TEXT
+
+                # 同じページへのリンクが末尾の"/"・"index.html"の有無だけ違う形で書かれている
+                # こともあるため、それらをそろえて巡回済みかを判定する
+                def _page_key(key: str) -> str:
+                    return re.sub(r"/(?:index\.(?:html?|php))?$", "", key.split("#")[0])
+
+                visited_pages = {_page_key(key) for key in visited}
+                unvisited_contact_pages = [key for key in contact_link_keys if key in queued_urls and _page_key(key) not in visited_pages]
+                reasons = {
+                    f"お問い合わせページに入力欄があるが項目を取れなかった({', '.join(contact_unread_pages[:3])})": bool(contact_unread_pages),
+                    f"未巡回のお問い合わせページがある({', '.join(unvisited_contact_pages[:3])})": bool(unvisited_contact_pages),
+                    "外部のフォームサービスへのリンクがある": has_form_service_link,
+                    f"別ドメインのお問い合わせページからフォームを取れなかった({', '.join(external_contact_urls)})": bool(external_contact_urls),
+                }
+                found = [reason for reason, hit in reasons.items() if hit]
+                self.contact_form_uncertain = bool(found)
+                if found:
+                    logger.info("[%s] 問い合わせフォームなし(取り損ねの疑いあり): %s", start_url, " / ".join(found))
 
         # 10項目を超えるのは、子メニューまで展開したスマホ用メニューやサイトマップ的な
         # リンク集を拾った場合がほとんどで、先頭10項目に切り詰めると中途半端な内容になる

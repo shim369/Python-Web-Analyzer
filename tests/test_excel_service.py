@@ -110,6 +110,24 @@ def test_excel_export_strips_illegal_control_characters(tmp_path: Path) -> None:
     assert "混入テスト" in value
 
 
+def test_excel_export_marks_blank_structure_of_crawled_site(tmp_path: Path) -> None:
+    """巡回できたのに構成が空欄の行は、要確認と分かるよう構成(H列)に背景色を付ける。"""
+    test_file = tmp_path / "structure_fill.xlsx"
+
+    assessments = [
+        _make_assessment(id="1", site_structure="", total_pages=12),
+        _make_assessment(id="2", site_structure="会社概要\n事業内容\nお問い合わせ"),
+        _make_assessment(id="3", site_structure="", total_pages=0),  # 接続失敗等で巡回できていない
+    ]
+    ExcelService.export_excel(assessments, test_file)
+
+    ws = load_workbook(str(test_file)).active
+    assert ws is not None
+    assert ws.cell(row=2, column=8).fill.fgColor.rgb == "00EDEDED"
+    assert ws.cell(row=3, column=8).fill.fill_type is None
+    assert ws.cell(row=4, column=8).fill.fill_type is None
+
+
 def test_excel_import_reads_domain_column_and_skips_header_like_rows(tmp_path: Path) -> None:
     """B列からドメイン名を読み取り、ヘッダー的な行や空行はスキップすることを確認する。"""
     test_file = tmp_path / "import_test.xlsx"
@@ -130,3 +148,22 @@ def test_excel_import_reads_domain_column_and_skips_header_like_rows(tmp_path: P
     # インポート直後は解析前なので、各種結果フィールドは初期値のまま
     assert imported[0].evaluation_result == ""
     assert imported[0].job_id == job.id
+
+
+def test_excel_export_marks_uncertain_no_contact_form(tmp_path: Path) -> None:
+    """「問い合わせフォームなし」に取り損ねの疑いがある行だけ、問合せ項目(L列)に背景色を付ける。"""
+    test_file = tmp_path / "contact_fill.xlsx"
+
+    assessments = [
+        _make_assessment(id="1", contact_fields="問い合わせフォームなし", contact_uncertain=True),
+        _make_assessment(id="2", contact_fields="問い合わせフォームなし"),
+        _make_assessment(id="3", contact_fields="mailto"),
+        _make_assessment(id="4", contact_fields="", total_pages=0),  # 接続失敗等で巡回できていない
+    ]
+    ExcelService.export_excel(assessments, test_file)
+
+    ws = load_workbook(str(test_file)).active
+    assert ws is not None
+    assert ws.cell(row=2, column=12).value == "問い合わせフォームなし"
+    assert ws.cell(row=2, column=12).fill.fgColor.rgb == "00EDEDED"
+    assert [ws.cell(row=r, column=12).fill.fill_type for r in (3, 4, 5)] == [None, None, None]

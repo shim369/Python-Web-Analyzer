@@ -34,6 +34,8 @@ class SiteAssessment:
     cms_name: str = ""  # J列
     description: str = ""  # K列
     contact_fields: str = ""  # L列
+    # L列の「問い合わせフォームなし」に、フォームを取り損ねた疑いがあるか(Excelで背景色を付ける)
+    contact_uncertain: bool = False
     rejection_reason: str = ""  # M列
     remarks: str = ""  # N列
     operator_name: str = ""  # O列
