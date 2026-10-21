@@ -164,16 +164,20 @@ class WebCrawler:
         "alpinejs",
         "x-data=",
         "vite/client",
-        "remix",
+        "__remixcontext",
         "astro-island",
         # Canva/Webflow/Framer等のノーコードサイトビルダーも、静的HTML(httpx取得分)
         # にはほぼ実質的なコンテンツ・内部リンクが含まれず、JavaScriptによる
         # クライアントサイド描画に依存している。既知のJSフレームワークと同様、
         # Playwrightでの再レンダリングが必要な対象として扱う(実際に確認済み)。
-        "canva",
+        # (Canva/Framerは単語として現れる場合だけをJS_FRAMEWORK_WORD_MARKER_REで判定する)
         "webflow",
-        "framer",
+        "framerusercontent",
     ]
+    # 他の語の一部としても現れる目印は、単語として現れる場合に限る。部分一致では、WordPressの
+    # CSS(--wp-editor-canvas-background)やJavaScript(e.canvas.width)の"canvas"、"premix"等に
+    # 反応し、調査したサイトの半数以上で、トップページを不要にブラウザで描画し直していた(実際に確認済み)
+    JS_FRAMEWORK_WORD_MARKER_RE = re.compile(r"(?<![a-z])(canva|remix|framer)(?![a-z])")
 
     # CMSの自動生成抜粋(excerpt)が文の途中で切れているサインとなる省略記号。
     # 例:「岡山建設は、あなたの住居に対する理想をカタチに...」のように、
@@ -812,6 +816,12 @@ class WebCrawler:
                 # フッター内のメニューも同様に対象外
                 if cand.find_parent("li") is not None or self._is_in_page_footer(cand) or "フッター" in attr_str:
                     continue
+                # 本文(<main>/<article>)の中にあるメニューは、そのページのローカルナビ等で
+                # グローバルナビではない。ヘッダーをJavaScriptで書き出すサイトでは
+                # 本文中のローカルナビを拾っていた(実際に確認済み)。ただし<main>が
+                # <header>ごとページ全体を包んでいる作りもあるため、その場合は除外しない
+                if self._is_in_page_body(cand):
+                    continue
 
                 if any(
                     k in attr_str
@@ -830,6 +840,14 @@ class WebCrawler:
                     continue
 
                 score = 0
+
+                # スマホ用のナビ(class="sp_navi"、"siteHeader__nav-sp"等)は、PC用の
+                # グローバルナビとは別に置かれ、子メニューまで展開した項目を持つことが多い。
+                # navタグの加点でPC用のul等に勝ってしまっていた(実際に確認済み)
+                if self.SP_NAV_ATTR_RE.search(attr_str):
+                    score -= 60
+                elif self.PC_NAV_ATTR_RE.search(attr_str):
+                    score += 10
 
                 # nav は強く優先
                 if cand.name == "nav":
@@ -911,6 +929,10 @@ class WebCrawler:
     SUB_LABEL_CLASS_RE = re.compile(r"(?:^|[-_])(?:sub|subtitle|en|eng|english|ruby)(?:$|[-_\d])", re.I)
     SUB_LABEL_CAMEL_CLASS_RE = re.compile(r"[a-z](?:Sub|En|Eng|English|Ruby)(?:$|[-_A-Z\d])")
 
+    # classの無い英語表記の要素とみなす文字列(英字・空白・記号のみ。数字だけの「01」等は含めない)
+    EN_SUB_LABEL_TEXT_RE = re.compile(r"^[A-Za-z][A-Za-z &'.\-/]*$")
+    JAPANESE_TEXT_RE = re.compile(r"[ぁ-んァ-ヶ一-龠々]")
+
     @classmethod
     def _is_sub_label_class(cls, class_name: str | None) -> bool:
         if not class_name:
@@ -928,9 +950,31 @@ class WebCrawler:
         re.I,
     )
 
+    # ナビ領域のclass/id(小文字化・空白区切り)が、スマホ用/PC用のナビであることを示す語。
+    # "sp-none"/"pc-hide"等は逆の意味(その端末では非表示)になる
+    SP_NAV_ATTR_RE = re.compile(r"(?:^|[\s_-])(?:sp(?:nav|menu|[\s_-]|$)(?!(?:hide|hidden|none|off)(?:[\s_-]|$))|pc[\s_-](?:hide|hidden|none)(?:[\s_-]|$))")
+    PC_NAV_ATTR_RE = re.compile(r"(?:^|[\s_-])(?:pc(?:[\s_-]|$)(?!(?:hide|hidden|none|off)(?:[\s_-]|$))|sp[\s_-](?:hide|hidden|none)(?:[\s_-]|$))")
+
+    # グローバルナビとみなす最大項目数。これを超えたら切り詰めずに「構成」列を空欄にする
+    # (途中で切れた内容は使えないため。Excelでは背景色が付き、AI補完の対象になる)
+    MAX_STRUCTURE_ITEMS = 10
+
+    # SNSへのリンクだけの項目(ナビ内に並んでいても構成の項目にはしない)
+    SNS_ITEM_RE = re.compile(r"^(twitter|x|facebook|instagram|youtube|line|tiktok|note|linkedin|pinterest)(page|公式)?$", re.I)
+
     # <li>項目名<a class="link"></a></li>のような、中身の無いリンクを重ねた項目で、
     # liの文字列を項目名とみなす最大文字数
     OVERLAY_LINK_LABEL_MAX_LEN = 20
+
+    # リンクの無い短い文字列だけの項目を見出しとみなす際に除く文言(コピーライト・電話番号・
+    # ドロワーの閉じるボタン・検索欄等)
+    NON_LABEL_TEXT_RE = re.compile(r"©|copyright|\d{2,4}-\d{2,4}-\d{3,4}|^(close|search|menu|open|閉じる|検索)$", re.I)
+
+    # グローバルナビ本体のリストらしいclass/id(同じ項目数のリストが複数ある場合の優先に使う)
+    NAV_LIST_ATTR_RE = re.compile(r"gnav|global|main-?menu|main-?nav|header-?(menu|nav)|nav-?list", re.I)
+
+    # ul/liを使わないナビで、ドロップダウンの子メニューを包む要素のclass
+    DROPDOWN_PANEL_CLASS_RE = re.compile(r"dropdown-menu|sub-?menu|mega-?menu|child", re.I)
 
     def _menu_list_items(self, area: Tag) -> list[Tag]:
         """ナビ領域内で、グローバルナビ本体とみなすリストのトップレベル項目(li)を返す。
@@ -946,18 +990,36 @@ class WebCrawler:
         lists += [ul for ul in area.find_all(["ul", "ol"]) if not any(p is not area and p.name == "li" for p in self._ancestors_within(ul, area))]
 
         best: list[Tag] = []
+        best_list: Tag | None = None
+        best_has_nav_class = False
         for lst in lists:
-            # <ul><a href="/x/"><li>項目</li></a>…のように、リンクの中にliを置いた
-            # 崩れたマークアップ(実際に確認済み)のliも、リスト直下の項目として数える
-            items = [li for li in lst.find_all("li") if isinstance(li, Tag) and self._is_top_level_item(li, lst)]
-            if not items:
-                # <ul><div><li>...のような崩れたマークアップ
-                first_li = lst.find("li")
-                if isinstance(first_li, Tag) and isinstance(first_li.parent, Tag):
-                    items = [li for li in first_li.parent.find_all("li", recursive=False) if isinstance(li, Tag)]
-            if len(items) > len(best):
-                best = items
+            items = self._list_items(lst)
+            # 項目数が同じなら、class/idがナビらしいリストを優先する(PC用ナビの中で、
+            # 先に出てくるメガメニューの製品一覧が本体と同数になり選ばれていた。実際に確認済み)
+            has_nav_class = bool(self.NAV_LIST_ATTR_RE.search(f"{lst.get('id', '')} {' '.join(lst.get('class') or [])}"))
+            if len(items) > len(best) or (items and len(items) == len(best) and has_nav_class and not best_has_nav_class):
+                best, best_list, best_has_nav_class = items, lst, has_nav_class
+
+        # <nav><ul class="l-gnav__list">…</ul><ul class="l-gnav__list">…</ul></nav>のように、
+        # 1つのグローバルナビを同じclassのリストに分けて並べている作り(実際に確認済み)は
+        # まとめて1つのナビとみなす。classの違うリスト(お問い合わせ等のボタン群)はまとめない
+        if best_list is not None and best_list.get("class"):
+            siblings = [lst for lst in lists if lst is best_list or (lst.parent is best_list.parent and lst.get("class") == best_list.get("class"))]
+            if len(siblings) > 1:
+                best = [li for lst in siblings for li in self._list_items(lst)]
         return best
+
+    def _list_items(self, lst: Tag) -> list[Tag]:
+        """リストlstのトップレベルの項目(li)を返す。"""
+        # <ul><a href="/x/"><li>項目</li></a>…のように、リンクの中にliを置いた
+        # 崩れたマークアップ(実際に確認済み)のliも、リスト直下の項目として数える
+        items = [li for li in lst.find_all("li") if isinstance(li, Tag) and self._is_top_level_item(li, lst)]
+        if not items:
+            # <ul><div><li>...のような崩れたマークアップ
+            first_li = lst.find("li")
+            if isinstance(first_li, Tag) and isinstance(first_li.parent, Tag):
+                items = [li for li in first_li.parent.find_all("li", recursive=False) if isinstance(li, Tag)]
+        return items
 
     @staticmethod
     def _is_top_level_item(li: Tag, lst: Tag) -> bool:
@@ -978,6 +1040,11 @@ class WebCrawler:
             if footer.find_parent(["section", "article", "aside", "header", "main", "nav"]) is None:
                 return True
         return False
+
+    @staticmethod
+    def _is_in_page_body(el: Tag) -> bool:
+        """本文領域(<main>/<article>)の中にあるか。<header>を含む<main>はページ全体の外枠とみなす。"""
+        return any(body.find("header") is None for body in el.find_parents(["main", "article"]))
 
     @staticmethod
     def _ancestors_within(el: Tag, area: Tag) -> list[Tag]:
@@ -1017,8 +1084,11 @@ class WebCrawler:
         if not isinstance(li_copy, Tag):
             return None
         has_submenu = False
-        # パネルの判定(リンク数)にリスト内のリンクも数えるため、リストより先に除去する
-        for panel in li_copy.find_all(["div", "section"]):
+        # パネルの判定(リンク数)にリスト内のリンクも数えるため、リストより先に除去する。
+        # 内側のパネルから除去する(外側から除去すると、<div class="h_option"><label>見出し</label>
+        # <div class="content">子リンク…</div></div>のように見出しと子メニューを包む外枠ごと
+        # 消え、見出しの代わりに子メニューのリンク名を拾っていた。実際に確認済み)
+        for panel in reversed(li_copy.find_all(["div", "section"])):
             if panel.decomposed:
                 continue
             if len(panel.find_all("a")) >= 2 or panel.find(["ul", "ol"]) is not None:
@@ -1040,9 +1110,31 @@ class WebCrawler:
         # 説明文付きのカード(本文の一覧)を拾わないよう、項目名らしい短い文字列に限る
         if len(li_copy.find_all("a")) == 1 and 0 < len(li_copy.get_text(strip=True)) <= self.OVERLAY_LINK_LABEL_MAX_LEN:
             return li_copy
+        # <li><span>業務内容</span></li>のように、子メニューを別の場所(メガメニュー)に置いた
+        # 親項目は、liの中にリンクも子メニューも無い(実際に確認済み)。同じリストの他の項目の
+        # 半数以上がリンクで、項目名らしい短い文字列の場合に限り見出しとみなす
+        if li_copy.find("a") is None and self._is_text_label_among_links(li, li_copy.get_text(strip=True)):
+            # 文字列を包む要素のclassが"sub"等だと英語表記として消されるため、文字列だけを渡す
+            # (実際に確認済み: <span class="cont sub hasc3"><span>業務内容</span></span>)
+            label = BeautifulSoup("", HTML_PARSER).new_tag("span")
+            label.string = li_copy.get_text(" ", strip=True)
+            return label
         # 見出しが取れない場合は従来どおりli内の最初のリンク
         first_a = li.find("a")
         return first_a if isinstance(first_a, Tag) else None
+
+    def _is_text_label_among_links(self, li: Tag, text: str) -> bool:
+        """リンクの無い項目liの文字列textを、メニューの見出しとみなせるか。"""
+        if not 0 < len(text) <= self.OVERLAY_LINK_LABEL_MAX_LEN or self.NON_LABEL_TEXT_RE.search(text):
+            return False
+        if li.find(["form", "input", "button", "select"]) is not None:
+            return False
+        # 区切り記号("|"等)だけの項目は除く
+        if not re.search(r"[A-Za-z0-9ぁ-んァ-ヶ一-龠]", text):
+            return False
+        siblings = [s for s in li.find_next_siblings("li") + li.find_previous_siblings("li") if isinstance(s, Tag)]
+        linked = sum(s.find("a", href=True) is not None for s in siblings)
+        return linked >= 2 and linked * 2 >= len(siblings)
 
     def _menu_link_text(self, a_tag: Tag) -> str:
         """メニューのリンク(または見出し要素)から、英語表記・副題を除いた項目名を取り出す。"""
@@ -1050,6 +1142,16 @@ class WebCrawler:
 
         for sub in a_copy.find_all(["span", "small", "p", "em", "i"], class_=self._is_sub_label_class):
             sub.decompose()
+
+        # <a>SDGs宣言<span>SDGs</span></a>のように、classの無い要素に英語表記を添えた作り
+        # (実際に確認済み)。日本語の項目名があり、子要素が英字だけの場合はその子要素を除く。
+        # 文字列の末尾の英字を消す_clean_menu_text()では、項目名が英字で始まる・「・」を含む
+        # 場合に消えず、同じナビ内で英語表記の残る項目と消える項目が混在していた
+        full_text = a_copy.get_text("", strip=True)
+        for sub in a_copy.find_all(["span", "small", "p", "em", "i", "b", "strong"]):
+            sub_text = sub.get_text("", strip=True)
+            if sub.find(True) is None and self.EN_SUB_LABEL_TEXT_RE.match(sub_text) and self.JAPANESE_TEXT_RE.search(full_text.replace(sub_text, "", 1)):
+                sub.decompose()
 
         # aタグ内の子要素を含めてリンク文字列を取得
         raw_text = a_copy.get_text(" ", strip=True)
@@ -1068,6 +1170,53 @@ class WebCrawler:
                 raw_text = alt or title or ""
 
         return self._clean_menu_text(str(raw_text))
+
+    # ナビを別ファイルに分けてiframeで読み込む古い作り(<iframe src="parts/menu.htm">)のiframeのsrc
+    # ファイル名(拡張子を除く)がナビらしい語で始まるか、語を区切り文字で挟んで含むもの
+    # ("topics"・"headline"等のお知らせのiframeは対象外)
+    NAV_IFRAME_SRC_RE = re.compile(r"(?:^|[_\-.])(?:g?menu|g?navi?|header)(?:$|[_\-.\d])", re.I)
+    MAX_NAV_IFRAMES = 3
+
+    def _has_nav_iframe(self, soup: BeautifulSoup) -> bool:
+        """srcのファイル名がナビらしいiframeがあるか(ページを取得し直す前の絞り込み用。ホストは見ない)。"""
+        return any(self.NAV_IFRAME_SRC_RE.search(urlparse(str(frame.get("src", ""))).path.rsplit("/", 1)[-1].rsplit(".", 1)[0]) for frame in soup.find_all(["iframe", "frame"], src=True))
+
+    def _extract_iframe_nav_menus(self, soup: BeautifulSoup, page_url: str, client: httpx.Client, cms_name: str) -> list[str]:
+        """トップページのナビがiframeの中にある場合に、iframeのページからナビの項目を取り出す。
+
+        ホームページ・ビルダー等で作られた古いサイトには、ヘッダー・メニューを別ファイルにして
+        iframeで読み込むもの(<iframe src="parts/menu.htm">)がある(実際に確認済み)。トップページ
+        自体にはナビが無いため、srcのファイル名がナビらしい同一サイト内のiframeを文書順に取得し、
+        3項目以上取れたものを使う。iframeのページ自体がナビなので、ul/liを使わない
+        表組みのリンクの並び(collect_nav_candidates()の候補)も採る。
+        ナビらしいiframeが無い・取れなかった場合は空リスト(取得のリクエストも行わない)。
+        """
+        base_host = urlparse(page_url).netloc.lower().removeprefix("www.")
+        fetched = 0
+        for frame in soup.find_all(["iframe", "frame"], src=True):
+            if fetched >= self.MAX_NAV_IFRAMES:
+                break
+            src = urljoin(page_url, str(frame.get("src", "")))
+            parsed = urlparse(src)
+            if parsed.scheme not in ("http", "https") or parsed.netloc.lower().removeprefix("www.") != base_host:
+                continue
+            if not self.NAV_IFRAME_SRC_RE.search(parsed.path.rsplit("/", 1)[-1].rsplit(".", 1)[0]):
+                continue
+            fetched += 1
+            try:
+                response = client.get(src)
+            except httpx.HTTPError:
+                continue
+            if response.status_code >= 400:
+                continue
+            frame_soup = BeautifulSoup(self._decode_response(response), HTML_PARSER)
+            menus = self._extract_global_nav_menus(frame_soup, cms_name)
+            if len(menus) < 3:
+                candidates = [c for c in self.collect_nav_candidates(frame_soup) if 3 <= len(c) <= self.MAX_STRUCTURE_ITEMS]
+                menus = candidates[0] if candidates else []
+            if len(menus) >= 3:
+                return menus
+        return []
 
     def collect_nav_candidates(self, soup: BeautifulSoup, max_candidates: int = 12) -> list[list[str]]:
         """ページ内の「グローバルナビかもしれないメニューのリスト」の項目名を、文書順に返す。
@@ -1128,12 +1277,18 @@ class WebCrawler:
                 if label is not None:
                     target_links.append(label)
         else:
-            target_links = [link for link in target_area.find_all("a") if isinstance(link, Tag)]
+            # ul/liを使わないナビでは、ドロップダウンの子メニュー(class="dropdown-menu"等)の
+            # リンクまで項目に並んでいた(実際に確認済み)
+            target_links = [
+                link
+                for link in target_area.find_all("a")
+                if isinstance(link, Tag) and not any(self.DROPDOWN_PANEL_CLASS_RE.search(" ".join(p.get("class") or [])) for p in self._ancestors_within(link, target_area) if p is not target_area)
+            ]
 
         menus: list[str] = []
         for a_tag in target_links:
             menu_text = self._menu_link_text(a_tag)
-            if not menu_text or menu_text in self.NON_MENU_TEXTS:
+            if not menu_text or menu_text in self.NON_MENU_TEXTS or self.SNS_ITEM_RE.match(menu_text):
                 continue
             if self._is_multilang_element(a_tag, menu_text):
                 continue
@@ -1152,6 +1307,11 @@ class WebCrawler:
             # <body>のclassにはWordPressが"home blog"等のページ種別を付けるため、body手前までを見る
             chain = [cand, *(p for p in cand.parents if p.name not in ("body", "html", "[document]"))]
             if any(isinstance(el, Tag) and (el.name in ("main", "article", "footer") or excluded_attr_re.search(f"{el.get('id', '')} {' '.join(el.get('class') or [])}")) for el in chain):
+                continue
+            # 本文(<main>/<article>)を含む要素は、サイドバーではなくページ全体の外枠
+            # (<div class="side"><header>…</header><main>…</main></div>のような作りで、
+            # 本文中のお知らせ一覧を拾っていた。実際に確認済み)
+            if cand.find(["main", "article"]) is not None:
                 continue
             items = self._menu_list_items(cand)
             if 3 <= len(items) <= 12:
@@ -1214,11 +1374,26 @@ class WebCrawler:
         for marker in self.JS_FRAMEWORK_MARKERS:
             if marker in html_lower:
                 return marker
+        word_match = self.JS_FRAMEWORK_WORD_MARKER_RE.search(html_lower)
+        if word_match:
+            return word_match.group(1)
 
         if self._looks_like_empty_js_shell(html):
             return "empty-shell(推定SPA)"
 
         return ""
+
+    @staticmethod
+    def _has_empty_header(html: str) -> bool:
+        """ページのヘッダー(<header>・id="header")が空か。
+
+        ヘッダーを fetch("/common/parts/header.html") や jQueryの.load() 等で後から
+        差し込むサイトは、静的HTMLの<header>が空になる(実際に確認済み)。
+        """
+        soup = BeautifulSoup(html, HTML_PARSER)
+        headers = [h for h in soup.find_all("header") + soup.find_all(id=re.compile(r"^header$", re.I)) if isinstance(h, Tag)]
+        page_headers = [h for h in headers if h.find_parent(["main", "article", "section"]) is None]
+        return bool(page_headers) and all(h.find(["a", "img"]) is None and not h.get_text(strip=True) for h in page_headers)
 
     def _looks_like_empty_js_shell(self, html: str) -> bool:
         """<body>の可視テキストがほぼ空で、外部スクリプトの読み込みだけがある
@@ -3626,7 +3801,9 @@ class WebCrawler:
                         # 大半を1ページ目だけで使い果たし、2ページ目以降を巡回できず総ページ数が
                         # 極端に少ない「要確認」判定に化けてしまう。JSフレームワークを検知した
                         # ページ（＝静的HTMLだけでは内容が欠落する可能性が高いページ）のみに限定する。
-                        if self.render_js and len(visited) == 1 and not first_html_from_playwright and self._detect_js_framework(current_html):
+                        # ヘッダー(グローバルナビ)だけをJavaScriptで後から差し込むページ(<header>が空)も、
+                        # 静的HTMLではナビが無く、本文中のリストを拾ってしまうため描画し直す
+                        if self.render_js and len(visited) == 1 and not first_html_from_playwright and (self._detect_js_framework(current_html) or self._has_empty_header(current_html)):
                             rendered, _rendered_url, _rendered_status, _nav_error = self._fetch_rendered_html(current_url)
                             if rendered:
                                 current_html = rendered
@@ -3711,7 +3888,10 @@ class WebCrawler:
                             # 多言語切り替え機能の有無を検知
                             has_multilang = self._detect_multilang_switcher(soup)
 
-                            for menu_text in self._extract_global_nav_menus(soup, cms_name):
+                            # ナビ用のiframeがあるページは、ナビがiframeの中にあるとみなして優先する
+                            # (トップページ自体から別のリンクの並びを拾っても、それはナビではない)
+                            top_menus = self._extract_iframe_nav_menus(soup, resolved_url, client, cms_name) or self._extract_global_nav_menus(soup, cms_name)
+                            for menu_text in top_menus:
                                 if menu_text not in global_nav_menus:
                                     global_nav_menus.append(menu_text)
 
@@ -3971,7 +4151,10 @@ class WebCrawler:
         if not contact_fields:
             contact_fields = "mailto" if has_mailto_link else self.NO_CONTACT_FORM_TEXT
 
-        site_structure = "\n".join(global_nav_menus[:10])
+        # 10項目を超えるのは、子メニューまで展開したスマホ用メニューやサイトマップ的な
+        # リンク集を拾った場合がほとんどで、先頭10項目に切り詰めると中途半端な内容になる
+        # (実際に確認済み)。空欄にして、Excel上で要確認と分かるようにし、AI補完の対象にする
+        site_structure = "\n".join(global_nav_menus) if len(global_nav_menus) <= self.MAX_STRUCTURE_ITEMS else ""
         # 総ページ数は、リダイレクト前の生URL(visited)の件数ではなく、実際に
         # 表示された実体ページ(canonical_visited)の件数で数える。生URLは
         # http/httpsの混在や壊れた相対リンクによって同じページに対して

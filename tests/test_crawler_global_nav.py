@@ -1,3 +1,4 @@
+import pytest
 from bs4 import BeautifulSoup
 
 from web_analyzer.core.crawler import HTML_PARSER, WebCrawler
@@ -194,3 +195,237 @@ def test_label_text_beside_empty_overlay_link() -> None:
     </ul></header>
     """
     assert _menus(html) == ["特装車", "車体製造・組立", "塗装", "レストア"]
+
+
+def test_english_label_without_class_is_removed() -> None:
+    """is-kentetsu.jp / kasumicc.co.jp の構造を簡略化したもの。
+
+    classの無い要素の英語表記も、項目名の前後どちらにあっても、英字で始まる項目名・「・」を含む項目名でも除く。
+    英字だけの項目名(TOP等)はそのまま残す。
+    """
+    html = """
+    <nav id="global-nav"><ul>
+      <li><a href="/">TOP</a></li>
+      <li><a href="/sdgs">SDGs宣言<span>SDGs</span></a></li>
+      <li><a href="/flat">階段・手摺り<span>FLAT</span></a></li>
+      <li><a href="/company/"><span>COMPANY</span>会社概要</a></li>
+      <li><a href="/about/">NEXTEPについて<span>ABOUT US</span></a></li>
+    </ul></nav>
+    """
+    assert _menus(html) == ["TOP", "SDGs宣言", "階段・手摺り", "会社概要", "NEXTEPについて"]
+
+
+def test_sp_nav_loses_to_pc_nav() -> None:
+    """itogawa.co.jp の構造を簡略化したもの。
+
+    - 子メニューまで展開したスマホ用のnav(class="sp_navi")より、PC用のナビを採る
+    - PC用ナビの中で、先に出てくるメガメニューの製品一覧と項目数が同じでも、ナビらしいclassのリストを採る
+    """
+    html = """
+    <header><div id="global-nav">
+      <nav class="pc_navi">
+        <div class="mega"><ul>
+          <li><a href="/p/1/">円筒型タンク</a></li><li><a href="/p/2/">角型タンク</a></li><li><a href="/p/3/">撹拌タンク</a></li>
+        </ul></div>
+        <div class="page_links"><ul class="nav-list gnavi_pc">
+          <li><a href="/">TOP</a></li><li><a href="/features/">強み</a></li><li><a href="/faq/">FAQ</a></li>
+        </ul></div>
+      </nav>
+      <nav class="sp_navi"><ul class="nav-list nav-list-global">
+        <li><a href="/">TOP</a></li><li><a href="/features/">強み</a></li><li><a href="/faq/">よくあるご質問</a></li>
+        <li><a href="/company/">会社案内</a></li><li><a href="/news/">ニュース</a></li><li><a href="/recruit/">採用情報</a></li>
+      </ul></nav>
+    </div></header>
+    """
+    assert _menus(html) == ["TOP", "強み", "FAQ"]
+
+
+def test_sp_nav_attr_matching() -> None:
+    assert WebCrawler.SP_NAV_ATTR_RE.search("sp_navi")
+    assert WebCrawler.SP_NAV_ATTR_RE.search("siteheader__nav-sp")
+    assert WebCrawler.SP_NAV_ATTR_RE.search("nav pc-none")
+    assert not WebCrawler.SP_NAV_ATTR_RE.search("gnav sp-none")
+    assert not WebCrawler.SP_NAV_ATTR_RE.search("special-menu")
+    assert WebCrawler.PC_NAV_ATTR_RE.search("pc_menu align-right")
+    assert not WebCrawler.PC_NAV_ATTR_RE.search("pc-hide")
+
+
+def test_accordion_label_and_sibling_lists_with_same_class() -> None:
+    """k-hoshinosato.jp の構造を簡略化したもの。
+
+    - アコーディオンの親項目は<label>が見出し(子リンクの1つ目を拾わない)
+    - 同じclassのリストに分けたナビはまとめる。SNSの項目は除く
+    """
+    html = """
+    <header><nav class="l-gnav">
+      <ul class="l-gnav__list">
+        <li class="l-gnav__item"><div class="h_option">
+          <input type="checkbox" id="toggle1"><label for="toggle1"><img alt="アイコン" src="i.png">概要一覧</label>
+          <div class="content"><a href="/about"><p>星の里とは</p></a><a href="/company"><p>指定管理者情報</p></a></div>
+        </div></li>
+        <li class="l-gnav__item"><a href="/pricelist"><img alt="アイコン" src="i.png">ご利用料金一覧</a></li>
+        <li class="l-gnav__item"><a href="/faq">よくあるご質問</a></li>
+      </ul>
+      <ul class="l-gnav__list">
+        <li><a href="/access">アクセス</a></li>
+        <li><a href="https://lin.ee/x">LINE</a></li>
+        <li><a href="https://www.instagram.com/x/">Instagram</a></li>
+      </ul>
+      <ul class="sub-buttons"><li><a href="/contact">お問い合わせ</a></li><li><a href="/reserve">WEB予約</a></li><li><a href="/">トップへ戻る</a></li></ul>
+    </nav></header>
+    """
+    assert _menus(html) == ["概要一覧", "ご利用料金一覧", "よくあるご質問", "アクセス"]
+
+
+def test_text_only_labels_among_links() -> None:
+    """intemjapan.co.jp の構造を簡略化したもの。子メニューを別の場所に置いた親項目は、liに文字列しか無い。
+
+    検索欄・閉じるボタン等の文字列だけの項目は拾わない。
+    """
+    html = """
+    <header><ul class="mainMenu">
+      <li><span class="cont sub hasc1"><a href="/newslist/"><span>ニュース一覧</span></a></span></li>
+      <li><span class="cont sub hasc2"><a href="/company/"><span>会社概要</span></a></span></li>
+      <li><span class="cont sub hasc3"><i class="bx"></i><span>業務内容</span></span></li>
+      <li><span class="cont sub hasc4"><a href="/csr/"><span>CSR事業</span></a></span></li>
+      <li><span class="cont sub hasc5"><i class="bx"></i><span>採用情報</span></span></li>
+      <li><form action="/search"><input type="text" name="s">SEARCH</form></li>
+      <li>CLOSE</li>
+    </ul></header>
+    """
+    assert _menus(html) == ["ニュース一覧", "会社概要", "業務内容", "CSR事業", "採用情報"]
+
+
+def test_local_nav_in_main_is_not_used() -> None:
+    """jefma.or.jp の構造を簡略化したもの。ヘッダーをJavaScriptで書き出しており、静的HTMLには本文中のローカルナビしか無い。"""
+    html = """
+    <body><div id="wrap"><main class="content"><section id="about">
+      <nav class="local__nav"><ul>
+        <li><a href="/about/greeting/">ご挨拶</a></li><li><a href="/about/purpose/">工業会の目的</a></li><li><a href="/about/history/">沿革</a></li>
+      </ul></nav>
+    </section></main></div></body>
+    """
+    assert _menus(html) == []
+
+
+def test_main_wrapping_whole_page_is_not_excluded() -> None:
+    """<main>が<header>ごとページ全体を包んでいる作りでは、ヘッダーのナビを採る。"""
+    html = """
+    <body><main>
+      <header><nav class="gnav"><ul>
+        <li><a href="/">ホーム</a></li><li><a href="/company/">会社概要</a></li><li><a href="/contact/">お問い合わせ</a></li>
+      </ul></nav></header>
+      <section><p>本文</p></section>
+    </main></body>
+    """
+    assert _menus(html) == ["ホーム", "会社概要", "お問い合わせ"]
+
+
+def test_links_in_dropdown_panel_without_list() -> None:
+    """tokulabo.co.jp の構造を簡略化したもの。ul/liを使わないナビで、ドロップダウンの子リンクは項目にしない。"""
+    html = """
+    <header><nav class="navbar d-none d-xl-block"><div class="pc_menu">
+      <span class="nav-item dropdown"><a class="nav-link dropdown-toggle" href="#">事業案内</a>
+        <div class="dropdown-menu"><a href="/biz/">事業について</a><a href="/catalog/">製品カタログ</a></div></span>
+      <a class="nav-link" href="/aboutus/">会社案内</a>
+      <a class="nav-link" href="/contact/">お問い合わせ</a>
+    </div></nav></header>
+    """
+    assert _menus(html) == ["事業案内", "会社案内", "お問い合わせ"]
+
+
+def test_page_wrapper_with_side_class_is_not_sidebar_nav() -> None:
+    """ページ全体を包む<div class="side">(本文を含む)はサイドバーではない。
+    ヘッダーをJavaScriptで差し込むため静的HTMLの<header>が空でも、本文中のお知らせ一覧を拾わない。"""
+    html = """
+    <body><div class="side">
+      <header id="header"></header>
+      <div class="main"><main>
+        <section class="info"><ul class="info_list">
+          <li><a href="info/1"><time>2026.07.16</time><span>夏季休業のお知らせ</span></a></li>
+          <li><a href="info/2"><time>2025.11.27</time><span>年末年始休業のお知らせ</span></a></li>
+          <li><a href="info/3"><time>2025.10.29</time><span>お取引条件変更のご案内</span></a></li>
+        </ul></section>
+      </main></div>
+    </div></body>
+    """
+    crawler = WebCrawler()
+    assert crawler._extract_global_nav_menus(BeautifulSoup(html, "lxml"), "") == []
+    assert crawler._has_empty_header(html)
+
+
+@pytest.mark.parametrize(
+    ("html", "expected"),
+    [
+        ('<header id="header"></header><main><p>本文</p></main>', True),
+        ('<div id="header"> </div><p>本文</p>', True),
+        ('<header><a href="/">ホーム</a></header>', False),
+        ('<header><h1><img src="logo.png" alt=""></h1></header>', False),
+        # 記事の見出し用の<header>はページのヘッダーではない
+        ("<main><article><header></header></article></main>", False),
+        ("<p>ヘッダーの無いページ</p>", False),
+    ],
+)
+def test_has_empty_header(html: str, expected: bool) -> None:
+    assert WebCrawler._has_empty_header(html) is expected
+
+
+@pytest.mark.parametrize(
+    ("html", "expected"),
+    [
+        # WordPressのCSS・JavaScriptの"canvas"や、"premix"等の語の一部には反応しない
+        ("<style>:root{--wp-editor-canvas-background:#ddd}</style><script>e.canvas.width</script><p>premixs</p>", ""),
+        ('<link href="https://static.canva.com/x.css">', "canva"),
+        ('<img src="https://framerusercontent.com/images/a.png">', "framerusercontent"),
+        ("<script>window.__remixContext = {}</script>", "__remixcontext"),
+    ],
+)
+def test_detect_js_framework_ignores_partial_words(html: str, expected: str) -> None:
+    body = "<body>" + "<p>本文の段落です。</p>" * 30 + '<a href="/a">A</a><a href="/b">B</a><a href="/c">C</a><a href="/d">D</a></body>'
+    assert WebCrawler()._detect_js_framework(html + body) == expected
+
+
+def test_extracts_nav_from_menu_iframe() -> None:
+    """kyoto-hokenkai.or.jp の構造を簡略化したもの。ナビを別ファイルにしてiframeで読み込む古い作り。"""
+    import httpx
+
+    top = """
+    <body><table><tr><td><iframe src="parts/top.htm"></iframe></td></tr>
+    <tr><td><iframe src="parts/menu.htm"></iframe></td></tr></table>
+    <iframe src="https://www.youtube.com/embed/x"></iframe><p>本文</p></body>
+    """
+    pages = {
+        "https://a.example/parts/top.htm": '<body><a href="/"><img alt="ロゴ"></a><a href="../mail-form.htm"><img alt="お問い合せ"></a></body>',
+        "https://a.example/parts/menu.htm": """<body><table><tr>
+            <td><a href="https://a.example/" target="_top"><b>トップ(紹介･概要)</b></a></td>
+            <td><a href="../tomo/index.htm" target="_top"><b>友の会･基金</b></a></td>
+            <td><a href="../koukai/index.htm" target="_top"><b>情報公開</b></a></td>
+            <td><a href="../saiyou/index.htm" target="_top"><b>採用情報</b></a></td>
+            </tr></table></body>""",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        return httpx.Response(200, text=pages[url], headers={"content-type": "text/html; charset=utf-8"}) if url in pages else httpx.Response(404)
+
+    crawler = WebCrawler()
+    soup = BeautifulSoup(top, HTML_PARSER)
+    assert crawler._extract_global_nav_menus(soup, "") == []
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        assert crawler._extract_iframe_nav_menus(soup, "https://a.example/", client, "") == ["トップ(紹介･概要)", "友の会･基金", "情報公開", "採用情報"]
+
+
+def test_menu_iframe_filter_skips_news_iframes() -> None:
+    """お知らせ等のiframe(topics.html・headline.html)はナビのiframeとみなさず、取得もしない。"""
+    import httpx
+
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        return httpx.Response(200, text='<a href="/a">A</a><a href="/b">B</a><a href="/c">C</a>', headers={"content-type": "text/html"})
+
+    soup = BeautifulSoup('<iframe src="topics.html"></iframe><iframe src="parts/headline.htm"></iframe><iframe src="/top.htm"></iframe>', HTML_PARSER)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        assert WebCrawler()._extract_iframe_nav_menus(soup, "https://a.example/", client, "") == []
+    assert requested == []
