@@ -153,10 +153,13 @@ PYTHON-WEB-ANALYZER/
 ├── temp/                      # Temporary file output directory
 ├── logs/                      # Output location for per-run log files
 ├── tests/                     # Unit tests
+│   ├── test_crawler_contact_uncertain.py # Tests for the uncertain "no contact form" flag
+│   ├── test_crawler_form_fields.py # Tests for contact-form field label extraction
 │   ├── test_crawler_global_nav.py # Tests for global-nav extraction
 │   ├── test_description_enricher.py # Tests for AI enrichment and page-count re-measurement
 │   ├── test_evaluator.py      # Tests for evaluation logic
 │   ├── test_excel_service.py  # Tests for Excel import/export
+│   ├── test_job_repository.py # Tests for SQLite persistence (column migration)
 │   ├── test_reverse_dns_checker.py # Tests for server lookup
 │   ├── test_site_summarizer.py # Tests for Gemini calls (summarization, rate limiting)
 │   └── test_ssl_checker.py    # Tests for SSL verification
@@ -298,7 +301,16 @@ To ensure robustness, core logic is thoroughly covered by unit tests using `pyte
 * **Target selection and writing**: Verifies, with `SiteSummarizer` and friends stubbed out (no network traffic), the target rules for Purpose/Structure/page count/Contact fields (column L only for gray "問い合わせフォームなし" and blank cells), skipping "already renewed" rows, fetching a site only once when both Purpose and Structure are targets, using the candidate chosen by AI (falling back to the rule-based result when the AI call fails, removing phone/SNS items, re-rendering only when the static HTML has no candidates), rewriting the result columns (C/M/N) after a page-count re-measurement, following contact pages to their form pages for rule-based extraction and falling back to the AI answer, and reporting rows skipped due to the rate limit.
 * **Gemini calls**: Verifies, by mocking `httpx.post`, the assembly of source text, returning an empty string without an API key or on API errors, and the cooldown on persistent 429s reported via `pop_rate_limited()` (other errors are not treated as rate limiting), and dropping contact field names that do not appear on the page.
 
-#### 6. Server Lookup (ReverseDnsChecker)
+#### 6. Contact-Form Analysis (WebCrawler)
+
+* **Field label extraction**: verifies forms with hidden inputs inside the label box, grouped radio buttons, branch forms with hidden tables/badges/line breaks, removal of required/optional badges, and keeping confirmation-email fields while excluding buttons, using HTML fragments.
+* **Uncertain "no contact form"**: verifies the `contact_form_uncertain` flag is raised only when a form may have been missed (e.g. the contact page has inputs but no fields were extracted) and not raised when a form is found, using `httpx.MockTransport` with no external traffic.
+
+#### 7. Persistence (JobRepository)
+
+* **Migration of existing DBs**: verifies that a database created before the uncertain-flag column was added gets the column on startup and can still be read and written.
+
+#### 8. Server Lookup (ReverseDnsChecker)
 
 * **Reverse DNS / RDAP assembly**: With `socket` and `httpx` mocked, verifies that the IP organization name is extracted from the RDAP response in priority order (`fn` of the `registrant` entity → first `remarks` entry → network name), that an empty string is returned on network failure or an invalid response, that only the hostname is extracted from a URL for forward lookup, the output format when only one of hostname / organization is available, and that no further lookups are made when the domain can't be resolved.
 
